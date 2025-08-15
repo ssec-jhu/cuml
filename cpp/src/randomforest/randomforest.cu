@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
- /*** DOES THIS CHANGE PROPAGATE BACK TO THE GITHUB REPO? ***/
+ /*** DOES THIS CHANGE PROPAGATE BACK TO THE GITHUB REPO? LET'S FIND OUT. ***/
 
 #include "randomforest.cuh"
 
