@@ -424,7 +424,8 @@ struct Builder {
       // dynamically calculated sampling work to be done per block:
       // `n_parallel_samples`
       // former must be greater or equal to than latter for excess-sampling-based strategy
-      if (max_samples_per_thread * block_threads >= n_parallel_samples) {
+      // if (max_samples_per_thread * block_threads >= n_parallel_samples) {
+      if (false) {
         raft::common::nvtx::range fun_scope("excess-sampling-based approach");
         dim3 grid;
         grid.x = work_items.size();
