@@ -52,6 +52,21 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                   RF_params,
                   level_enum) except +
 
+### NEW CODE ###
+
+    # (declared in randomforest.hpp; defined in randomforest.cu)
+    cdef void fitX(handle_t& handle,
+                  RandomForestMetaData[float, int]*,
+                  float*,
+                  int,
+                  int,
+                  int*,
+                  int,
+                  RF_params,
+                  level_enum) except +
+
+### END NEW CODE ###
+
     cdef void fit(handle_t& handle,
                   RandomForestMetaData[double, int]*,
                   double*,
@@ -488,6 +503,103 @@ class RandomForestClassifier(BaseRandomForestModel,
         del X_m
         del y_m
         return self
+
+### new code ###
+    @nvtx.annotate(
+        message="fit RF-Classifier @randomforestclassifier.pyx",
+        domain="cuml_python")
+    @generate_docstring(skip_parameters_heading=True,
+                        y='dense_intdtype',
+                        convert_dtype_cast='np.float32')
+    @cuml.internals.api_base_return_any(set_output_type=False,
+                                        set_output_dtype=True,
+                                        set_n_features_in=False)
+    def fitX(self, X, y, *, convert_dtype=True):
+        """
+        Perform Random Forest Classification on the input data
+
+        **** THIS IS NEW CODE ****
+
+        Parameters
+        ----------
+        convert_dtype : bool, optional (default = True)
+            When set to True, the fit method will, when necessary, convert
+            y to be of dtype int32. This will increase memory used for
+            the method.
+        """
+        X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
+        # Track the labels to see if update is necessary
+        self.update_labels = not check_labels(y_m, self.classes_)
+        cdef uintptr_t X_ptr, y_ptr
+
+        X_ptr = X_m.ptr
+        y_ptr = y_m.ptr
+
+        cdef handle_t* handle_ =\
+            <handle_t*><uintptr_t>self.handle.getHandle()
+
+        cdef RandomForestMetaData[float, int] *rf_forest = \
+            new RandomForestMetaData[float, int]()
+        self.rf_forest = <uintptr_t> rf_forest
+        cdef RandomForestMetaData[double, int] *rf_forest64 = \
+            new RandomForestMetaData[double, int]()
+        self.rf_forest64 = <uintptr_t> rf_forest64
+
+        if self.random_state is None:
+            seed_val = <uintptr_t>NULL
+        else:
+            seed_val = <uintptr_t>check_random_seed(self.random_state)
+
+        rf_params = set_rf_params(<int> self.max_depth,
+                                  <int> self.max_leaves,
+                                  <float> max_feature_val,
+                                  <int> self.n_bins,
+                                  <int> self.min_samples_leaf,
+                                  <int> self.min_samples_split,
+                                  <float> self.min_impurity_decrease,
+                                  <bool> self.bootstrap,
+                                  <int> self.n_estimators,
+                                  <float> self.max_samples,
+                                  <uint64_t> seed_val,
+                                  <CRITERION> self.split_criterion,
+                                  <int> self.n_streams,
+                                  <int> self.max_batch_size)
+
+        if self.dtype == np.float32:
+            fitX(handle_[0],
+                rf_forest,
+                <float*> X_ptr,
+                <int> self.n_rows,
+                <int> self.n_cols,
+                <int*> y_ptr,
+                <int> self.num_classes,
+                rf_params,
+                <level_enum> self.verbose)
+
+        elif self.dtype == np.float64:
+            rf_params64 = rf_params
+            fit(handle_[0],
+                rf_forest64,
+                <double*> X_ptr,
+                <int> self.n_rows,
+                <int> self.n_cols,
+                <int*> y_ptr,
+                <int> self.num_classes,
+                rf_params64,
+                <level_enum> self.verbose)
+
+        else:
+            raise TypeError("supports only np.float32 and np.float64 input,"
+                            " but input of type '%s' passed."
+                            % (str(self.dtype)))
+        # make sure that the `fit` is complete before the following delete
+        # call happens
+        self.handle.sync()
+        del X_m
+        del y_m
+        return self
+### end new code ###
+
 
     @cuml.internals.api_base_return_array(get_output_dtype=True)
     def _predict_model_on_cpu(

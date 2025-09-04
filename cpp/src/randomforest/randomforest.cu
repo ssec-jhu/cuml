@@ -382,6 +382,30 @@ void fit(const raft::handle_t& user_handle,
   rf_classifier->fit(user_handle, input, n_rows, n_cols, labels, n_unique_labels, forest);
 }
 
+/*** NEW CODE ***/
+void fitX(const raft::handle_t& user_handle,
+         RandomForestClassifierF*& forest,
+         float* input,
+         int n_rows,
+         int n_cols,
+         int* labels,
+         int n_unique_labels,
+         RF_params rf_params,
+         rapids_logger::level_enum verbosity)
+{
+  raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
+  ML::default_logger().set_level(verbosity);
+  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
+  forest->trees.resize(rf_params.n_trees);
+  forest->rf_params = rf_params;
+
+  std::shared_ptr<RandomForest<float, int>> rf_classifier =
+    std::make_shared<RandomForest<float, int>>(rf_params, RF_type::CLASSIFICATION);
+  rf_classifier->fit(user_handle, input, n_rows, n_cols, labels, n_unique_labels, forest);
+}
+/*** END NEW CODE ***/
+
+
 void fit(const raft::handle_t& user_handle,
          RandomForestClassifierD*& forest,
          double* input,
