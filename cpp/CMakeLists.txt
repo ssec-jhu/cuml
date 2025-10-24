@@ -502,7 +502,8 @@ if(BUILD_CUML_CPP_LIBRARY)
   if(all_algo OR randomforest_algo)
     target_sources(${CUML_CPP_TARGET}
       PRIVATE
-        src/randomforest/randomforest.cu)
+        src/randomforest/randomforest.cu
+        src/randomforest/sporf.cu)
   endif()
 
   if(all_algo OR randomprojection_algo)

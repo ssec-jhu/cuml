@@ -20,7 +20,6 @@
 #include "randomforest.cuh"
 
 #include <cuml/common/logger.hpp>
-#include <cuml/ensemble/randomforest.hpp>
 #include <cuml/tree/flatnode.h>
 
 #include <raft/core/error.hpp>
@@ -355,7 +354,7 @@ void compare_trees(tl::Tree<T, L>& tree_from_concatenated_forest,
  * @param[in] labels: 1D array of target features (int only), with one label per
  *   training sample. Device pointer.
  *   Assumption: labels were preprocessed to map to ascending numbers from 0;
- *   needed for current gini impl. in decision tree
+ *   needed for current gini impl. in ecision tree
  * @param[in] n_unique_labels: #unique label values (known during preprocessing)
  * @param[in] rf_params: Random Forest training hyper parameter struct.
  * @param[in] verbosity: verbosity level for logging messages during execution
@@ -371,6 +370,8 @@ void fit(const raft::handle_t& user_handle,
          RF_params rf_params,
          rapids_logger::level_enum verbosity)
 {
+  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
   ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
@@ -381,30 +382,6 @@ void fit(const raft::handle_t& user_handle,
     std::make_shared<RandomForest<float, int>>(rf_params, RF_type::CLASSIFICATION);
   rf_classifier->fit(user_handle, input, n_rows, n_cols, labels, n_unique_labels, forest);
 }
-
-/*** NEW CODE ***/
-void fitX(const raft::handle_t& user_handle,
-         RandomForestClassifierF*& forest,
-         float* input,
-         int n_rows,
-         int n_cols,
-         int* labels,
-         int n_unique_labels,
-         RF_params rf_params,
-         rapids_logger::level_enum verbosity)
-{
-  raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
-  ML::default_logger().set_level(verbosity);
-  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
-  forest->trees.resize(rf_params.n_trees);
-  forest->rf_params = rf_params;
-
-  std::shared_ptr<RandomForest<float, int>> rf_classifier =
-    std::make_shared<RandomForest<float, int>>(rf_params, RF_type::CLASSIFICATION);
-  rf_classifier->fit(user_handle, input, n_rows, n_cols, labels, n_unique_labels, forest);
-}
-/*** END NEW CODE ***/
-
 
 void fit(const raft::handle_t& user_handle,
          RandomForestClassifierD*& forest,
@@ -416,6 +393,8 @@ void fit(const raft::handle_t& user_handle,
          RF_params rf_params,
          rapids_logger::level_enum verbosity)
 {
+  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
   ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");

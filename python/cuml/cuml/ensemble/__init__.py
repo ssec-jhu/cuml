@@ -17,3 +17,6 @@
 
 from cuml.ensemble.randomforestclassifier import RandomForestClassifier
 from cuml.ensemble.randomforestregressor import RandomForestRegressor
+
+from cuml.ensemble.sporfclassifier import SPORFClassifier
+from cuml.ensemble.sporfregressor import SPORFRegressor

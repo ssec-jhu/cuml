@@ -42,6 +42,10 @@ from cuml.decomposition.pca import PCA
 from cuml.decomposition.tsvd import TruncatedSVD
 from cuml.ensemble.randomforestclassifier import RandomForestClassifier
 from cuml.ensemble.randomforestregressor import RandomForestRegressor
+
+from cuml.ensemble.sporfclassifier import SPORFClassifier
+from cuml.ensemble.sporfregressor import SPORFRegressor
+
 from cuml.explainer.kernel_shap import KernelExplainer
 from cuml.explainer.permutation_shap import PermutationExplainer
 from cuml.explainer.tree_shap import TreeExplainer
