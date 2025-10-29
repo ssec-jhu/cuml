@@ -24,11 +24,17 @@ namespace ML {
 
 namespace DT {
 
+typedef enum {
+  HISTOGRAM_METHOD_EXACT = 0,
+  HISTOGRAM_METHOD_SAMPLED
+} HISTOGRAM_METHOD;
+
 struct SPORFDecisionTreeParams : DecisionTreeParams {
   /**
    * Additional parameter(s) required for SPORF
    */
-  int TBD;
+  float density;
+  HISTOGRAM_METHOD histogram_method;
 };
 
 /***
