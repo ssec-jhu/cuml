@@ -85,7 +85,7 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
         int n_trees
         bool bootstrap
         float max_samples
-        int seed
+        uint64_t seed
         pass
 
     cdef cppclass SPORFMetaData[T, L]:
@@ -544,6 +544,9 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                         <int> self.max_batch_size,
                                         <float> self.density,
                                         <HISTOGRAM_METHOD> self.histogram_method)
+
+        print( "density:", self.density )
+        print( "histogram_method:", self.histogram_method )
 
         if self.dtype == np.float32:
             fit(handle_[0],
