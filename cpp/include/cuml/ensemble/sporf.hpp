@@ -129,7 +129,8 @@ SPORF_params set_sporf_params(int max_depth,
                               CRITERION split_criterion,
                               int cfg_n_streams,
                               int max_batch_size,
-                              int TBD );
+                              float density,                // SPORF paramsters
+                              DT::HISTOGRAM_METHOD histogram_method );
 
 // ----------------------------- Regression ----------------------------------- //
 

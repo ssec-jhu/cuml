@@ -26,7 +26,7 @@ namespace DT {
 
 typedef enum {
   HISTOGRAM_METHOD_EXACT = 0,
-  HISTOGRAM_METHOD_SAMPLED
+  HISTOGRAM_METHOD_SAMPLED = 1
 } HISTOGRAM_METHOD;
 
 struct SPORFDecisionTreeParams : DecisionTreeParams {

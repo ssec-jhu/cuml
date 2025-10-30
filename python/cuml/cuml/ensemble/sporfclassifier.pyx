@@ -41,28 +41,45 @@ from pylibraft.common.handle cimport handle_t
 from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
+cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT" nogil:
+
+# defined in sporfdecisiontree.hpp
+#
+# namespace ML {
+#   namespace DT {
+#
+#     typedef enum {
+#        HISTOGRAM_METHOD_EXACT = 0,
+#        HISTOGRAM_METHOD_SAMPLED = 1
+#     } HISTOGRAM_METHOD;
+
+    ctypedef enum HISTOGRAM_METHOD:
+        HISTOGRAM_METHOD_EXACT = 0,
+        HISTOGRAM_METHOD_SAMPLED = 1
 
 cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
 
 # defined in sporf.hpp
 #
-# struct SPORF_params {
-#   ... RF_params members ...
-#   int n_trees;
-#   bool bootstrap;
-#   float max_samples;
-#   uint64_t seed;
-#   int n_streams;
+# namespace ML {
 #
-#   DT::SPORFDecisionTreeParams tree_params;
-# };
+#   struct SPORF_params {
+#     ... RF_params members ...
+#     int n_trees;
+#     bool bootstrap;
+#     float max_samples;
+#     uint64_t seed;
+#     int n_streams;
 #
-# template <class T, class L>
-# struct SPORFMetaData {
-#   std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
-#   SPORF_params rf_params;
-# };
-
+#     DT::SPORFDecisionTreeParams tree_params;
+#   };
+#
+#   template <class T, class L>
+#   struct SPORFMetaData {
+#     std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
+#     SPORF_params rf_params;
+#   };
+# }; // (namespace ML)
 
     cdef cppclass SPORF_params:
         int n_trees
@@ -90,7 +107,8 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                                         CRITERION,
                                         int,
                                         int,
-                                        int) except +
+                                        float,
+                                        HISTOGRAM_METHOD) except +
 
     ctypedef SPORFMetaData[float, int] SPORFClassifierF
     ctypedef SPORFMetaData[double, int] SPORFClassifierD
@@ -295,6 +313,15 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
     RF_type = CLASSIFICATION
 
     @classmethod
+    def _get_param_names(cls):
+        print( "HELLO FROM _get_param_names() IN sporfclassifier.pyx")
+        return [
+            *super()._get_param_names(),    # class BaseRandomForestModel(Base, InteropMixin) in randomforest_common.pyx
+            "device",
+            "histogram_method",
+        ]
+
+    @classmethod
     def _params_from_cpu(cls, model):
         if model.class_weight is not None:
             raise UnsupportedOnGPU("`class_weight` is not supported")
@@ -315,15 +342,29 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             **super()._attrs_to_cpu(model),
         }
 
-    def __init__(self, *, split_criterion=0, handle=None, verbose=False,
+    def __init__(self,
+                 *,
+                 split_criterion=0,                 # random forest parameters
+                 handle=None,
+                 verbose=False,
                  output_type=None,
+                 density=0.0,                       # SPORF-specific parameters
+                 histogram_method=HISTOGRAM_METHOD_EXACT,
                  **kwargs):
+
+        print( 'HELLO FROM __init__ IN sporfclassifier.pyx')
+
         super().__init__(
             split_criterion=split_criterion,
             handle=handle,
             verbose=verbose,
             output_type=output_type,
             **kwargs)
+
+        # initialize SPORF-specific instance variables
+        self.density = density
+        self.histogram_method = histogram_method
+        return    
 
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
@@ -501,7 +542,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                         <CRITERION> self.split_criterion,
                                         <int> self.n_streams,
                                         <int> self.max_batch_size,
-                                        <int> 0)            # TODO: TBD   
+                                        <float> self.density,
+                                        <HISTOGRAM_METHOD> self.histogram_method)
 
         if self.dtype == np.float32:
             fit(handle_[0],

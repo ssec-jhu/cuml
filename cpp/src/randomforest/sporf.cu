@@ -68,7 +68,8 @@ SPORF_params set_sporf_params(int max_depth,
                               CRITERION split_criterion,
                               int cfg_n_streams,
                               int max_batch_size,
-                              int TBD )                     // SPORF-specific parameters
+                              float density,                // SPORF-specific parameters
+                              DT::HISTOGRAM_METHOD histogram_method )
 {
   DT::SPORFDecisionTreeParams tree_params;
   DT::set_tree_params(tree_params,
@@ -82,8 +83,11 @@ SPORF_params set_sporf_params(int max_depth,
                       split_criterion,
                       max_batch_size);
 
+  // initialize SPORF-specific members in the SPORFDecisionTreeParams struct
+  tree_params.density = density;
+  tree_params.histogram_method = histogram_method;
+  
   // initialize RF_params members
-  tree_params.TBD = TBD;                      
   SPORF_params rf_params;
   rf_params.n_trees     = n_trees;
   rf_params.bootstrap   = bootstrap;
@@ -91,9 +95,6 @@ SPORF_params set_sporf_params(int max_depth,
   rf_params.seed        = seed;
   rf_params.n_streams   = min(cfg_n_streams, omp_get_max_threads());
   if (n_trees < rf_params.n_streams) rf_params.n_streams = n_trees;
-
-  // initialize SPORF-specific members in the SPORFDecisionTreeParams struct
-  tree_params.TBD = TBD;  
 
   rf_params.tree_params = tree_params;
   validity_check(rf_params);

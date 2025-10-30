@@ -93,8 +93,7 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                           level_enum) except +
 
 
-class RandomForestClassifier(BaseRandomForestModel,
-                             ClassifierMixin):
+class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     """
     Implements a Random Forest classifier model which fits multiple decision
     tree classifiers in an ensemble.

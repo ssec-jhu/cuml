@@ -115,6 +115,9 @@ class BaseRandomForestModel(Base, InteropMixin):
 
     @classmethod
     def _get_param_names(cls):
+        
+        print( "HELLO FROM _get_param_names() IN randomforest_common.pyx!")
+
         return [
             *super()._get_param_names(),
             "split_criterion",
@@ -139,6 +142,9 @@ class BaseRandomForestModel(Base, InteropMixin):
 
     @classmethod
     def _params_from_cpu(cls, model):
+
+        print( 'HELLO FROM _params_from_cpu IN randomforest_common.pyx')
+
         if model.oob_score:
             raise UnsupportedOnGPU("`oob_score=True` is not supported")
 
@@ -188,6 +194,9 @@ class BaseRandomForestModel(Base, InteropMixin):
         }
 
     def _params_to_cpu(self):
+
+        print( 'HELLO FROM _params_to_cpu IN randomforest_common.pyx')
+
         if (criterion := _split_criterion_to_criterion.get(self.split_criterion)) is None:
             raise UnsupportedOnCPU(
                 f"`split_criterion={self.split_criterion!r}` is not supported"
@@ -261,6 +270,9 @@ class BaseRandomForestModel(Base, InteropMixin):
         verbose=False,
         output_type=None,
     ):
+
+        print( 'HELLO FROM __init__ IN randomforest_common.pyx')
+
         if handle is None:
             handle = Handle(n_streams=n_streams)
 
