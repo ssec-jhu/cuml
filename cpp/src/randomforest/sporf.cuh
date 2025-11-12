@@ -35,6 +35,7 @@
 
 #include <decisiontree/batched-levelalgo/quantiles.cuh>
 #include <decisiontree/decisiontree.cuh>
+#include <decisiontree/sporfdecisiontree.cuh>
 #include <decisiontree/treelite_util.h>
 
 #ifdef _OPENMP
@@ -174,6 +175,10 @@ class SPORF {
       selected_rows.emplace_back(n_sampled_rows, handle.get_stream_from_stream_pool(i));
     }
 
+
+    printf( "**** top of parallel loops: n_streams=%d n_trees=%d\n", n_streams, this->rf_params.n_trees );
+
+
 #pragma omp parallel for num_threads(n_streams)
     for (int i = 0; i < this->rf_params.n_trees; i++) {
       int stream_id = omp_get_thread_num();
@@ -190,18 +195,18 @@ class SPORF {
           (b) a pointer to a list of row numbers w.r.t original data.
       */
 
-      forest->trees[i] = DT::DecisionTree::fit(handle,
-                                               s,
-                                               input,
-                                               n_cols,
-                                               n_rows,
-                                               labels,
-                                               &selected_rows[stream_id],
-                                               n_unique_labels,
-                                               this->rf_params.tree_params,
-                                               this->rf_params.seed,
-                                               quantiles,
-                                               i);
+      forest->trees[i] = DT::SPORFDecisionTree::fit(handle,
+                                                    s,
+                                                    input,
+                                                    n_cols,
+                                                    n_rows,
+                                                    labels,
+                                                    &selected_rows[stream_id],
+                                                    n_unique_labels,
+                                                    this->rf_params.tree_params,
+                                                    this->rf_params.seed,
+                                                    quantiles,
+                                                    i);
     }
     // Cleanup
     handle.sync_stream_pool();

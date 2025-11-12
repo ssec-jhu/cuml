@@ -292,6 +292,12 @@ struct Builder {
       calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
 
+
+
+    //if( this->builder_stream == handle.get_stream_from_stream_pool(0) )
+  printf( "Builder::workspaceSize (%s line %d): d_wsize=%lu h_wsize=%lu\n", __FILE__, __LINE__, d_wsize, h_wsize );
+
+
     return std::make_pair(d_wsize, h_wsize);
   }
 
