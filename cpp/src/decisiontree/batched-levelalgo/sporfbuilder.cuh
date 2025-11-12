@@ -1,4 +1,6 @@
 /*
+ * sporfbuilder.cuh
+ *
  * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +24,7 @@
 
 #include <cuml/common/pinned_host_vector.hpp>
 #include <cuml/tree/decisiontree.hpp>
+#include <cuml/tree/sporfdecisiontree.hpp>
 #include <cuml/tree/flatnode.h>
 
 #include <raft/core/handle.hpp>
@@ -42,15 +45,15 @@ namespace DT {
  * in the host.
  */
 template <typename DataT, typename LabelT>
-class NodeQueue {
+class SPORFNodeQueue {
   using NodeT = SparseTreeNode<DataT, LabelT>;
-  const DecisionTreeParams params;
+  const SPORFDecisionTreeParams params;
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> tree;
   std::vector<InstanceRange> node_instances_;
   std::deque<NodeWorkItem> work_items_;
 
  public:
-  NodeQueue(DecisionTreeParams params, size_t max_nodes, size_t sampled_rows, int num_outputs)
+  SPORFNodeQueue(SPORFDecisionTreeParams params, size_t max_nodes, size_t sampled_rows, int num_outputs)
     : params(params), tree(std::make_shared<DT::TreeMetaDataNode<DataT, LabelT>>())
   {
     tree->num_outputs = num_outputs;
@@ -143,7 +146,7 @@ class NodeQueue {
  * Internal struct used to do all the heavy-lifting required for tree building
  */
 template <typename ObjectiveT>
-struct Builder {
+struct SPORFBuilder {
   typedef typename ObjectiveT::DataT DataT;
   typedef typename ObjectiveT::LabelT LabelT;
   typedef typename ObjectiveT::IdxT IdxT;
@@ -160,7 +163,7 @@ struct Builder {
   /** stream to launch kernels */
   cudaStream_t builder_stream;
   /** DT params */
-  DecisionTreeParams params;
+  SPORFDecisionTreeParams params;
   /** input dataset */
   DatasetT dataset;
   /** quantiles */
@@ -199,11 +202,11 @@ struct Builder {
   /** pinned host buffer to store the trained nodes */
   ML::pinned_host_vector<char> h_buff;
 
-  Builder(const raft::handle_t& handle,
+  SPORFBuilder(const raft::handle_t& handle,
           cudaStream_t s,
           IdxT treeid,
           uint64_t seed,
-          const DecisionTreeParams& p,
+          const SPORFDecisionTreeParams& p,
           const DataT* data,
           const LabelT* labels,
           IdxT n_rows,
@@ -272,7 +275,7 @@ struct Builder {
   auto workspaceSize() const
   {
     size_t d_wsize = 0, h_wsize = 0;
-    raft::common::nvtx::range fun_scope("Builder::workspaceSize @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range fun_scope("SPORFBuilder::workspaceSize @sporfbuilder.cuh [batched-levelalgo]");
     auto max_batch = params.max_batch_size;
     size_t max_len_histograms =
       max_batch * params.max_n_bins * n_blks_for_cols * dataset.num_outputs;
@@ -292,6 +295,12 @@ struct Builder {
       calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
 
+
+
+    //if( this->builder_stream == handle.get_stream_from_stream_pool(0) )
+  printf( "SPORFBuilder::workspaceSize (%s line %d): d_wsize=%lu h_wsize=%lu\n", __FILE__, __LINE__, d_wsize, h_wsize );
+
+
     return std::make_pair(d_wsize, h_wsize);
   }
 
@@ -305,7 +314,7 @@ struct Builder {
   void assignWorkspace(char* d_wspace, char* h_wspace)
   {
     raft::common::nvtx::range fun_scope(
-      "Builder::assignWorkspace @builder.cuh [batched-levelalgo]");
+      "SPORFBuilder::assignWorkspace @sporfbuilder.cuh [batched-levelalgo]");
     auto max_batch  = params.max_batch_size;
     auto n_col_blks = n_blks_for_cols;
     size_t max_len_histograms =
@@ -346,9 +355,9 @@ struct Builder {
    */
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> train()
   {
-    raft::common::nvtx::range fun_scope("Builder::train @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range fun_scope("SPORFBuilder::train @sporfbuilder.cuh [batched-levelalgo]");
     MLCommon::TimerCPU timer;
-    NodeQueue<DataT, LabelT> queue(
+    SPORFNodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs);
     while (queue.HasWork()) {
       auto work_items                      = queue.Pop();
@@ -385,7 +394,7 @@ struct Builder {
 
   auto doSplit(const std::vector<NodeWorkItem>& work_items)
   {
-    raft::common::nvtx::range fun_scope("Builder::doSplit @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range fun_scope("SPORFBuilder::doSplit @sporfbuilder.cuh [batched-levelalgo]");
     // start fresh on the number of *new* nodes created in this batch
     RAFT_CUDA_TRY(cudaMemsetAsync(n_nodes, 0, sizeof(IdxT), builder_stream));
     initSplit<DataT, IdxT, TPB_DEFAULT>(splits, work_items.size(), builder_stream);
@@ -478,7 +487,7 @@ struct Builder {
     }
 
     // create child nodes (or make the current ones leaf)
-    raft::common::nvtx::push_range("nodeSplitKernel @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
     launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
                                                             params.min_samples_leaf,
                                                             params.min_samples_split,
@@ -511,6 +520,9 @@ struct Builder {
     auto available_smem = handle.get_device_properties().sharedMemPerBlock;
     size_t smem_size    = std::max(smem_size_1, smem_size_2);
     ASSERT(available_smem >= smem_size, "Not enough shared memory. Consider reducing max_n_bins.");
+
+    printf( "SPORFBuilder::computeSplitSmemSize: smem_size=%ld\n", static_cast<size_t>(smem_size) );
+
     return smem_size;
   }
 
@@ -518,7 +530,7 @@ struct Builder {
   {
     // if no instances to split, return
     if (n_blocks_dimx == 0) return;
-    raft::common::nvtx::range fun_scope("Builder::computeSplit @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range fun_scope("SPORFBuilder::computeSplit @sporfbuilder.cuh [batched-levelalgo]");
     auto n_bins    = params.max_n_bins;
     auto n_classes = dataset.num_outputs;
     // if columns left to be processed lesser than `n_blks_for_cols`, shrink the blocks along dimy
@@ -533,7 +545,7 @@ struct Builder {
     // create the objective function object
     ObjectiveT objective(dataset.num_outputs, params.min_samples_leaf);
     // call the computeSplitKernel
-    raft::common::nvtx::range kernel_scope("computeSplitKernel @builder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range kernel_scope("computeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
     launchComputeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(histograms,
                                                                params.max_n_bins,
                                                                params.max_depth,

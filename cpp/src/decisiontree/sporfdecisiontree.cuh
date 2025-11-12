@@ -19,6 +19,7 @@
 #pragma once
 
 #include "batched-levelalgo/builder.cuh"
+#include "batched-levelalgo/sporfbuilder.cuh"
 #include "batched-levelalgo/quantiles.cuh"
 #include "treelite_util.h"
 
@@ -68,7 +69,7 @@ class SPORFDecisionTree {
     const LabelT* labels,
     rmm::device_uvector<int>* row_ids,
     int unique_labels,
-    DecisionTreeParams params,
+    SPORFDecisionTreeParams params,
     uint64_t seed,
     const Quantiles<DataT, int>& quantiles,
     int treeid)
@@ -82,91 +83,91 @@ class SPORFDecisionTree {
     using IdxT = int;
     // Dispatch objective
     if (not std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GINI) {
-      return Builder<GiniObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                 s,
-                                                                 treeid,
-                                                                 seed,
-                                                                 params,
-                                                                 data,
-                                                                 labels,
-                                                                 nrows,
-                                                                 ncols,
-                                                                 row_ids,
-                                                                 unique_labels,
-                                                                 quantiles)
+      return SPORFBuilder<GiniObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                      s,
+                                                                      treeid,
+                                                                      seed,
+                                                                      params,
+                                                                      data,
+                                                                      labels,
+                                                                      nrows,
+                                                                      ncols,
+                                                                      row_ids,
+                                                                      unique_labels,
+                                                                      quantiles)
         .train();
     } else if (not std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::ENTROPY) {
-      return Builder<EntropyObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                    s,
-                                                                    treeid,
-                                                                    seed,
-                                                                    params,
-                                                                    data,
-                                                                    labels,
-                                                                    nrows,
-                                                                    ncols,
-                                                                    row_ids,
-                                                                    unique_labels,
-                                                                    quantiles)
+      return SPORFBuilder<EntropyObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                         s,
+                                                                         treeid,
+                                                                         seed,
+                                                                         params,
+                                                                         data,
+                                                                         labels,
+                                                                         nrows,
+                                                                         ncols,
+                                                                         row_ids,
+                                                                         unique_labels,
+                                                                         quantiles)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
-      return Builder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                s,
-                                                                treeid,
-                                                                seed,
-                                                                params,
-                                                                data,
-                                                                labels,
-                                                                nrows,
-                                                                ncols,
-                                                                row_ids,
-                                                                unique_labels,
-                                                                quantiles)
+      return SPORFBuilder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                     s,
+                                                                     treeid,
+                                                                     seed,
+                                                                     params,
+                                                                     data,
+                                                                     labels,
+                                                                     nrows,
+                                                                     ncols,
+                                                                     row_ids,
+                                                                     unique_labels,
+                                                                     quantiles)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::POISSON) {
-      return Builder<PoissonObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                    s,
-                                                                    treeid,
-                                                                    seed,
-                                                                    params,
-                                                                    data,
-                                                                    labels,
-                                                                    nrows,
-                                                                    ncols,
-                                                                    row_ids,
-                                                                    unique_labels,
-                                                                    quantiles)
+      return SPORFBuilder<PoissonObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                         s,
+                                                                         treeid,
+                                                                         seed,
+                                                                         params,
+                                                                         data,
+                                                                         labels,
+                                                                         nrows,
+                                                                         ncols,
+                                                                         row_ids,
+                                                                         unique_labels,
+                                                                         quantiles)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
-      return Builder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                  s,
-                                                                  treeid,
-                                                                  seed,
-                                                                  params,
-                                                                  data,
-                                                                  labels,
-                                                                  nrows,
-                                                                  ncols,
-                                                                  row_ids,
-                                                                  unique_labels,
-                                                                  quantiles)
+      return SPORFBuilder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                       s,
+                                                                       treeid,
+                                                                       seed,
+                                                                       params,
+                                                                       data,
+                                                                       labels,
+                                                                       nrows,
+                                                                       ncols,
+                                                                       row_ids,
+                                                                       unique_labels,
+                                                                       quantiles)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::INVERSE_GAUSSIAN) {
-      return Builder<InverseGaussianObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                            s,
-                                                                            treeid,
-                                                                            seed,
-                                                                            params,
-                                                                            data,
-                                                                            labels,
-                                                                            nrows,
-                                                                            ncols,
-                                                                            row_ids,
-                                                                            unique_labels,
-                                                                            quantiles)
+      return SPORFBuilder<InverseGaussianObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                                 s,
+                                                                                 treeid,
+                                                                                 seed,
+                                                                                 params,
+                                                                                 data,
+                                                                                 labels,
+                                                                                 nrows,
+                                                                                 ncols,
+                                                                                 row_ids,
+                                                                                 unique_labels,
+                                                                                 quantiles)
         .train();
     } else {
       ASSERT(false, "Unknown split criterion.");
