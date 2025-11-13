@@ -19,6 +19,7 @@
 #pragma once
 
 #include "kernels/builder_kernels.cuh"
+#include "kernels/sporf_builder_kernels.cuh"
 
 #include <common/Timer.h>
 
@@ -49,8 +50,8 @@ class SPORFNodeQueue {
   using NodeT = SparseTreeNode<DataT, LabelT>;
   const SPORFDecisionTreeParams params;
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> tree;
-  std::vector<InstanceRange> node_instances_;
-  std::deque<NodeWorkItem> work_items_;
+  std::vector<SPORFDT::InstanceRange> node_instances_;
+  std::deque<SPORFDT::NodeWorkItem> work_items_;
 
  public:
   SPORFNodeQueue(SPORFDecisionTreeParams params, size_t max_nodes, size_t sampled_rows, int num_outputs)
@@ -62,20 +63,20 @@ class SPORFNodeQueue {
     tree->leaf_counter  = 1;
     tree->depth_counter = 0;
     node_instances_.reserve(max_nodes);
-    node_instances_.emplace_back(InstanceRange{0, sampled_rows});
+    node_instances_.emplace_back(SPORFDT::InstanceRange{0, sampled_rows});
     if (this->IsExpandable(tree->sparsetree.back(), 0)) {
-      work_items_.emplace_back(NodeWorkItem{0, 0, node_instances_.back()});
+      work_items_.emplace_back(SPORFDT::NodeWorkItem{0, 0, node_instances_.back()});
     }
   }
 
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> GetTree() { return tree; }
-  const std::vector<InstanceRange>& GetInstanceRanges() { return node_instances_; }
+  const std::vector<SPORFDT::InstanceRange>& GetInstanceRanges() { return node_instances_; }
 
   bool HasWork() { return work_items_.size() > 0; }
 
   auto Pop()
   {
-    std::vector<NodeWorkItem> result;
+    std::vector<SPORFDT::NodeWorkItem> result;
     result.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
     while (work_items_.size() > 0 && result.size() < std::size_t(params.max_batch_size)) {
       result.emplace_back(work_items_.front());
@@ -94,7 +95,7 @@ class SPORFNodeQueue {
   }
 
   template <typename SplitT>
-  void Push(const std::vector<NodeWorkItem>& work_items, SplitT* h_splits)
+  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items, SplitT* h_splits)
   {
     // Update node queue based on splits
     for (std::size_t i = 0; i < work_items.size(); i++) {
@@ -117,23 +118,23 @@ class SPORFNodeQueue {
       tree->leaf_counter++;
       // left
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(split.nLeft));
-      node_instances_.emplace_back(InstanceRange{parent_range.begin, std::size_t(split.nLeft)});
+      node_instances_.emplace_back(SPORFDT::InstanceRange{parent_range.begin, std::size_t(split.nLeft)});
 
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
-          NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
+          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
       }
 
       // right
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(parent_range.count - split.nLeft));
       node_instances_.emplace_back(
-        InstanceRange{parent_range.begin + split.nLeft, parent_range.count - split.nLeft});
+        SPORFDT::InstanceRange{parent_range.begin + split.nLeft, parent_range.count - split.nLeft});
 
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
-          NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
+          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
       }
 
       // update depth
@@ -183,11 +184,11 @@ struct SPORFBuilder {
   /** best splits for the current batch of nodes */
   SplitT* splits;
   /** current batch of nodes */
-  NodeWorkItem* d_work_items;
+  SPORFDT::NodeWorkItem* d_work_items;
   /** device AOS to map CTA blocks along dimx to nodes of a batch */
-  WorkloadInfo<IdxT>* workload_info;
+  SPORFDT::WorkloadInfo<IdxT>* workload_info;
   /** host AOS to map CTA blocks along dimx to nodes of a batch */
-  WorkloadInfo<IdxT>* h_workload_info;
+  SPORFDT::WorkloadInfo<IdxT>* h_workload_info;
   /** maximum CTA blocks along dimx */
   int max_blocks_dimx = 0;
   /** host array of splits */
@@ -285,14 +286,14 @@ struct SPORFBuilder {
     d_wsize += calculateAlignedBytes(sizeof(int) * max_batch * n_blks_for_cols);  // done_count
     d_wsize += calculateAlignedBytes(sizeof(int) * max_batch);                    // mutex
     d_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);                 // splits
-    d_wsize += calculateAlignedBytes(sizeof(NodeWorkItem) * max_batch);           // d_work_Items
+    d_wsize += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);           // d_work_Items
     d_wsize +=                                                                    // workload_info
-      calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
+      calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     d_wsize += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);  // colids
 
     // all nodes in the tree
     h_wsize +=  // h_workload_info
-      calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
+      calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
 
 
@@ -330,10 +331,10 @@ struct SPORFBuilder {
     d_wspace += calculateAlignedBytes(sizeof(int) * max_batch);
     splits = reinterpret_cast<SplitT*>(d_wspace);
     d_wspace += calculateAlignedBytes(sizeof(SplitT) * max_batch);
-    d_work_items = reinterpret_cast<NodeWorkItem*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(NodeWorkItem) * max_batch);
-    workload_info = reinterpret_cast<WorkloadInfo<IdxT>*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
+    d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(d_wspace);
+    d_wspace += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);
+    workload_info = reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(d_wspace);
+    d_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     colids = reinterpret_cast<IdxT*>(d_wspace);
     d_wspace += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);
 
@@ -342,8 +343,8 @@ struct SPORFBuilder {
     RAFT_CUDA_TRY(cudaMemsetAsync(mutex, 0, sizeof(int) * max_batch, builder_stream));
 
     // host
-    h_workload_info = reinterpret_cast<WorkloadInfo<IdxT>*>(h_wspace);
-    h_wspace += calculateAlignedBytes(sizeof(WorkloadInfo<IdxT>) * max_blocks_dimx);
+    h_workload_info = reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(h_wspace);
+    h_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_splits = reinterpret_cast<SplitT*>(h_wspace);
     h_wspace += calculateAlignedBytes(sizeof(SplitT) * max_batch);
   }
@@ -371,7 +372,7 @@ struct SPORFBuilder {
   }
 
  private:
-  auto updateWorkloadInfo(const std::vector<NodeWorkItem>& work_items)
+  auto updateWorkloadInfo(const std::vector<SPORFDT::NodeWorkItem>& work_items)
   {
     int n_large_nodes = 0;  // large nodes are nodes having training instances larger than block
                             // size, hence require global memory for histogram construction
@@ -392,7 +393,7 @@ struct SPORFBuilder {
     return std::make_pair(n_blocks_dimx, n_large_nodes);
   }
 
-  auto doSplit(const std::vector<NodeWorkItem>& work_items)
+  auto doSplit(const std::vector<SPORFDT::NodeWorkItem>& work_items)
   {
     raft::common::nvtx::range fun_scope("SPORFBuilder::doSplit @sporfbuilder.cuh [batched-levelalgo]");
     // start fresh on the number of *new* nodes created in this batch
@@ -488,7 +489,7 @@ struct SPORFBuilder {
 
     // create child nodes (or make the current ones leaf)
     raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
-    launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
+    SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
                                                             params.min_samples_leaf,
                                                             params.min_samples_split,
                                                             params.max_leaves,
@@ -570,7 +571,7 @@ struct SPORFBuilder {
 
   // Set the leaf value predictions in batch
   void SetLeafPredictions(std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> tree,
-                          const std::vector<InstanceRange>& instance_ranges)
+                          const std::vector<SPORFDT::InstanceRange>& instance_ranges)
   {
     tree->vector_leaf.resize(tree->sparsetree.size() * dataset.num_outputs);
     ASSERT(tree->sparsetree.size() == instance_ranges.size(),
@@ -578,7 +579,7 @@ struct SPORFBuilder {
     // do this in batch to reduce peak memory usage in extreme cases
     std::size_t max_batch_size = min(std::size_t(100000), tree->sparsetree.size());
     rmm::device_uvector<NodeT> d_tree(max_batch_size, builder_stream);
-    rmm::device_uvector<InstanceRange> d_instance_ranges(max_batch_size, builder_stream);
+    rmm::device_uvector<SPORFDT::InstanceRange> d_instance_ranges(max_batch_size, builder_stream);
     rmm::device_uvector<DataT> d_leaves(max_batch_size * dataset.num_outputs, builder_stream);
 
     ObjectiveT objective(dataset.num_outputs, params.min_samples_leaf);
@@ -594,7 +595,7 @@ struct SPORFBuilder {
       RAFT_CUDA_TRY(
         cudaMemsetAsync(d_leaves.data(), 0, sizeof(DataT) * d_leaves.size(), builder_stream));
       size_t smem_size = sizeof(BinT) * dataset.num_outputs;
-      launchLeafKernel(objective,
+      SPORFDT::launchLeafKernel(objective,
                        dataset,
                        d_tree.data(),
                        d_instance_ranges.data(),
