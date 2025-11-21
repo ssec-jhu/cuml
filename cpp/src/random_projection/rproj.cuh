@@ -146,30 +146,61 @@ void RPROJtransform(const raft::handle_t& handle,
                     rand_mat<math_t>* random_matrix,
                     math_t* output,
                     paramsRPROJ* params)
+                    {
+                      RPROJtransform(handle,
+                                     false,
+                                     input,
+                                     false,
+                                     random_matrix,
+                                     output,
+                                     params);
+                    }
+
+template <typename math_t>
+void RPROJtransform(const raft::handle_t& handle,
+                    bool transInput,
+                    math_t* input,
+                    bool transRandomMatrix,
+                    rand_mat<math_t>* random_matrix,
+                    math_t* output,
+                    paramsRPROJ* params)
 {
   cudaStream_t stream = handle.get_stream();
 
   check_parameters(*params);
 
+  const math_t alfa = 1;
+  const math_t beta = 0;
+
+  auto& m = params->n_samples;
+  auto& n = params->n_components;
+  auto& k = params->n_features;
+
+  cublasOperation_t opIn = CUBLAS_OP_N;
+  if (transInput) {
+    opIn = CUBLAS_OP_T;
+    k = params->n_samples;
+    m = params->n_features;
+  }
+
+  cublasOperation_t opRandMat = CUBLAS_OP_N;
+  if (transRandomMatrix) {
+    opRandMat = CUBLAS_OP_T;
+    n = params->n_features;
+  }
+
+  auto& lda = m;
+  auto& ldb = k;
+  auto& ldc = m;
+
   if (random_matrix->type == dense) {
     cublasHandle_t cublas_handle = handle.get_cublas_handle();
 
-    const math_t alfa = 1;
-    const math_t beta = 0;
-
-    auto& m = params->n_samples;
-    auto& n = params->n_components;
-    auto& k = params->n_features;
-
-    auto& lda = m;
-    auto& ldb = k;
-    auto& ldc = m;
-
     // #TODO: Call from public API when ready
     RAFT_CUBLAS_TRY(raft::linalg::detail::cublasgemm(cublas_handle,
-                                                     CUBLAS_OP_N,
-                                                     CUBLAS_OP_N,
-                                                     params->n_samples,
+                                                     opIn,
+                                                     opRandMat,
+                                                     m,
                                                      n,
                                                      k,
                                                      &alfa,
@@ -183,18 +214,8 @@ void RPROJtransform(const raft::handle_t& handle,
                                                      stream));
 
   } else if (random_matrix->type == sparse) {
-    auto cusparse_handle = handle.get_cusparse_handle();
-
-    const math_t alfa = 1;
-    const math_t beta = 0;
-
-    auto& m         = params->n_samples;
-    auto& n         = params->n_components;
-    auto& k         = params->n_features;
+    cusparseHandle_t cusparse_handle = handle.get_cusparse_handle();
     std::size_t nnz = random_matrix->sparse_data.size();
-
-    auto& lda = m;
-    auto& ldc = m;
 
     // TODO: Need to wrap this in a RAFT public API.
     RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsegemmi(cusparse_handle,
