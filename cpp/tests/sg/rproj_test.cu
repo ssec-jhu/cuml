@@ -33,7 +33,7 @@
 
 namespace ML {
 
-template <typename T, int N, int M>
+template <typename T, int N, int M, bool USE_ROW_MAJOR = false>
 class RPROJTest : public ::testing::Test {
  public:
   RPROJTest()
@@ -80,7 +80,12 @@ class RPROJTest : public ::testing::Test {
 
     d_output1.resize(N * params1.n_components, stream);
     rmm::device_uvector<T> tmp(d_output1.size(), stream);
-    RPROJtransform(handle, d_input.data(), &random_matrix1, tmp.data(), &params1);
+
+    if (USE_ROW_MAJOR) {
+      RPROJtransform(handle, true, d_input.data(), false, &random_matrix1, tmp.data(), &params1);
+    } else {
+      RPROJtransform(handle, d_input.data(), &random_matrix1, tmp.data(), &params1);
+    }
 
     raft::linalg::transpose(handle,
                             tmp.data(),
@@ -109,7 +114,12 @@ class RPROJTest : public ::testing::Test {
 
     d_output2.resize(N * params2.n_components, stream);
     rmm::device_uvector<T> tmp(d_output2.size(), stream);
-    RPROJtransform(handle, d_input.data(), &random_matrix2, tmp.data(), &params2);
+
+    if (USE_ROW_MAJOR) {
+      RPROJtransform(handle, true, d_input.data(), false, &random_matrix2, tmp.data(), &params2);
+    } else {
+      RPROJtransform(handle, d_input.data(), &random_matrix2, tmp.data(), &params2);
+    }
 
     raft::linalg::transpose(handle,
                             tmp.data(),
@@ -211,20 +221,36 @@ class RPROJTest : public ::testing::Test {
   rmm::device_uvector<T> d_output2;
 };
 
-typedef RPROJTest<float, 500, 2000> RPROJTestF1;
+typedef RPROJTest<float, 500, 2000, false> RPROJTestF1;
 TEST_F(RPROJTestF1, RandomMatrixCheck) { random_matrix_check(); }
 TEST_F(RPROJTestF1, EpsilonCheck) { epsilon_check(); }
 
-typedef RPROJTest<double, 500, 2000> RPROJTestD1;
+typedef RPROJTest<double, 500, 2000, false> RPROJTestD1;
 TEST_F(RPROJTestD1, RandomMatrixCheck) { random_matrix_check(); }
 TEST_F(RPROJTestD1, EpsilonCheck) { epsilon_check(); }
 
-typedef RPROJTest<float, 5000, 3500> RPROJTestF2;
+typedef RPROJTest<float, 5000, 3500, false> RPROJTestF2;
 TEST_F(RPROJTestF2, RandomMatrixCheck) { random_matrix_check(); }
 TEST_F(RPROJTestF2, EpsilonCheck) { epsilon_check(); }
 
-typedef RPROJTest<double, 5000, 3500> RPROJTestD2;
+typedef RPROJTest<double, 5000, 3500, false> RPROJTestD2;
 TEST_F(RPROJTestD2, RandomMatrixCheck) { random_matrix_check(); }
 TEST_F(RPROJTestD2, EpsilonCheck) { epsilon_check(); }
 
+
+typedef RPROJTest<float, 500, 2000, true> RPROJTestF3;
+TEST_F(RPROJTestF3, RandomMatrixCheck) { random_matrix_check(); }
+TEST_F(RPROJTestF3, EpsilonCheck) { epsilon_check(); }
+
+// typedef RPROJTest<double, 500, 2000, true> RPROJTestD3;
+// TEST_F(RPROJTestD3, RandomMatrixCheck) { random_matrix_check(); }
+// TEST_F(RPROJTestD3, EpsilonCheck) { epsilon_check(); }
+
+// typedef RPROJTest<float, 5000, 3500, true> RPROJTestF4;
+// TEST_F(RPROJTestF4, RandomMatrixCheck) { random_matrix_check(); }
+// TEST_F(RPROJTestF4, EpsilonCheck) { epsilon_check(); }
+
+// typedef RPROJTest<double, 5000, 3500, true> RPROJTestD4;
+// TEST_F(RPROJTestD4, RandomMatrixCheck) { random_matrix_check(); }
+// TEST_F(RPROJTestD4, EpsilonCheck) { epsilon_check(); }
 }  // end namespace ML

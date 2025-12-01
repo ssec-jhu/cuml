@@ -93,6 +93,15 @@ void RPROJtransform(const raft::handle_t& handle,
                     math_t* output,
                     paramsRPROJ* params);
 
+template <typename math_t>
+void RPROJtransform(const raft::handle_t& handle,
+                    bool transInput,
+                    math_t* input,
+                    bool transRandomMatrix,
+                    rand_mat<math_t>* random_matrix,
+                    math_t* output,
+                    paramsRPROJ* params);
+
 size_t johnson_lindenstrauss_min_dim(size_t n_samples, double eps);
 
 }  // namespace ML

@@ -176,22 +176,12 @@ void RPROJtransform(const raft::handle_t& handle,
   auto& n = params->n_components;
   auto& k = params->n_features;
 
-  cublasOperation_t opIn = CUBLAS_OP_N;
-  if (transInput) {
-    opIn = CUBLAS_OP_T;
-    k = params->n_samples;
-    m = params->n_features;
-  }
-
-  cublasOperation_t opRandMat = CUBLAS_OP_N;
-  if (transRandomMatrix) {
-    opRandMat = CUBLAS_OP_T;
-    n = params->n_features;
-  }
-
   auto& lda = m;
   auto& ldb = k;
   auto& ldc = m;
+
+  cublasOperation_t opIn = transInput ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t opRandMat = transRandomMatrix ? CUBLAS_OP_T : CUBLAS_OP_N;
 
   if (random_matrix->type == dense) {
     cublasHandle_t cublas_handle = handle.get_cublas_handle();
@@ -200,7 +190,7 @@ void RPROJtransform(const raft::handle_t& handle,
     RAFT_CUBLAS_TRY(raft::linalg::detail::cublasgemm(cublas_handle,
                                                      opIn,
                                                      opRandMat,
-                                                     m,
+                                                     params->n_samples,
                                                      n,
                                                      k,
                                                      &alfa,

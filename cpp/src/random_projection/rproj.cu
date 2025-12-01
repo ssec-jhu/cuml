@@ -39,4 +39,19 @@ template void RPROJtransform(const raft::handle_t& handle,
                              double* output,
                              paramsRPROJ* params);
 
+template void RPROJtransform(const raft::handle_t& handle,
+                             bool transInput,
+                             float* input,
+                             bool transRandomMatrix,
+                             rand_mat<float>* random_matrix,
+                             float* output,
+                             paramsRPROJ* params);
+template void RPROJtransform(const raft::handle_t& handle,
+                             bool transInput,
+                             double* input,
+                             bool transRandomMatrix,
+                             rand_mat<double>* random_matrix,
+                             double* output,
+                             paramsRPROJ* params);
+
 };  // namespace ML
