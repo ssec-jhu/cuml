@@ -150,7 +150,6 @@ void RPROJtransform(const raft::handle_t& handle,
                       RPROJtransform(handle,
                                      false,
                                      input,
-                                     false,
                                      random_matrix,
                                      output,
                                      params);
@@ -160,7 +159,6 @@ template <typename math_t>
 void RPROJtransform(const raft::handle_t& handle,
                     bool transInput,
                     math_t* input,
-                    bool transRandomMatrix,
                     rand_mat<math_t>* random_matrix,
                     math_t* output,
                     paramsRPROJ* params)
@@ -180,29 +178,25 @@ void RPROJtransform(const raft::handle_t& handle,
   auto& ldb = k;
   auto& ldc = m;
 
-  cublasOperation_t opIn = transInput ? CUBLAS_OP_T : CUBLAS_OP_N;
-  cublasOperation_t opRandMat = transRandomMatrix ? CUBLAS_OP_T : CUBLAS_OP_N;
-
   if (random_matrix->type == dense) {
     cublasHandle_t cublas_handle = handle.get_cublas_handle();
 
     // #TODO: Call from public API when ready
     RAFT_CUBLAS_TRY(raft::linalg::detail::cublasgemm(cublas_handle,
-                                                     opIn,
-                                                     opRandMat,
-                                                     params->n_samples,
+                                                     transInput ? CUBLAS_OP_T : CUBLAS_OP_N,
+                                                     CUBLAS_OP_N,
+                                                     m,
                                                      n,
                                                      k,
                                                      &alfa,
                                                      input,
-                                                     lda,
+                                                     transInput ? k : lda,
                                                      random_matrix->dense_data.data(),
                                                      ldb,
                                                      &beta,
                                                      output,
                                                      ldc,
                                                      stream));
-
   } else if (random_matrix->type == sparse) {
     cusparseHandle_t cusparse_handle = handle.get_cusparse_handle();
     std::size_t nnz = random_matrix->sparse_data.size();

@@ -82,7 +82,7 @@ class RPROJTest : public ::testing::Test {
     rmm::device_uvector<T> tmp(d_output1.size(), stream);
 
     if (USE_ROW_MAJOR) {
-      RPROJtransform(handle, true, d_input.data(), false, &random_matrix1, tmp.data(), &params1);
+      RPROJtransform(handle, true, d_input.data(), &random_matrix1, tmp.data(), &params1);
     } else {
       RPROJtransform(handle, d_input.data(), &random_matrix1, tmp.data(), &params1);
     }
@@ -115,11 +115,7 @@ class RPROJTest : public ::testing::Test {
     d_output2.resize(N * params2.n_components, stream);
     rmm::device_uvector<T> tmp(d_output2.size(), stream);
 
-    if (USE_ROW_MAJOR) {
-      RPROJtransform(handle, true, d_input.data(), false, &random_matrix2, tmp.data(), &params2);
-    } else {
-      RPROJtransform(handle, d_input.data(), &random_matrix2, tmp.data(), &params2);
-    }
+    RPROJtransform(handle, d_input.data(), &random_matrix2, tmp.data(), &params2);
 
     raft::linalg::transpose(handle,
                             tmp.data(),
@@ -162,7 +158,7 @@ class RPROJTest : public ::testing::Test {
 
     rmm::device_uvector<T> d_pdist(N * N, stream);
     ML::Metrics::pairwise_distance(
-      handle, d_input.data(), d_input.data(), d_pdist.data(), N, N, M, distance_type);
+      handle, d_input.data(), d_input.data(), d_pdist.data(), N, N, M, distance_type, true);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     T* h_pdist = new T[N * N];
@@ -170,7 +166,7 @@ class RPROJTest : public ::testing::Test {
 
     rmm::device_uvector<T> d_pdist1(N * N, stream);
     ML::Metrics::pairwise_distance(
-      handle, d_output1.data(), d_output1.data(), d_pdist1.data(), N, N, D, distance_type);
+      handle, d_output1.data(), d_output1.data(), d_pdist1.data(), N, N, D, distance_type, true);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     T* h_pdist1 = new T[N * N];
@@ -178,7 +174,7 @@ class RPROJTest : public ::testing::Test {
 
     rmm::device_uvector<T> d_pdist2(N * N, stream);
     ML::Metrics::pairwise_distance(
-      handle, d_output2.data(), d_output2.data(), d_pdist2.data(), N, N, D, distance_type);
+      handle, d_output2.data(), d_output2.data(), d_pdist2.data(), N, N, D, distance_type, true);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     T* h_pdist2 = new T[N * N];
@@ -242,15 +238,92 @@ typedef RPROJTest<float, 500, 2000, true> RPROJTestF3;
 TEST_F(RPROJTestF3, RandomMatrixCheck) { random_matrix_check(); }
 TEST_F(RPROJTestF3, EpsilonCheck) { epsilon_check(); }
 
-// typedef RPROJTest<double, 500, 2000, true> RPROJTestD3;
-// TEST_F(RPROJTestD3, RandomMatrixCheck) { random_matrix_check(); }
-// TEST_F(RPROJTestD3, EpsilonCheck) { epsilon_check(); }
+typedef RPROJTest<double, 500, 2000, true> RPROJTestD3;
+TEST_F(RPROJTestD3, RandomMatrixCheck) { random_matrix_check(); }
+TEST_F(RPROJTestD3, EpsilonCheck) { epsilon_check(); }
 
-// typedef RPROJTest<float, 5000, 3500, true> RPROJTestF4;
-// TEST_F(RPROJTestF4, RandomMatrixCheck) { random_matrix_check(); }
-// TEST_F(RPROJTestF4, EpsilonCheck) { epsilon_check(); }
+typedef RPROJTest<float, 5000, 3500, true> RPROJTestF4;
+TEST_F(RPROJTestF4, RandomMatrixCheck) { random_matrix_check(); }
+TEST_F(RPROJTestF4, EpsilonCheck) { epsilon_check(); }
 
-// typedef RPROJTest<double, 5000, 3500, true> RPROJTestD4;
-// TEST_F(RPROJTestD4, RandomMatrixCheck) { random_matrix_check(); }
-// TEST_F(RPROJTestD4, EpsilonCheck) { epsilon_check(); }
+typedef RPROJTest<double, 5000, 3500, true> RPROJTestD4;
+TEST_F(RPROJTestD4, RandomMatrixCheck) { random_matrix_check(); }
+TEST_F(RPROJTestD4, EpsilonCheck) { epsilon_check(); }
+
+TEST(DenseTransTest, Basic)
+{
+  using T = float;
+
+  // Shapes
+  constexpr int N = 2;  // n_samples (rows of A)
+  constexpr int M = 3;  // n_features (cols of A, rows of B)
+  constexpr int D = 3;  // n_components (cols of B)
+
+  // Host-side A (row-major N x M)
+  std::vector<T> h_A = {
+    1.0f, 2.0f, 3.0f,   // row 0
+    6.0f, 7.0f, 8.0f  // row 1
+  };
+
+  // Host-side B in column-major (M x D) layout: columns stored consecutively.
+  // We'll populate B_col[col*M + row]
+  std::vector<T> h_B_col = {
+    1.0f, 0.0f, 0.0f, // column 0
+    0.0f, 1.0f, 0.0f,   // column 1
+    0.0f, 0.0f, 1.0f  // column 2
+  };
+
+  std::vector<T> h_C_ref = {
+    1.0f, 6.0f, 2.0f, 7.0f, 3.0f, 8.0f
+  };
+
+  // Setup RAFT handle and device buffers
+  raft::handle_t handle;
+  auto stream = handle.get_stream();
+
+  // Prepare rand_mat with dense_data holding B in column-major (M x D)
+  ML::rand_mat<T> randmat(stream);
+  randmat.type = dense;
+  randmat.dense_data.resize(M * D, stream);
+  raft::update_device(randmat.dense_data.data(), h_B_col.data(), M * D, stream);
+
+  // Prepare input device buffer: A as row-major (N*M)
+  rmm::device_uvector<T> d_A(N * M, stream);
+  raft::update_device(d_A.data(), h_A.data(), N * M, stream);
+
+  // Prepare output device buffer (size N*D)
+  rmm::device_uvector<T> d_C(N * D, stream);
+
+  // Set params
+  paramsRPROJ params{};
+  params.n_samples = N;
+  params.n_features = M;
+  params.n_components = D;
+  params.eps = 0.1;
+  params.gaussian_method = true;  // not used by transform
+  params.density = -1.0;
+  params.dense_output = true;
+  params.random_state = 42;
+
+  // Call transform with transInput = true (we pass A as row-major)
+  ML::RPROJtransform<T>(handle, true, d_A.data(), &randmat, d_C.data(), &params);
+
+  handle.sync_stream(stream);
+
+  // Copy device output to host
+  std::vector<T> h_C(N * D);
+  raft::update_host(h_C.data(), d_C.data(), N * D, stream);
+  handle.sync_stream(stream);
+
+  // The implementation writes output in column-major order with leading dim ldc.
+  // For transInput==true the code sets ldc = n_components (D), so element (i,j)
+  // produced by GEMM will be located at h_C[j * D + i]. Compare accordingly.
+  const T tol = 1e-5f;
+  for (int i = 0; i < N * D; ++i) {
+    T produced = h_C[i];
+    T expected = h_C_ref[i];
+    ASSERT_NEAR(produced, expected, tol) << "mismatch at " << i;
+  }
+}
+
 }  // end namespace ML

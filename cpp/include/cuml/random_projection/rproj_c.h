@@ -97,7 +97,6 @@ template <typename math_t>
 void RPROJtransform(const raft::handle_t& handle,
                     bool transInput,
                     math_t* input,
-                    bool transRandomMatrix,
                     rand_mat<math_t>* random_matrix,
                     math_t* output,
                     paramsRPROJ* params);
