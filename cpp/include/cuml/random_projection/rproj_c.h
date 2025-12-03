@@ -18,7 +18,15 @@
 
 #include <raft/core/handle.hpp>
 
+// #include <raft/sparse/detail/cusparse_wrappers.h>
+
+// #include <raft/core/cusparse_macros.hpp>
+// #include <raft/core/error.hpp>
+// #include <raft/linalg/transpose.cuh>
+
 #include <rmm/device_uvector.hpp>
+
+#include <cusparse.h>
 
 namespace ML {
 
@@ -102,5 +110,23 @@ void RPROJtransform(const raft::handle_t& handle,
                     paramsRPROJ* params);
 
 size_t johnson_lindenstrauss_min_dim(size_t n_samples, double eps);
+
+template <typename T>
+cusparseStatus_t cusparsegemmi_foo(  // NOLINT
+  cusparseHandle_t handle,
+  int m,
+  int n,
+  int k,
+  int nnz,
+  const T* alpha,
+  const T* A,
+  int lda,
+  const T* cscValB,
+  const int* cscColPtrB,
+  const int* cscRowIndB,
+  const T* beta,
+  T* C,
+  int ldc,
+  cudaStream_t stream);
 
 }  // namespace ML

@@ -52,4 +52,23 @@ template void RPROJtransform(const raft::handle_t& handle,
                              double* output,
                              paramsRPROJ* params);
 
+                             template <typename T>
+
+                             cusparseStatus_t cusparsegemmi_foo(  // NOLINT
+  cusparseHandle_t handle,
+  int m,
+  int n,
+  int k,
+  int nnz,
+  const T* alpha,
+  const T* A,
+  int lda,
+  const T* cscValB,
+  const int* cscColPtrB,
+  const int* cscRowIndB,
+  const T* beta,
+  T* C,
+  int ldc,
+  cudaStream_t stream);
+
 };  // namespace ML

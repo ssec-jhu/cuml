@@ -202,7 +202,7 @@ void RPROJtransform(const raft::handle_t& handle,
     std::size_t nnz = random_matrix->sparse_data.size();
 
     // TODO: Need to wrap this in a RAFT public API.
-    RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsegemmi(cusparse_handle,
+    RAFT_CUSPARSE_TRY(ML::cusparsegemmi_foo(cusparse_handle,
                                                           m,
                                                           n,
                                                           k,
@@ -223,6 +223,76 @@ void RPROJtransform(const raft::handle_t& handle,
            "before applying transformation");
   }
 }
+
+template <typename T>
+cusparseStatus_t cusparsegemmi_foo(  // NOLINT
+  cusparseHandle_t handle,
+  int m,
+  int n,
+  int k,
+  int nnz,
+  const T* alpha,
+  const T* A,
+  int lda,
+  const T* cscValB,
+  const int* cscColPtrB,
+  const int* cscRowIndB,
+  const T* beta,
+  T* C,
+  int ldc,
+  cudaStream_t stream)
+  {
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>, "Unsupported data type");
+
+    cusparseDnMatDescr_t matA;
+    cusparseSpMatDescr_t matB;
+    cusparseDnMatDescr_t matC;
+    rmm::device_uvector<T> CT(m * n, stream);
+
+    auto constexpr math_type = std::is_same_v<T, float> ? CUDA_R_32F : CUDA_R_64F;
+    // Create sparse matrix B
+    CUSPARSE_CHECK(cusparseCreateCsc(&matB,
+                                    k,
+                                    n,
+                                    nnz,
+                                    static_cast<void*>(const_cast<int*>(cscColPtrB)),
+                                    static_cast<void*>(const_cast<int*>(cscRowIndB)),
+                                    static_cast<void*>(const_cast<T*>(cscValB)),
+                                    CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_BASE_ZERO,
+                                    math_type));
+    /**
+    *  Create dense matrices.
+    *  Note: Since this is replacing `cusparse_gemmi`, it assumes dense inputs are
+    *  column-ordered
+    */
+    CUSPARSE_CHECK(cusparseCreateDnMat(
+      &matA, m, k, lda, static_cast<void*>(const_cast<T*>(A)), math_type, CUSPARSE_ORDER_COL));
+    CUSPARSE_CHECK(cusparseCreateDnMat(
+      &matC, n, m, n, static_cast<void*>(CT.data()), math_type, CUSPARSE_ORDER_COL));
+
+    auto opA         = CUSPARSE_OPERATION_TRANSPOSE;
+    auto opB         = CUSPARSE_OPERATION_TRANSPOSE;
+    auto alg         = CUSPARSE_SPMM_CSR_ALG1;
+    auto buffer_size = std::size_t{};
+
+    CUSPARSE_CHECK(raft::sparse::detail::cusparsespmm_bufferSize(
+      handle, opB, opA, alpha, matB, matA, beta, matC, alg, &buffer_size, stream));
+    buffer_size = buffer_size / sizeof(T);
+    rmm::device_uvector<T> external_buffer(buffer_size, stream);
+    auto ext_buf = static_cast<T*>(static_cast<void*>(external_buffer.data()));
+    auto return_value =
+      raft::sparse::detail::cusparsespmm(handle, opB, opA, alpha, matB, matA, beta, matC, alg, ext_buf, stream);
+
+    raft::resources rhandle;
+    raft::linalg::transpose(rhandle, CT.data(), C, n, m, stream);
+    // destroy matrix/vector descriptors
+    CUSPARSE_CHECK(cusparseDestroyDnMat(matA));
+    CUSPARSE_CHECK(cusparseDestroySpMat(matB));
+    CUSPARSE_CHECK(cusparseDestroyDnMat(matC));
+    return return_value;
+  }
 
 };  // namespace ML
 // end namespace ML
