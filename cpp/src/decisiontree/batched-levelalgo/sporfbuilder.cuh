@@ -24,12 +24,14 @@
 #include <common/Timer.h>
 
 #include <cuml/common/pinned_host_vector.hpp>
+#include <cuml/random_projection/rproj_c.h>
 #include <cuml/tree/decisiontree.hpp>
 #include <cuml/tree/sporfdecisiontree.hpp>
 #include <cuml/tree/flatnode.h>
 
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
+#include <raft/matrix/matrix.cuh>
 #include <raft/util/cuda_utils.cuh>
 
 #include <rmm/device_uvector.hpp>
@@ -202,6 +204,17 @@ struct SPORFBuilder {
   rmm::device_uvector<char> d_buff;
   /** pinned host buffer to store the trained nodes */
   ML::pinned_host_vector<char> h_buff;
+  /**
+  device buffer for contiguous input data
+
+  dataset.row_ids is n_sampled_rows long.
+  each node gets its own extent within dataset.row_ids, disjoint from other nodes.
+  d_contiguous indices correspond to dataset.row_ids indices,
+  so that we may copy from dataset.data[dataset.row_ids[i]] into d_contiguous[i],
+  and node row_id extents map directly to d_contiguous extents.
+  */
+  rmm::device_uvector<DataT> d_contiguous;
+  std::vector<std::unique_ptr<rand_mat<DataT>>> h_sparse_matrices;
 
   SPORFBuilder(const raft::handle_t& handle,
           cudaStream_t s,
@@ -226,15 +239,28 @@ struct SPORFBuilder {
               n_cols,
               int(row_ids->size()),
               max(1, IdxT(params.max_features * n_cols)),
-              row_ids->data(),
-              n_classes},
+      row_ids->data(),
+      n_classes},
       quantiles(q),
-      d_buff(0, builder_stream)
+      d_buff(0, builder_stream),
+      d_contiguous(0, builder_stream)
   {
     max_blocks_dimx = 1 + params.max_batch_size + dataset.n_sampled_rows / TPB_DEFAULT;
     ASSERT(q.quantiles_array != nullptr && q.n_bins_array != nullptr,
            "Currently quantiles need to be computed before this call!");
     ASSERT(n_classes >= 1, "n_classes should be at least 1");
+
+    // allocate d_contiguous with byte-alignment: calculateAlignedBytes works in bytes
+    size_t req_bytes     = size_t(dataset.n_sampled_rows) * size_t(n_cols) * sizeof(DataT);
+    size_t aligned_bytes = calculateAlignedBytes(req_bytes);
+    size_t aligned_elems = aligned_bytes / sizeof(DataT);
+    d_contiguous.resize(aligned_elems, builder_stream);
+
+    // initialize host-owned rand_mat objects so they own their device buffers
+    h_sparse_matrices.reserve(params.max_batch_size);
+    for (int i = 0; i < params.max_batch_size; ++i) {
+      h_sparse_matrices.emplace_back(std::make_unique<rand_mat<DataT>>(builder_stream));
+    }
 
     auto [device_workspace_size, host_workspace_size] = workspaceSize();
     d_buff.resize(device_workspace_size, builder_stream);
@@ -404,6 +430,43 @@ struct SPORFBuilder {
     raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
 
     auto [n_blocks_dimx, n_large_nodes] = this->updateWorkloadInfo(work_items);
+
+    printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+
+    // TODO: parallelize this over work_items
+    for (size_t i = 0; i < work_items.size(); i++) {
+      auto& begin = work_items[i].instances.begin;
+      auto& count = work_items[i].instances.count;
+
+      raft::matrix::copyRows<DataT, IdxT, size_t>(
+        dataset.data,                     // in
+        count,                            // number of rows of output matrix
+        dataset.N,                        // number of columns of output matrix
+        &(d_contiguous.data()[begin]),    // out
+        &(dataset.row_ids[begin]),        // row indices to copy
+        count,
+        builder_stream,
+        false                             // do-row-major
+      );
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+      rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i]);
+      auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i) &
+                                           0x7fffffffULL);
+      // // TODO: fix rproj to use better types than int for everything
+      paramsRPROJ rproj_params{
+        static_cast<int>(count), // number of samples
+        dataset.N,               // number of features
+        1,                       // number of components
+        -1.0f,                   // error tolerance (not used)
+        false,                   // gaussian or sparse method
+        -1.0,                    // auto density (-1: auto-deduction)
+        false,                   // not used
+        random_state             // random seed
+      };
+      RPROJfit(handle, &random_matrix, &rproj_params);
+    }
+
 
     // do feature-sampling
     if (dataset.n_sampled_cols != dataset.N) {

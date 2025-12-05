@@ -54,6 +54,9 @@ from cuml.testing.utils import (
     unit_param,
 )
 
+from cuml.ensemble import SPORFClassifier as sporfc
+from cuml.ensemble import SPORFRegressor as sporfr
+
 
 @pytest.fixture(
     scope="session",
@@ -332,11 +335,31 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     )
     cuml_model.fit(X_train, y_train)
 
+    sporf_model = sporfc(
+        max_features=max_features,
+        max_samples=max_samples,
+        n_bins=16,
+        split_criterion=0,
+        min_samples_leaf=2,
+        random_state=123,
+        n_streams=1,
+        n_estimators=40,
+        handle=handle,
+        max_leaves=-1,
+        max_depth=16,
+    )
+    sporf_model.fit(X_train, y_train)
+
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
+    sp_preds = sporf_model.predict(X_test, predict_model="GPU")
+
     fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
+    sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
+
     cuml_acc = accuracy_score(y_test, cu_preds)
     fil_acc = accuracy_score(y_test, fil_preds)
+    sp_acc = accuracy_score(y_test, sp_preds)
     if X.shape[0] < 500000:
         sk_model = skrfc(
             n_estimators=40,
@@ -352,6 +375,9 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     assert fil_acc >= (
         cuml_acc - 0.07
     )  # to be changed to 0.02. see issue #3910: https://github.com/rapidsai/cuml/issues/3910 # noqa
+    assert sp_acc >= (
+        cuml_acc - 0.07
+    )
 
 
 @pytest.mark.parametrize(
