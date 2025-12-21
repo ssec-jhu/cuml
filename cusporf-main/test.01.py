@@ -1,5 +1,5 @@
 #
-# test01.py
+# test.01.py
 #
 # Notes:
 #  Here we implement a simple test harness for the cuml SPORF implementation.
@@ -46,7 +46,7 @@ def loadParams() -> (argparse.Namespace, list[dict]):
         if not m:
             raise ValueError(f"Unable to parse filter expression as name=value: {nvp}")
 
-        # save a range of values for the
+        # save a range of values for the parameter to filter
         pname = m.group(1)
         try:
             pvalFrom = float(m.group(2))
@@ -57,7 +57,7 @@ def loadParams() -> (argparse.Namespace, list[dict]):
             pvalTo = m.group(4) if m.group(4) else pvalFrom
 
         # if only one value is specified, duplicate it to form a single-valued "range"
-        df[m.group(1)] = [m.group(2), m.group(4) if m.group(4) else m.group(2)]
+        df[pname] = [pvalFrom, pvalTo]
 
     # build a list of parameter sets to be tested:
     #  - scan the .CSV for the row(s) whose first column contains the specified tag string
@@ -76,9 +76,15 @@ def loadParams() -> (argparse.Namespace, list[dict]):
             # filter the row on the specified parameter values
             ok = True
             for pname in df.keys():
-                if r[pname] < df[pname][0] or r[pname] > df[pname][1]:
-                    ok = False
-                    break
+                try:
+                    if r[pname] < df[pname][0] or r[pname] > df[pname][1]:
+                        ok = False
+                        break
+                except TypeError:
+                    fval = float(r[pname])
+                    if fval < df[pname][0] or fval > df[pname][1]:
+                        ok = False
+                        break
 
             # conditionally append the SPORF parameter set (excluding the 0th column) to the list
             if ok:
