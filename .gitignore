@@ -81,6 +81,6 @@ pytest.ini
 python/cuml/cuml_accel_tests/upstream/umap/umap-upstream
 
 # SPORF
-/datascope/rwilton/scratch/sporf/cuml/cusporf-main/test_data/HIGGS.csv
-/datascope/rwilton/scratch/sporf/cuml/cusporf-main/test_data/HIGGS.csv.gz
+cusporf-main/test_data/HIGGS.csv
+cusporf-main/test_data/HIGGS.csv.gz
 
