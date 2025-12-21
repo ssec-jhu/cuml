@@ -17,7 +17,6 @@ from cuml import SPORFClassifier as cuRFC
 from cuml import SPORFRegressor as cuRFR
 
 from test_data import test_data
-still trying
 
 
 #
