@@ -16,7 +16,7 @@ from pidmon import scaffold as p
 from cuml import SPORFClassifier as cuRFC
 from cuml import SPORFRegressor as cuRFR
 
-from test_data import test_data
+from test_data import test_data as td
 
 
 #
@@ -25,7 +25,7 @@ from test_data import test_data
 #       - the first column must have a header named "tag"
 #       - the remaining columns must have headers whose names correspond to SPORF parameters
 #
-def loadParams() -> (argparse.Namespace, list[dict]):
+def loadParams() -> (argparse.Namespace, dict, list[dict]):
 
     # parse the command line:
     #   - the .CSV filename and the tag string are the first two (unnamed positional) arguments
@@ -40,7 +40,7 @@ def loadParams() -> (argparse.Namespace, list[dict]):
     args, params = ap.parse_known_args()
 
     # build a dict of filter values
-    df = {"tag": [args.csvTag, args.csvTag]}
+    df = {"tag": [args.csvTag, args.csvTag, False]}
     for nvp in params:
         m = re.match(r"(\w+)=(\w+)(:(\w+))?", nvp)
         if not m:
@@ -51,13 +51,15 @@ def loadParams() -> (argparse.Namespace, list[dict]):
         try:
             pvalFrom = float(m.group(2))
             pvalTo = float(m.group(4)) if m.group(4) else pvalFrom
+            pvalIsNumeric = True
 
         except ValueError:
             pvalFrom = m.group(2)
             pvalTo = m.group(4) if m.group(4) else pvalFrom
+            pvalIsNumeric = False
 
         # if only one value is specified, duplicate it to form a single-valued "range"
-        df[pname] = [pvalFrom, pvalTo]
+        df[pname] = [pvalFrom, pvalTo, pvalIsNumeric]
 
     # build a list of parameter sets to be tested:
     #  - scan the .CSV for the row(s) whose first column contains the specified tag string
@@ -90,34 +92,90 @@ def loadParams() -> (argparse.Namespace, list[dict]):
             if ok:
                 ap.append(dict(itertools.islice(r.items(), 1, len(r))))
 
+    # abort if there are no parameter sets (rows in the .CSV file) that pass the specified filter(s)
     if not ap:
-        raise ValueError(f"No parameters in {args.csvFile} for tag {args.csvTag}.")
+        raise ValueError(
+            f"No parameters in {args.csvFile} that match tag '{args.csvTag}' and specified filters."
+        )
 
-    # return the argparse Namespace (positional parameters) and the list of test parameter sets
-    return args, ap
+    # return a tuple consisting of...
+    #   - the argparse Namespace (positional command-line parameters)
+    #   - the parameter filter criteria (optional command-line parameters)
+    #   - the list of test parameter sets that meet all the filter criteria
+    return args, df, ap
+
+
+#
+# echo parameters to the output log
+#
+def logParams(args: argparse.Namespace, df: dict, ap: list[dict]) -> None:
+
+    # echo the .CSV filename and the parameter tag string
+    p.dtLog(f"csvFile: {args.csvFile}")
+    p.dtLog(f"csvTag : {args.csvTag}")
+
+    p.dtLog(f"Parameters in {args.csvFile} filtered by:")
+    for pname in df.keys():
+        if df[pname][2]:
+            if df[pname][0] == df[pname][1]:
+                p.dtLog(f" {pname}: {df[pname][0]:g} (numeric)")
+            else:
+                p.dtLog(f" {pname}: {df[pname][0]:g}:{df[pname][1]:g} (numeric)")
+        else:
+            if df[pname][0] == df[pname][1]:
+                p.dtLog(f" {pname}: {df[pname][0]} (string)")
+            else:
+                p.dtLog(f" {pname}: {df[pname][0]}:{df[pname][1]} (string)")
+
+    p.dtLog("")
+    p.dtLog(f"Testing {len(ap)} parameter set{'s' if len(ap) != 1 else ''} from {args.csvFile}:")
+    return
+
+
+#
+# execute one test iteration with the specified set of parameters
+#
+def doTest(dp: dict) -> None:
+
+    p.dtLog(f"--- Start test: data={dp["dataset"]}...")
+
+    try:
+        # use a function in module 'test_data' to build the test data
+        fn = getattr(td, dp["dataset"])
+
+    except AttributeError as ex:
+        raise AttributeError(f"Unrecognized dataset name: {dp["dataset"]}") from ex
+
+    X_train, y_train, X_test, y_test = fn(n_samples=int(dp["n_samples"]), n_features=int(dp["n_features"]))
+
+    # TODO: DO IT!
+
+    p.dtLog(f"--- End test: data={dp["dataset"]}.")
+    return
 
 
 if __name__ == "__main__":
-    # parse the command line and load test parameters
-    args, ap = loadParams()
 
     # log interesting process metadata
     sScriptName = os.path.basename(__file__)
     p.dtLog(
         f"Start __name__='{__name__}' for {sScriptName} pid {os.getpid()} in python v{sys.version.split('|')[0]}..."
     )
-    p.dtLog(f"csvFile: {args.csvFile}")
-    p.dtLog(f"csvTag : {args.csvTag}")
-    p.dtLog("")
-    p.dtLog("Parameters:")
-    for d in ap:
-        for k, v in d.items():
-            p.dtLog(f" {k}: {v}")
+
+    # parse the command line and load test parameters
+    args, df, ap = loadParams()
+    logParams(args, df, ap)
+
+    # hard-coded breakpoint
     p.dtLog("")
     p.dtLog("Breakpoint so we can attach a C++ debugger to the Linux process!")
     breakpoint()
     p.dtLog("Resumed execution after breakpoint")
     p.dtLog("")
+
+    # iterate through the specified sets of parameters
+    for dp in ap:
+        doTest(dp)
 
     # that's all, folks!
     p.dtLog(f"Exiting {sScriptName}")
