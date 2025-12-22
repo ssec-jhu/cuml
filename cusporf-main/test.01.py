@@ -133,14 +133,29 @@ def logParams(args: argparse.Namespace, df: dict, ap: list[dict]) -> None:
 
 
 #
+# do regression on test data
+#
+def doRegression():
+    return
+
+
+#
+# do classification on test data
+#
+def doClassification():
+    return
+
+
+#
 # execute one test iteration with the specified set of parameters
 #
 def doTest(dp: dict) -> None:
 
+    p.dtLog("")
     p.dtLog(f"--- Start test: data={dp["dataset"]}...")
 
+    # use a function in module 'test_data' to build the test data
     try:
-        # use a function in module 'test_data' to build the test data
         fn = getattr(td, dp["dataset"])
 
     except AttributeError as ex:
@@ -148,7 +163,17 @@ def doTest(dp: dict) -> None:
 
     X_train, y_train, X_test, y_test = fn(n_samples=int(dp["n_samples"]), n_features=int(dp["n_features"]))
 
-    # TODO: DO IT!
+    # use a function in the current module to execute the specified task on the test data
+    try:
+        sTask = f"do{dp['task'][0].upper()}{dp['task'][1:].lower()}"
+        fn = getattr(sys.modules[__name__], sTask)
+
+    except AttributeError as ex:
+        raise AttributeError(f"Unrecognized task name: {dp["task"]}") from ex
+
+    nEstimators = int(dp["n_estimators"])
+    p.dtLog(f"Calling {sTask}...")
+    #    rval = fn(cuRFC, accuracy_score, nEstimators, X_train, y_train, X_test, y_test)
 
     p.dtLog(f"--- End test: data={dp["dataset"]}.")
     return
@@ -171,7 +196,6 @@ if __name__ == "__main__":
     p.dtLog("Breakpoint so we can attach a C++ debugger to the Linux process!")
     breakpoint()
     p.dtLog("Resumed execution after breakpoint")
-    p.dtLog("")
 
     # iterate through the specified sets of parameters
     for dp in ap:
