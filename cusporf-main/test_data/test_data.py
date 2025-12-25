@@ -2,21 +2,39 @@
 # test_data.py
 #
 
-from sklearn.datasets import make_friedman1, make_classification
-import cudf
+from dataclasses import dataclass
 import numpy as np
 
+from sklearn.datasets import make_friedman1, make_classification
+import cudf
 
-def higgs():
-    df_higgs = cudf.read_csv("higgs.csv", header=None, nrows=5_000_000)
-    df_train = df_higgs.sample(frac=0.95, random_state=42)
+
+#
+# training and test data
+#
+@dataclass
+class RFTestData:
+
+    X_train: cudf.core.dataframe.DataFrame
+    y_train: cudf.core.series.Series
+    X_test: cudf.core.dataframe.DataFrame
+    y_test: cudf.core.series.Series
+
+
+#
+#
+def higgs(testParams: dict) -> RFTestData:
+
+    df_higgs = cudf.read_csv(testParams["higgs_csv"], header=None, nrows=5_000_000)
+    df_train = df_higgs.sample(frac=0.95, random_state=int(testParams["random_state"]))
+    X_train = df_train.iloc[:, 1:]
+    y_train = df_train.iloc[:, 0]
+
     df_test = df_higgs.drop(index=df_train.index)
-    X_train_gpu = df_train.iloc[:, 1:]
-    y_train_gpu = df_train.iloc[:, 0]
-    X_test_gpu = df_test.iloc[:, 1:]
-    y_test_gpu = df_test.iloc[:, 0]
+    X_test = df_test.iloc[:, 1:]
+    y_test = df_test.iloc[:, 0]
 
-    return X_train_gpu, y_train_gpu, X_test_gpu, y_test_gpu
+    return RFTestData(X_train, y_train, X_test, y_test)
 
 
 #    N_EST = 100
@@ -70,27 +88,26 @@ def higgs():
 #     "gpu_mb": df_higgs.memory_usage(deep=True).sum() / 1024**2,
 # }
 
-type TestData = tuple[
-    cudf.core.dataframe.DataFrame,
-    cudf.core.series.Series,
-    cudf.core.dataframe.DataFrame,
-    cudf.core.series.Series,
-]
 
-
-def classification(n_samples: int, n_features: int) -> TestData:
+def classification(testParams: dict) -> RFTestData:
 
     X, y = make_classification(
-        n_samples=n_samples, n_features=n_features, n_informative=5, n_classes=2, random_state=42
+        n_samples=int(testParams["n_samples"]),
+        n_features=int(testParams["n_features"]),
+        n_informative=5,
+        n_classes=2,
+        random_state=int(testParams["random_state"]),
     )
-    X = cudf.DataFrame(X.astype(np.float32))
-    y = cudf.Series(y.astype(np.float32))
-    X_train_gpu = X.sample(frac=0.95, random_state=42)
-    X_test_gpu = X.drop(index=X_train_gpu.index)
-    y_train_gpu = y[X_train_gpu.index]
-    y_test_gpu = y[X_test_gpu.index]
 
-    return X_train_gpu, y_train_gpu, X_test_gpu, y_test_gpu
+    dfX = cudf.DataFrame(X.astype(np.float32))
+    X_train = dfX.sample(frac=0.95, random_state=int(testParams["random_state"]))
+    X_test = dfX.drop(index=X_train.index)
+
+    sy = cudf.Series(y.astype(np.float32))
+    y_train = sy[X_train.index]
+    y_test = sy[X_test.index]
+
+    return RFTestData(X_train, y_train, X_test, y_test)
 
     # N_EST = n_est
     # N_TRIALS = n_trials
@@ -141,16 +158,23 @@ def classification(n_samples: int, n_features: int) -> TestData:
     # }
 
 
-def friedman(n_samples, n_features, n_est=100, n_trials=1):
-    X, y = make_friedman1(n_samples=n_samples, n_features=n_features, random_state=42)
-    X = cudf.DataFrame(X.astype(np.float32))
-    y = cudf.Series(y.astype(np.float32))
-    X_train_gpu = X.sample(frac=0.95, random_state=42)
-    X_test_gpu = X.drop(index=X_train_gpu.index)
-    y_train_gpu = y[X_train_gpu.index]
-    y_test_gpu = y[X_test_gpu.index]
+def friedman(testParams: dict) -> RFTestData:
 
-    return X_train_gpu, y_train_gpu, X_test_gpu, y_test_gpu
+    X, y = make_friedman1(
+        n_samples=int(testParams["n_samples"]),
+        n_features=int(testParams["n_features"]),
+        random_state=int(testParams["random_state"]),  # TODO: DEFAULT = 42?
+    )
+
+    dfX = cudf.DataFrame(X.astype(np.float32))
+    sy = cudf.Series(y.astype(np.float32))
+
+    X_train = dfX.sample(frac=0.95, random_state=42)
+    X_test = dfX.drop(index=X_train.index)
+    y_train = sy[X_train.index]
+    y_test = sy[X_test.index]
+
+    return RFTestData(X_train, y_train, X_test, y_test)
 
     # N_EST = n_est
     # N_TRIALS = n_trials

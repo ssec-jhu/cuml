@@ -142,40 +142,62 @@ def doRegression():
 #
 # do classification on test data
 #
-def doClassification():
+def doClassification(testParams: dict, testData: td.RFTestData) -> None:
+
+    p.dtLog(f"Start doClassification...")
+
+    rf_params = {
+        "n_estimators": int(testParams["n_estimators"]),
+        "max_depth": int(testParams["max_depth"]),
+        "max_features": int(testParams["max_features"]),
+        "n_bins": int(testParams["n_bins"]),
+        "n_streams": int(testParams["n_streams"]),
+        "split_criterion": int(testParams["split_criterion"]),
+        ##  "criterion": testParams["split_criterion"],  # which is it, 'split_criterion' or 'criterion'? how do we know?
+        "density": float(testParams["density"]),
+        "histogram_method": int(testParams["histogram_method"]),
+    }
+
+    rf = cuRFC(**rf_params)
+    rf.fit(testData.X_train, testData.y_train)
+
+    # TODO: HOW DO WE KNOW WHAT HAPPENED???
+
+    # we call our new API again
+    ###rval = fn_metric(rf.predict(X_test).to_numpy(), y_test.to_numpy())
+
+    p.dtLog(f"End doClassification")
     return
 
 
 #
 # execute one test iteration with the specified set of parameters
 #
-def doTest(dp: dict) -> None:
+def doTest(testParams: dict) -> None:
 
     p.dtLog("")
     p.dtLog(f"--- Start test: data={dp["dataset"]}...")
 
     # use a function in module 'test_data' to build the test data
     try:
-        fn = getattr(td, dp["dataset"])
+        fn = getattr(td, testParams["dataset"])
 
     except AttributeError as ex:
-        raise AttributeError(f"Unrecognized dataset name: {dp["dataset"]}") from ex
+        raise AttributeError(f"Unrecognized dataset name: {testParams["dataset"]}") from ex
 
-    X_train, y_train, X_test, y_test = fn(n_samples=int(dp["n_samples"]), n_features=int(dp["n_features"]))
+    testData = fn(testParams)
 
     # use a function in the current module to execute the specified task on the test data
     try:
-        sTask = f"do{dp['task'][0].upper()}{dp['task'][1:].lower()}"
+        sTask = f"do{testParams['task'][0].upper()}{testParams['task'][1:].lower()}"
         fn = getattr(sys.modules[__name__], sTask)
 
     except AttributeError as ex:
-        raise AttributeError(f"Unrecognized task name: {dp["task"]}") from ex
+        raise AttributeError(f"Unrecognized task name: {testParams["task"]}") from ex
 
-    nEstimators = int(dp["n_estimators"])
-    p.dtLog(f"Calling {sTask}...")
-    #    rval = fn(cuRFC, accuracy_score, nEstimators, X_train, y_train, X_test, y_test)
+    rval = fn(testParams, testData)
 
-    p.dtLog(f"--- End test: data={dp["dataset"]}.")
+    p.dtLog(f"--- End test: data={testParams["dataset"]}.")
     return
 
 
