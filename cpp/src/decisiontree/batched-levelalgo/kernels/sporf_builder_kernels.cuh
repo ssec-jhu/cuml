@@ -280,7 +280,8 @@ CUML_KERNEL void algo_L_sample_kernel(int* colids,
                                       IdxT treeid,
                                       uint64_t seed,
                                       size_t n /* total cols to sample from*/,
-                                      size_t k /* cols to sample */)
+                                      size_t k /* cols to sample */,
+                                      bool use_n_node = false)
 {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= work_items_size) return;
@@ -298,10 +299,15 @@ CUML_KERNEL void algo_L_sample_kernel(int* colids,
   gen.next(fp_uniform_val);
   double W = raft::exp(raft::log(fp_uniform_val) / k);
 
+  int node_offset = 0;
+  if (use_n_node) {
+    n = work_items[tid].instances.count;
+    node_offset = work_items[tid].instances.begin;
+  }
   size_t col(0);
   // initially fill the reservoir array in increasing order of cols till k
   while (1) {
-    colids[tid * k + col] = col;
+    colids[node_offset + tid * k + col] = col;
     if (col == k - 1)
       break;
     else
@@ -315,7 +321,7 @@ CUML_KERNEL void algo_L_sample_kernel(int* colids,
     if (col < n) {
       // int_uniform_val will now have a random value between 0...k
       raft::random::custom_next(gen, &int_uniform_val, uniform_int_dist_params, IdxT(0), IdxT(0));
-      colids[tid * k + int_uniform_val] = col;  // the bad memory coalescing here is hidden
+      colids[node_offset + tid * k + int_uniform_val] = col;  // the bad memory coalescing here is hidden
       // fp_uniform_val will have a random value between 0 and 1
       gen.next(fp_uniform_val);
       W *= raft::exp(raft::log(fp_uniform_val) / k);
@@ -358,15 +364,17 @@ template <typename DataT,
           typename LabelT,
           typename IdxT,
           int TPB,
+          int IPT,
           typename ObjectiveT,
           typename BinT>
 void launchComputeSplitKernel(BinT* histograms,
-                              IdxT n_bins,
+                              IdxT max_n_bins,
                               IdxT max_depth,
                               IdxT min_samples_split,
+                              IdxT min_samples_leaf,
                               IdxT max_leaves,
                               const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-                              const DT::Quantiles<DataT, IdxT>& quantiles,
+                              const IdxT* quantile_indices,
                               const NodeWorkItem* work_items,
                               IdxT colStart,
                               const IdxT* colids,

@@ -26,14 +26,18 @@
 #include <raft/util/cuda_utils.cuh>
 
 #include <cub/cub.cuh>
+#include <cub/block/block_radix_sort.cuh>
 #include <thrust/binary_search.h>
 
 #include <cstdio>
+#include <limits>
 
 namespace ML {
 namespace SPORFDT {
 
 static constexpr int TPB_DEFAULT = 128;
+static constexpr int ITEMS_PER_THREAD = 16;
+
 
 /**
  * @brief Partition the samples to left/right nodes based on the best split
@@ -216,15 +220,17 @@ template <typename DataT,
           typename LabelT,
           typename IdxT,
           int TPB,
+          int IPT,
           typename ObjectiveT,
           typename BinT>
 static __global__ void computeSplitKernel(BinT* histograms,
                                           IdxT max_n_bins,
-                                          IdxT max_depth,
+                                          IdxT max_depth, // remove?
                                           IdxT min_samples_split,
-                                          IdxT max_leaves,
+                                          IdxT min_samples_leaf,
+                                          IdxT max_leaves, // remove?
                                           const DT::Dataset<DataT, LabelT, IdxT> dataset,
-                                          const DT::Quantiles<DataT, IdxT> quantiles,
+                                          const IdxT* quantile_indices,
                                           const NodeWorkItem* work_items,
                                           IdxT colStart,
                                           const IdxT* colids,
@@ -247,6 +253,10 @@ static __global__ void computeSplitKernel(BinT* histograms,
   auto range_start                     = work_item.instances.begin;
   auto range_len                       = work_item.instances.count;
 
+  if (range_len < min_samples_split) {
+    return;
+  }
+
   IdxT offset_blockid = workload_info_cta.offset_blockid;
   IdxT num_blocks     = workload_info_cta.num_blocks;
 
@@ -258,9 +268,10 @@ static __global__ void computeSplitKernel(BinT* histograms,
     IdxT colIndex = colStart + blockIdx.y;
     col           = colids[nid * dataset.n_sampled_cols + colIndex];
   }
+  std::size_t col_offset = std::size_t(col) * dataset.M;
 
   // getting the n_bins for that feature
-  int n_bins = quantiles.n_bins_array[col];
+  IdxT n_bins = min(max_n_bins, static_cast<IdxT>(floor(range_len / min_samples_leaf)));//  quantiles.n_bins_array[col];
 
   auto end                  = range_start + range_len;
   auto shared_histogram_len = n_bins * objective.NumClasses();
@@ -273,16 +284,39 @@ static __global__ void computeSplitKernel(BinT* histograms,
   // populating shared memory with initial values
   for (IdxT i = threadIdx.x; i < shared_histogram_len; i += blockDim.x)
     shared_histogram[i] = BinT();
-  for (IdxT b = threadIdx.x; b < n_bins; b += blockDim.x)
-    shared_quantiles[b] = quantiles.quantiles_array[max_n_bins * col + b];
+  for (IdxT b = threadIdx.x; b < n_bins; b += blockDim.x) {
+    IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + col) * max_n_bins + b];
+    IdxT row_id = dataset.row_ids[quantile_index];
+    shared_quantiles[b] = dataset.data[row_id + col_offset];
+  }
 
-  // synchronizing above changes across block
+  using BlockSort = cub::BlockRadixSort<DataT, TPB, IPT>;
+  __shared__ typename BlockSort::TempStorage sort_storage;
+  DataT keys[IPT];
+
+  // Load shared quantiles into keys
+  #pragma unroll
+  for (IdxT i = 0; i < IPT; ++i) {
+    int idx = i * TPB + threadIdx.x;
+    keys[i] = (idx < n_bins) ? shared_quantiles[idx] : std::numeric_limits<DataT>::infinity();
+  }
+
+  // sort the quantile values
+  BlockSort(sort_storage).Sort(keys);
   __syncthreads();
+
+  // Store sorted quantiles back to shared memory
+  #pragma unroll
+  for (IdxT i = 0; i < IPT; ++i) {
+    int idx = i * TPB + threadIdx.x;
+    if (idx < n_bins) shared_quantiles[idx] = keys[i];
+  }
+  __syncthreads();
+
 
   // compute pdf shared histogram for all bins for all classes in shared mem
 
   // Must be 64 bit - can easily grow larger than a 32 bit int
-  std::size_t col_offset = std::size_t(col) * dataset.M;
   for (auto i = range_start + tid; i < end; i += stride) {
     // each thread works over a data point and strides to the next
     auto row   = dataset.row_ids[i];
@@ -349,15 +383,18 @@ template <typename DataT,
           typename LabelT,
           typename IdxT,
           int TPB,
+          int IPT,
           typename ObjectiveT,
           typename BinT>
 void launchComputeSplitKernel(BinT* histograms,
                               IdxT max_n_bins,
                               IdxT max_depth,
                               IdxT min_samples_split,
+                              IdxT min_samples_leaf,
                               IdxT max_leaves,
                               const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-                              const DT::Quantiles<DataT, IdxT>& quantiles,
+                              const IdxT* quantile_indices,
+                              // const DT::Quantiles<DataT, IdxT>& quantiles,
                               const NodeWorkItem* work_items,
                               IdxT colStart,
                               const IdxT* colids,
@@ -372,14 +409,15 @@ void launchComputeSplitKernel(BinT* histograms,
                               size_t smem_size,
                               cudaStream_t builder_stream)
 {
-  computeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>
+  computeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT, IPT>
     <<<grid, TPB_DEFAULT, smem_size, builder_stream>>>(histograms,
                                                        max_n_bins,
                                                        max_depth,
                                                        min_samples_split,
+                                                       min_samples_leaf,
                                                        max_leaves,
                                                        dataset,
-                                                       quantiles,
+                                                       quantile_indices,
                                                        work_items,
                                                        colStart,
                                                        colids,
@@ -414,14 +452,15 @@ template void launchLeafKernel<_DatasetT, _NodeT, _ObjectiveT, _DataT>(
   size_t smem_size,
   cudaStream_t builder_stream);
 
-template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, _ObjectiveT, _BinT>(
+template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEMS_PER_THREAD, _ObjectiveT, _BinT>(
   _BinT* histograms,
-  _IdxT n_bins,
+  _IdxT max_n_bins,
   _IdxT max_depth,
   _IdxT min_samples_split,
+  _IdxT min_samples_leaf,
   _IdxT max_leaves,
   const DT::Dataset<_DataT, _LabelT, _IdxT>& dataset,
-  const DT::Quantiles<_DataT, _IdxT>& quantiles,
+  const _IdxT* quantile_indices,
   const NodeWorkItem* work_items,
   _IdxT colStart,
   const _IdxT* colids,

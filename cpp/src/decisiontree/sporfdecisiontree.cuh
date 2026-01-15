@@ -23,6 +23,8 @@
 #include "batched-levelalgo/quantiles.cuh"
 #include "treelite_util.h"
 
+#include <cublas_v2.h>
+
 #include <cuml/common/logger.hpp>
 #include <cuml/tree/flatnode.h>
 
@@ -60,7 +62,7 @@ namespace DT {
 class SPORFDecisionTree {
  public:
   template <class DataT, class LabelT>
-  static std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> fit(
+  static std::shared_ptr<TreeMetaDataNode<DataT, LabelT>> fit(
     const raft::handle_t& handle,
     const cudaStream_t s,
     const DataT* data,
@@ -176,7 +178,7 @@ class SPORFDecisionTree {
 
   template <class DataT, class LabelT>
   static void predict(const raft::handle_t& handle,
-                      const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+                      const TreeMetaDataNode<DataT, LabelT>& tree,
                       const DataT* rows,
                       std::size_t n_rows,
                       std::size_t n_cols,
@@ -197,7 +199,7 @@ class SPORFDecisionTree {
   }
 
   template <class DataT, class LabelT>
-  static void predict_all(const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+  static void predict_all(const TreeMetaDataNode<DataT, LabelT>& tree,
                           const DataT* rows,
                           std::size_t n_rows,
                           std::size_t n_cols,
@@ -211,7 +213,7 @@ class SPORFDecisionTree {
 
   template <class DataT, class LabelT>
   static void predict_one(const DataT* row,
-                          const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+                          const TreeMetaDataNode<DataT, LabelT>& tree,
                           DataT* preds_out,
                           int num_outputs)
   {

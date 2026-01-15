@@ -246,14 +246,14 @@ class SPORF {
     for (int row_id = 0; row_id < n_rows; row_id++) {
       std::vector<T> row_prediction(forest->trees[0]->num_outputs);
       for (int i = 0; i < this->rf_params.n_trees; i++) {
-        DT::DecisionTree::predict(user_handle,
-                                  *forest->trees[i],
-                                  &h_input[row_id * row_size],
-                                  1,
-                                  n_cols,
-                                  row_prediction.data(),
-                                  forest->trees[i]->num_outputs,
-                                  verbosity);
+        DT::SPORFDecisionTree::predict(user_handle,
+          *forest->trees[i],
+          &h_input[row_id * row_size],
+          1,
+          n_cols,
+          row_prediction.data(),
+          forest->trees[i]->num_outputs,
+          verbosity);
       }
       for (int k = 0; k < forest->trees[0]->num_outputs; k++) {
         row_prediction[k] /= this->rf_params.n_trees;
