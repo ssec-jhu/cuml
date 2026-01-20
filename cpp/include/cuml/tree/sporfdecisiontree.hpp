@@ -42,7 +42,7 @@ struct SPORFDecisionTreeParams : DecisionTreeParams {
 
 template <class T, class L>
 struct ObliqueTreeMetaDataNode : public TreeMetaDataNode<T, L> {
-  std::vector<std::unique_ptr<ML::rand_mat<T>>> vector_projection_vectors;
+  std::vector<std::unique_ptr<ML::rand_mat<T>>> projection_vectors;
 };
 
 template <typename DataT>

@@ -66,7 +66,7 @@ class SPORFNodeQueue {
     tree->num_outputs = num_outputs;
     tree->sparsetree.reserve(max_nodes);
     tree->sparsetree.emplace_back(NodeT::CreateLeafNode(sampled_rows));
-    tree->vector_projection_vectors.reserve(max_nodes);
+    tree->projection_vectors.reserve(max_nodes);
     tree->leaf_counter  = 1;
     tree->depth_counter = 0;
     node_instances_.reserve(max_nodes);
@@ -102,7 +102,7 @@ class SPORFNodeQueue {
   }
 
   template <typename SplitT>
-  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items, SplitT* h_splits)
+  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items, SplitT* h_splits, std::vector<std::unique_ptr<rand_mat<DataT>>>& h_sparse_matrices)
   {
     // Update node queue based on splits
     for (std::size_t i = 0; i < work_items.size(); i++) {
@@ -122,6 +122,7 @@ class SPORFNodeQueue {
                                                              split.best_metric_val,
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
+      tree->projection_vectors.at(item.idx) = std::move(h_sparse_matrices[i]);
       tree->leaf_counter++;
       // left
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(split.nLeft));
@@ -160,7 +161,7 @@ struct SPORFBuilder {
   typedef typename ObjectiveT::IdxT IdxT;
   typedef typename ObjectiveT::BinT BinT;
   typedef SparseTreeNode<DataT, LabelT, IdxT> NodeT;
-  typedef TreeMetaDataNode<DataT, LabelT> TreeMetaDataNodeT;
+  typedef ObliqueTreeMetaDataNode<DataT, LabelT> TreeMetaDataNodeT;
   typedef Split<DataT, IdxT> SplitT;
   typedef Dataset<DataT, LabelT, IdxT> DatasetT;
   typedef Quantiles<DataT, IdxT> QuantilesT;
@@ -229,7 +230,6 @@ struct SPORFBuilder {
   rmm::device_uvector<DataT> d_contiguous;
   rmm::device_uvector<DataT> d_trans;
   std::vector<std::unique_ptr<rand_mat<DataT>>> h_sparse_matrices;
-  std::vector<std::unique_ptr<rand_mat<DataT>>> h_node_matrices;
   DatasetT dataset_trans;
 
   SPORFBuilder(const raft::handle_t& handle,
@@ -452,7 +452,7 @@ struct SPORFBuilder {
     while (queue.HasWork()) {
       auto work_items                      = queue.Pop();
       auto [splits_host_ptr, splits_count] = doSplit(work_items);
-      queue.Push(work_items, splits_host_ptr);
+      queue.Push(work_items, splits_host_ptr, h_sparse_matrices);
     }
     auto tree = queue.GetTree();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());

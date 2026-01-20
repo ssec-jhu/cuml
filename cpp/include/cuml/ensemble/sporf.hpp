@@ -55,7 +55,7 @@ struct SPORF_params {
 
 template <class T, class L>
 struct SPORFMetaData {
-  std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
+  std::vector<std::shared_ptr<DT::ObliqueTreeMetaDataNode<T, L>>> trees;
   SPORF_params rf_params;
 };
 

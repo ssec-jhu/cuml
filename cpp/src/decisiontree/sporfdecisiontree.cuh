@@ -27,6 +27,7 @@
 
 #include <cuml/common/logger.hpp>
 #include <cuml/tree/flatnode.h>
+#include <cuml/tree/sporfdecisiontree.hpp>
 
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
@@ -60,6 +61,9 @@ namespace ML {
 namespace DT {
 
 class SPORFDecisionTree {
+ template <class... Args>
+ using TreeMetaDataNode = typename DT::ObliqueTreeMetaDataNode<Args...>;
+
  public:
   template <class DataT, class LabelT>
   static std::shared_ptr<TreeMetaDataNode<DataT, LabelT>> fit(
