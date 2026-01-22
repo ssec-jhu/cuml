@@ -214,10 +214,10 @@ if __name__ == "__main__":
     logParams(args, df, ap)
 
     # hard-coded breakpoint
-    p.dtLog("")
-    p.dtLog("Breakpoint so we can attach a C++ debugger to the Linux process!")
-    breakpoint()
-    p.dtLog("Resumed execution after breakpoint")
+    # p.dtLog("")
+    # p.dtLog("Breakpoint so we can attach a C++ debugger to the Linux process!")
+    # breakpoint()
+    # p.dtLog("Resumed execution after breakpoint")
 
     # iterate through the specified sets of parameters
     for dp in ap:

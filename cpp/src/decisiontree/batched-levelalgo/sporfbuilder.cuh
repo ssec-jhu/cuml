@@ -323,10 +323,10 @@ struct SPORFBuilder {
     h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
 
 
-
+    /* TODO: CHOP WHEN DEBUGGED
     //if( this->builder_stream == handle.get_stream_from_stream_pool(0) )
-  printf( "SPORFBuilder::workspaceSize (%s line %d): d_wsize=%lu h_wsize=%lu\n", __FILE__, __LINE__, d_wsize, h_wsize );
-
+    printf( "SPORFBuilder::workspaceSize (%s line %d): d_wsize=%lu h_wsize=%lu\n", __FILE__, __LINE__, d_wsize, h_wsize );
+    */
 
     return std::make_pair(d_wsize, h_wsize);
   }
@@ -431,7 +431,9 @@ struct SPORFBuilder {
 
     auto [n_blocks_dimx, n_large_nodes] = this->updateWorkloadInfo(work_items);
 
+    /** TODO: CHOP WHEN DEBUGGED
     printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+    **/
 
     // TODO: parallelize this over work_items
     for (size_t i = 0; i < work_items.size(); i++) {
@@ -585,8 +587,10 @@ struct SPORFBuilder {
     size_t smem_size    = std::max(smem_size_1, smem_size_2);
     ASSERT(available_smem >= smem_size, "Not enough shared memory. Consider reducing max_n_bins.");
 
+    /* TODO: CHOP WHEN DEBUGGED
     printf( "SPORFBuilder::computeSplitSmemSize: smem_size=%ld\n", static_cast<size_t>(smem_size) );
-
+    */
+  
     return smem_size;
   }
 

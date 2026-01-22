@@ -26,6 +26,7 @@ import treelite.sklearn
 from pylibraft.common.handle import Handle
 
 import cuml.internals
+from cuml.common import dtPrint,dtLog,sbgb # (SPORF debug/test only)
 from cuml.common import input_to_cuml_array
 from cuml.common.exceptions import NotFittedError
 from cuml.fil.fil import ForestInference
@@ -272,6 +273,13 @@ class BaseRandomForestModel(Base, InteropMixin):
     ):
 
         print( 'HELLO FROM __init__ IN randomforest_common.pyx')
+        dtPrint("SAME DAMN THING")
+        dtPrint(sbgb(10101010))
+        dtPrint("AGAIN")
+        dtPrint( f"sbgb returned {sbgb(10101010)}")
+
+        dtLog("THIS IS DTLOG", 12345)
+
 
         if handle is None:
             handle = Handle(n_streams=n_streams)
