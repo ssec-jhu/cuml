@@ -33,6 +33,8 @@
 #include <raft/core/nvtx.hpp>
 #include <raft/util/cudart_utils.hpp>
 
+#include <thrust/sequence.h>
+
 #include <treelite/c_api.h>
 #include <treelite/tree.h>
 
@@ -59,6 +61,79 @@ namespace ML {
 */
 
 namespace DT {
+
+  /**
+ * Structure that manages the iterative batched-level training and building of nodes
+ * in the host.
+ */
+template <typename DataT, typename LabelT>
+class SPORFPredictNodeQueue {
+  using NodeT = SparseTreeNode<DataT, LabelT>;
+  using TreeMetaDataNodeT = DT::ObliqueTreeMetaDataNode<DataT, LabelT>;
+  const SPORFDecisionTreeParams params;
+  std::shared_ptr<TreeMetaDataNodeT> tree;
+  std::vector<SPORFDT::InstanceRange> node_instances_;
+  std::vector<SPORFDT::NodeWorkItem> leaves_;
+  std::deque<SPORFDT::NodeWorkItem> work_items_;
+
+ public:
+  SPORFPredictNodeQueue(std::shared_ptr<TreeMetaDataNodeT> tree)
+    : tree(tree)
+  {
+    node_instances_.reserve(tree->sparsetree.size());
+    node_instances_.emplace_back(SPORFDT::InstanceRange{0, sampled_rows});
+    work_items_.emplace_back(SPORFDT::NodeWorkItem{0, 0, node_instances_.back()});
+  }
+
+  std::shared_ptr<TreeMetaDataNodeT> GetTree() { return tree; }
+  const std::vector<SPORFDT::InstanceRange>& GetInstanceRanges() { return node_instances_; }
+
+  bool HasWork() { return work_items_.size() > 0; }
+
+  auto Pop()
+  {
+    std::vector<SPORFDT::NodeWorkItem> result;
+    result.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
+    while (work_items_.size() > 0 && result.size() < std::size_t(params.max_batch_size)) {
+      result.emplace_back(work_items_.front());
+      work_items_.pop_front();
+    }
+    return result;
+  }
+
+  template <typename SplitT>
+  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items)
+  {
+    // Update node queue based on partitioning results
+    for (std::size_t i = 0; i < work_items.size(); i++) {
+      auto item         = work_items[i];
+      auto parent         = tree->sparsetree[item.idx];
+      auto parent_range = item.instances;
+
+      if(parent.IsLeaf()) {
+        leaves_.push_back(item);
+        continue;
+      }
+
+      auto left_child = tree->sparsetree[parent.LeftChildId()];
+      auto right_child = tree->sparsetree[parent.RightChildId()];
+      // left
+      // Do not add a work item if this child is definitely a leaf
+      if (left_child.IsLeaf() == false) {
+        work_items_.emplace_back(
+          SPORFDT::NodeWorkItem{parent.LeftChildId(), item.depth + 1, SPORFDT::InstanceRange{parent_range.begin, item.nLeft}});
+      }
+
+      // right
+      // Do not add a work item if this child is definitely a leaf
+      if (right_child.IsLeaf() == false) {
+        work_items_.emplace_back(
+          SPORFDT::NodeWorkItem{parent.RightChildId(), item.depth + 1, SPORFDT::InstanceRange{parent_range.begin + item.nLeft, parent_range.count - item.nLeft}});
+      }
+    }
+  }
+};
+
 
 class SPORFDecisionTree {
  template <class... Args>
@@ -190,6 +265,118 @@ class SPORFDecisionTree {
                       int num_outputs,
                       rapids_logger::level_enum verbosity)
   {
+    int max_batch_size = 1024;
+    IdxT n_classes = 0; // Dummy variable, not used in prediction
+    rmm::device_uvector<IdxT> row_ids;
+    rmm::device_uvector<DataT> d_contiguous;
+    rmm::device_uvector<DataT> d_trans;
+    rmm::device_uvector<IdxT> smem;
+
+    size_t req_bytes     = n_rows * sizeof(IdxT);
+    size_t aligned_bytes = calculateAlignedBytes(req_bytes);
+    size_t aligned_elems = aligned_bytes / sizeof(IdxT);
+    row_ids.resize(aligned_elems, handle.get_stream());
+
+    req_bytes     = n_rows * n_cols * sizeof(DataT);
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(DataT);
+    d_contiguous.resize(aligned_elems, handle.get_stream());
+
+    req_bytes     = n_rows * sizeof(DataT);
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(DataT);
+    d_trans.resize(aligned_elems, handle.get_stream());
+
+    req_bytes     = max_batch_size * 2 * TPB_DEFAULT * sizeof(IdxT);
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(IdxT);
+    smem.resize(aligned_elems, handle.get_stream());
+
+    thrust::sequence(thrust::cuda::par.on(handle.get_stream()), row_ids.begin(), row_ids.begin() + n_rows, 0);
+
+    Dataset<DataT, LabelT, IdxT> dataset = {d_trans.data(), 0, n_rows, 1, n_rows, 1, row_ids.data(), n_classes};
+
+    raft::common::nvtx::range fun_scope("SPORFBuilder::train @sporfbuilder.cuh [batched-levelalgo]");
+    MLCommon::TimerCPU timer;
+    SPORFPredictNodeQueue<DataT, LabelT> queue(tree);
+    while (queue.HasWork()) {
+      auto work_items                      = queue.Pop();
+
+      for (int i = 0; i < work_items.size(); i++) {
+        auto& work_item = work_items[i];
+
+        if (tree->sparsetree[work_item.idx].LeftChildId() == -1) continue;
+
+        IdxT colid = 0;
+        auto node = tree->sparsetree[work_item.idx];
+        auto random_matrix = tree->projection_vectors.at(work_item.idx);
+
+        auto& begin = work_item.instances.begin;
+        auto& count = work_item.instances.count;
+
+        raft::matrix::copyRows<DataT, IdxT, size_t>(
+          rows,                     // in
+          count,                            // number of rows of output matrix
+          n_cols,                        // number of columns of output matrix
+          d_contiguous.data() + begin * n_cols,    // out
+          dataset.row_ids + begin,        // row indices to copy
+          count,
+          builder_stream,
+          false                             // do-row-major
+        );
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        paramsRPROJ rproj_params{
+          static_cast<int>(count), // number of samples
+          n_cols,               // number of features
+          1,                       // number of components
+          -1.0f,                   // error tolerance (not used)
+          false,                   // gaussian or sparse method
+          -1.0,                    // auto density (-1: auto-deduction)
+          false,                   // not used
+          0                        // random seed
+        };
+        RPROJtransform<DataT>(
+          handle,
+          d_contiguous.data() + begin * n_cols,
+          &random_matrix,
+          d_trans.data() + begin,
+          &rproj_params
+        );
+
+        work_item.nLeft = thrust::count_if(
+          thrust::cuda::par.on(handle.get_stream()),
+          dataset.row_ids + work_item.instances.begin,
+          dataset.row_ids + work_item.instances.begin + work_item.instances.count,
+          [=] __device__(IdxT row_id) {
+            return dataset.data[row_id * dataset.N + colid] <= node.QueryValue();
+          });
+        auto split = Split(node.QueryValue(), colid, node.BestMetric(), work_item.nLeft);
+
+        partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, (char*)(smem.data() + (i * 2 * TPB_DEFAULT * sizeof(IdxT))));
+      }
+
+      queue.Push(work_items);
+    }
+
+    
+    // auto tree = queue.GetTree();
+    // this->SetLeafPredictions(tree, queue.GetInstanceRanges());
+    // tree->train_time = timer.getElapsedMilliseconds();
+    // return tree;
+  }
+
+  /*
+  template <class DataT, class LabelT>
+  static void predict(const raft::handle_t& handle,
+                      const TreeMetaDataNode<DataT, LabelT>& tree,
+                      const DataT* rows,
+                      std::size_t n_rows,
+                      std::size_t n_cols,
+                      DataT* predictions,
+                      int num_outputs,
+                      rapids_logger::level_enum verbosity)
+  {
     if (verbosity >= rapids_logger::level_enum::off) { default_logger().set_level(verbosity); }
     ASSERT(is_host_ptr(rows) && is_host_ptr(predictions),
            "DT Error: Current impl. expects both input and predictions to be CPU "
@@ -235,6 +422,7 @@ class SPORFDecisionTree {
       preds_out[i] += tree.vector_leaf[idx * num_outputs + i];
     }
   }
+    */
 
 };  // End DecisionTree Class
 
