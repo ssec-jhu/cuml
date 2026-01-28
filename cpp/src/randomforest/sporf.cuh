@@ -248,6 +248,7 @@ class SPORF {
       for (int i = 0; i < this->rf_params.n_trees; i++) {
         DT::SPORFDecisionTree::predict(user_handle,
           *forest->trees[i],
+          this->rf_params.tree_params.max_batch_size,
           &h_input[row_id * row_size],
           1,
           n_cols,

@@ -43,7 +43,7 @@ struct InstanceRange {
 struct NodeWorkItem {
   size_t idx;  // Index of the work item in the tree
   int depth;
-  int nLeft;  // Number of prediction instances in the left child after partitioning
+  unsigned long nLeft;  // Number of prediction instances in the left child after partitioning
   InstanceRange instances;
 };
 

@@ -72,7 +72,7 @@ class SPORFNodeQueue {
     node_instances_.reserve(max_nodes);
     node_instances_.emplace_back(SPORFDT::InstanceRange{0, sampled_rows});
     if (this->IsExpandable(tree->sparsetree.back(), 0)) {
-      work_items_.emplace_back(SPORFDT::NodeWorkItem{0, 0, node_instances_.back()});
+      work_items_.emplace_back(SPORFDT::NodeWorkItem{0, 0, 0, node_instances_.back()});
     }
   }
 
@@ -131,7 +131,7 @@ class SPORFNodeQueue {
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
-          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
+          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, 0, node_instances_.back()});
       }
 
       // right
@@ -142,7 +142,7 @@ class SPORFNodeQueue {
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
-          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
+          SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, 0, node_instances_.back()});
       }
 
       // update depth
@@ -508,7 +508,7 @@ struct SPORFBuilder {
       auto& begin = work_items[i].instances.begin;
       auto& count = work_items[i].instances.count;
 
-      if (count < params.min_samples_split) continue;
+      if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
 
       raft::matrix::copyRows<DataT, IdxT, size_t>(
         dataset.data,                     // in
