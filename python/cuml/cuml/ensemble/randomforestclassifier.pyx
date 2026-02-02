@@ -416,9 +416,6 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             y to be of dtype int32. This will increase memory used for
             the method.
         """
-
-        print( "HELLO FROM randomforestclassifier.pyx LINE 421!")
-
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
         # Track the labels to see if update is necessary
         self.update_labels = not check_labels(y_m, self.classes_)

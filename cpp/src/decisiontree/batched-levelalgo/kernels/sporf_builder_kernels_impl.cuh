@@ -191,7 +191,6 @@ void launchLeafKernel(ObjectiveT objective,
  * @return The total sum aggregated over the sumscan,
  *         as well as the modified cdf-histogram pointer
  */
-/**$ (defined in builder_kernels_impl.cuh)
 template <typename BinT, typename IdxT, int TPB>
 DI BinT pdf_to_cdf(BinT* shared_histogram, IdxT n_bins)
 {
@@ -214,7 +213,6 @@ DI BinT pdf_to_cdf(BinT* shared_histogram, IdxT n_bins)
   // return the total sum
   return total_aggregate;
 }
-$*/
 
 template <typename DataT,
           typename LabelT,
@@ -359,7 +357,7 @@ static __global__ void computeSplitKernel(BinT* histograms,
   for (IdxT c = 0; c < objective.NumClasses(); ++c) {
     // left to right scan operation for scanning
     // "lesser-than-or-equal" counts
-    BinT total_sum = DT::pdf_to_cdf<BinT, IdxT, TPB>(shared_histogram + n_bins * c, n_bins);
+    BinT total_sum = SPORFDT::pdf_to_cdf<BinT, IdxT, TPB>(shared_histogram + n_bins * c, n_bins);
     // now, `shared_histogram[n_bins * c + i]` will have count of datapoints of class `c`
     // that are less than or equal to `shared_quantiles[i]`.
   }
@@ -430,6 +428,7 @@ void launchComputeSplitKernel(BinT* histograms,
                                                        seed);
 }
 
+#ifndef ML_SPORF_BUILDER_SKIP_EXPLICIT_INSTANTIATIONS
 template void launchNodeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT>(
   const _IdxT max_depth,
   const _IdxT min_samples_leaf,
@@ -474,5 +473,6 @@ template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEM
   dim3 grid,
   size_t smem_size,
   cudaStream_t builder_stream);
+#endif
 }  // namespace SPORFDT
 }  // namespace ML

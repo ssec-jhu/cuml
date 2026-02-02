@@ -27,10 +27,10 @@ namespace ML {
 
 namespace DT {
 
-typedef enum {
+enum HISTOGRAM_METHOD : int {
   HISTOGRAM_METHOD_EXACT = 0,
   HISTOGRAM_METHOD_SAMPLED = 1
-} HISTOGRAM_METHOD;
+};
 
 struct SPORFDecisionTreeParams : DecisionTreeParams {
   /**
@@ -46,7 +46,7 @@ struct ObliqueTreeMetaDataNode : public TreeMetaDataNode<T, L> {
 };
 
 template <typename DataT>
-ML::rand_mat<DataT> clone_rand_mat(const ML::rand_mat<DataT>& src, ML::rand_mat<DataT>& dst) {
+void clone_rand_mat(const ML::rand_mat<DataT>& src, ML::rand_mat<DataT>& dst) {
   dst.type = src.type;
   switch (src.type) {
     case ML::dense:
@@ -54,23 +54,23 @@ ML::rand_mat<DataT> clone_rand_mat(const ML::rand_mat<DataT>& src, ML::rand_mat<
       raft::copy(dst.dense_data.data(), src.dense_data.data(), src.dense_data.size(), dst.stream);
       break;
     case ML::sparse:
-      dst.indices    = rmm::device_uvector<int>(src.indices.size(), dst.stream);
-      dst.indptr     = rmm::device_uvector<int>(src.indptr.size(), dst.stream);
-      dst.sparse_data= rmm::device_uvector<DataT>(src.sparse_data.size(), dst.stream);
+      dst.indices     = rmm::device_uvector<int>(src.indices.size(), dst.stream);
+      dst.indptr      = rmm::device_uvector<int>(src.indptr.size(), dst.stream);
+      dst.sparse_data = rmm::device_uvector<DataT>(src.sparse_data.size(), dst.stream);
       raft::copy(dst.indices.data(), src.indices.data(), src.indices.size(), dst.stream);
-      raft::copy(dst.indptr.data(),  src.indptr.data(),  src.indptr.size(), dst.stream);
+      raft::copy(dst.indptr.data(), src.indptr.data(), src.indptr.size(), dst.stream);
       raft::copy(dst.sparse_data.data(), src.sparse_data.data(), src.sparse_data.size(), dst.stream);
       break;
     case ML::unset:
     default: break;
   }
-  return dst;
 }
 
 template <typename DataT>
 ML::rand_mat<DataT> clone_rand_mat(const ML::rand_mat<DataT>& src) {
-  ML::rand_mat<DataT> dst(src.stream());
-  return clone_rand_mat(src, dst);
+  ML::rand_mat<DataT> dst(src.stream);
+  clone_rand_mat(src, dst);
+  return dst;  // move/NRVO, no copy
 }
 
 

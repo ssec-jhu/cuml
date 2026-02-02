@@ -19,6 +19,8 @@
 #pragma once
 
 #include "../bins.cuh"
+#include "../dataset.h"
+#include "../split.cuh"
 #include "../objectives.cuh"
 #include "../quantiles.h"
 
@@ -360,6 +362,12 @@ CUML_KERNEL void adaptive_sample_kernel(int* colids,
     }
   }
 }
+
+template <typename DataT, typename LabelT, typename IdxT, int TPB>
+DI void partitionSamples(const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+                         const DT::Split<DataT, IdxT>& split,
+                         const NodeWorkItem& work_item,
+                         char* smem);
 
 template <typename DataT,
           typename LabelT,

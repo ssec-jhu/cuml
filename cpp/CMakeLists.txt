@@ -349,7 +349,8 @@ if(BUILD_CUML_CPP_LIBRARY)
         src/decisiontree/batched-levelalgo/kernels/mse-float.cu
         src/decisiontree/batched-levelalgo/kernels/poisson-double.cu
         src/decisiontree/batched-levelalgo/kernels/poisson-float.cu
-        src/decisiontree/decisiontree.cu)
+        src/decisiontree/decisiontree.cu
+        src/decisiontree/sporfdecisiontree.cu)
   endif()
 
   if(all_algo OR explainer_algo)

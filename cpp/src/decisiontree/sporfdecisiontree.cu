@@ -1,16 +1,33 @@
 // sporfdecisiontree.cu
 #include "sporfdecisiontree.cuh"               // class/decl
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
-#include "batched-levelalgo/kernels/builder_kernels_impl.cuh"       // for partitionSamples
-#include "batched-levelalgo/kernels/sporf_builder_kernels_impl.cuh" // for sporf variant
+#include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
+// pull in the device definitions but skip the explicit instantiations to avoid
+// clashes with the fixed _DataT/_LabelT aliases in this TU.
+#define ML_SPORF_BUILDER_SKIP_EXPLICIT_INSTANTIATIONS
+#include "batched-levelalgo/kernels/sporf_builder_kernels_impl.cuh"
+#undef ML_SPORF_BUILDER_SKIP_EXPLICIT_INSTANTIATIONS
 
 namespace ML {
 namespace DT {
+
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void partition_kernel(const Dataset<DataT, LabelT, IdxT> dataset,
+                                 DataT split_quesval, IdxT split_colid, DataT split_best_metric_val,
+                                 const SPORFDT::NodeWorkItem work_item)
+{
+    Split<DataT, IdxT> split{split_quesval, split_colid, split_best_metric_val, work_item.nLeft};
+    // DT::InstanceRange instances{work_item.instances.begin, work_item.instances.count};
+    // DT::NodeWorkItem local_work_item{work_item.idx, work_item.depth, instances};
+    extern __shared__ char smem[];
+    SPORFDT::partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, smem);
+}
 
 // Template definition moved from the header
 template <class DataT, class LabelT>
 void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 const TreeMetaDataNode<DataT, LabelT>& tree,
+                                std::size_t max_batch_size,
                                 const DataT* rows,
                                 std::size_t n_rows,
                                 std::size_t n_cols,
@@ -22,7 +39,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     rmm::device_uvector<IdxT> row_ids(0, handle.get_stream());
     rmm::device_uvector<DataT> d_contiguous(0, handle.get_stream());
     rmm::device_uvector<DataT> d_trans(0, handle.get_stream());
-    rmm::device_uvector<IdxT> smem(0, handle.get_stream());
+    // rmm::device_uvector<IdxT> smem(0, handle.get_stream());
 
     size_t req_bytes     = n_rows * sizeof(IdxT);
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
@@ -39,10 +56,10 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(DataT);
     d_trans.resize(aligned_elems, handle.get_stream());
 
-    req_bytes     = max_batch_size * 2 * TPB_DEFAULT * sizeof(IdxT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(IdxT);
-    smem.resize(aligned_elems, handle.get_stream());
+    // req_bytes     = max_batch_size * 2 * TPB_DEFAULT * sizeof(IdxT);
+    // aligned_bytes = calculateAlignedBytes(req_bytes);
+    // aligned_elems = aligned_bytes / sizeof(IdxT);
+    // smem.resize(aligned_elems, handle.get_stream());
 
     thrust::sequence(thrust::cuda::par.on(handle.get_stream()), row_ids.begin(), row_ids.begin() + n_rows, 0);
 
@@ -104,11 +121,15 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
           [=] __device__(IdxT row_id) {
             return dataset.data[row_id * dataset.N + colid] <= node.QueryValue();
           });
-        auto split = Split(node.QueryValue(), colid, node.BestMetric(), work_item.nLeft);
+        // auto split = Split(node.QueryValue(), colid, node.BestMetric(), work_item.nLeft);
 
-        char* smem_base = reinterpret_cast<char*>(smem.data());
-        char* buf = smem_base + (i * 2 * TPB_DEFAULT * sizeof(IdxT));
-        partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, buf);
+        // char* smem_base = reinterpret_cast<char*>(smem.data());
+        // char* buf = smem_base + (i * 2 * TPB_DEFAULT * sizeof(IdxT));
+        partition_kernel<DataT, LabelT, IdxT>
+          <<<1, TPB_DEFAULT, 2 * TPB_DEFAULT * sizeof(IdxT), handle.get_stream()>>>(
+            dataset, node.QueryValue(), colid, node.BestMetric(), work_item);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+        // partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, buf);
       }
 
       queue.Push(work_items);
@@ -142,10 +163,10 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
   }
 
 // Explicit instantiations (match the combos you need)
-template void SPORFDecisionTree::predict<float, int>(const raft::handle_t&, const TreeMetaDataNode<float,int>&, const float*, std::size_t, std::size_t, float*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<double, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, const double*, std::size_t, std::size_t, double*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<float, float>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, const float*, std::size_t, std::size_t, float*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<double, double>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, const double*, std::size_t, std::size_t, double*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<float, int>(const raft::handle_t&, const TreeMetaDataNode<float,int>&, std::size_t, const float*, std::size_t, std::size_t, float*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<double, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<float, float>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, float*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<double, double>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double*, int, rapids_logger::level_enum);
 
 }  // namespace DT
 }  // namespace ML

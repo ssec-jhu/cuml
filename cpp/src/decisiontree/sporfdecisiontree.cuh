@@ -63,6 +63,8 @@ namespace ML {
 */
 
 namespace DT {
+  static constexpr int TPB_DEFAULT = 128;
+
   /**
  * Structure that manages the iterative batched-level training and building of nodes
  * in the host.
@@ -140,7 +142,6 @@ class SPORFPredictNodeQueue {
 class SPORFDecisionTree {
   using NodeWorkItem = SPORFDT::NodeWorkItem;
   using IdxT = unsigned long;
-  static constexpr int TPB_DEFAULT = 128;
 
   template <class... Args>
   using TreeMetaDataNode = typename DT::ObliqueTreeMetaDataNode<Args...>;
