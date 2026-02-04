@@ -23,6 +23,9 @@ from treelite import Model as TreeliteModel
 
 import cuml.internals
 import cuml.internals.nvtx as nvtx
+
+from cuml.common import dtPrint,dtLog,sbgb # (SPORF debug/test only)
+
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
@@ -314,7 +317,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
 
     @classmethod
     def _get_param_names(cls):
-        print( "HELLO FROM _get_param_names() IN sporfclassifier.pyx")
+        dtPrint( "HELLO FROM _get_param_names() IN sporfclassifier.pyx")
         return [
             *super()._get_param_names(),    # class BaseRandomForestModel(Base, InteropMixin) in randomforest_common.pyx
             "device",
@@ -352,7 +355,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                  histogram_method=HISTOGRAM_METHOD_EXACT,
                  **kwargs):
 
-        print( 'HELLO FROM __init__ IN sporfclassifier.pyx')
+        dtPrint( 'HELLO FROM __init__ IN sporfclassifier.pyx')
 
         super().__init__(
             split_criterion=split_criterion,
@@ -506,7 +509,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             the method.
         """
 
-        print( "HELLO FROM fit(self, X, y, *, convert_dtype) IN FILE sporfclassifier.pyx")
+        dtPrint( "HELLO FROM fit(self, X, y, *, convert_dtype) IN FILE sporfclassifier.pyx")
 
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
         # Track the labels to see if update is necessary

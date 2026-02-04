@@ -8,13 +8,13 @@ from datetime import datetime as dt
 
 # emit timestamp and formatted string, separated by tab (ASCII 9)
 def dtPrint(*args, **kwargs):
-    builtins.print(f"{dt.now():%Y%m%d %H%M%S.%f}\t", end="")
+    builtins.print(f"{dt.now():%Y%m%d %H%M%S.%f}", end="\t")
     builtins.print(*args, **kwargs)
 
 
 # emit timestamp and formatted string, separated by space (ASCII 32)
 def dtLog(*args, **kwargs):
-    builtins.print(f"{dt.now():%Y%m%d %H%M%S.%f} ", end="")
+    builtins.print(f"{dt.now():%Y%m%d %H%M%S.%f}", end=" ")
     builtins.print(*args, **kwargs)
 
 

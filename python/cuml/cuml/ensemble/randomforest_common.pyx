@@ -117,7 +117,7 @@ class BaseRandomForestModel(Base, InteropMixin):
     @classmethod
     def _get_param_names(cls):
         
-        print( "HELLO FROM _get_param_names() IN randomforest_common.pyx!")
+        dtPrint( "HELLO FROM _get_param_names() IN randomforest_common.pyx!")
 
         return [
             *super()._get_param_names(),
@@ -272,8 +272,7 @@ class BaseRandomForestModel(Base, InteropMixin):
         output_type=None,
     ):
 
-        print( 'HELLO FROM __init__ IN randomforest_common.pyx')
-        dtPrint("SAME DAMN THING")
+        dtPrint( 'HELLO FROM __init__ IN randomforest_common.pyx')
         dtPrint(sbgb(10101010))
         dtPrint("AGAIN")
         dtPrint( f"sbgb returned {sbgb(10101010)}")

@@ -133,7 +133,18 @@ void fit(const raft::handle_t& user_handle,
                 SPORF_params rf_params,
                 rapids_logger::level_enum verbosity)
 {
-  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtPrint( "HELLO FROM sporf.cu LINE %d", __LINE__ );
+  dtLog( "Here is a call to dtLog at line %d in sporf.cu", __LINE__ );
 
   raft::common::nvtx::range fun_scope("RF::fit @sporf.cu");
   ML::default_logger().set_level(verbosity);

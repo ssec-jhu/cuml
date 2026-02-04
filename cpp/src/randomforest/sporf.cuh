@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cuml/ensemble/sporf.hpp>
+#include <cuml/common/sporf_utils.hpp>  // dtPrint(), dtLog()
 
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
@@ -134,7 +135,7 @@ class SPORF {
            SPORFMetaData<T, L>*& forest)
   {
     
-    printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+    dtPrint( "HELLO FROM sporf.cuh LINE %d\n", __LINE__ );
 
     raft::common::nvtx::range fun_scope("SPORF::fit @sporf.cuh");
     this->error_checking(input, labels, n_rows, n_cols, false);
