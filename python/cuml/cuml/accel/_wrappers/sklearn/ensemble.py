@@ -18,7 +18,7 @@ import cuml.ensemble
 from cuml.accel.estimator_proxy import ProxyBase
 from cuml.internals.interop import UnsupportedOnGPU
 
-__all__ = ("RandomForestRegressor", "RandomForestClassifier", "SPORFRegressor", "SPORFClassifier")
+__all__ = ("RandomForestRegressor", "RandomForestClassifier")
 
 
 class RandomForestRegressor(ProxyBase):
@@ -67,47 +67,50 @@ class RandomForestClassifier(ProxyBase):
         return self._call_method("__getitem__", index)
 
 
-class SPORFRegressor(ProxyBase):
-    _gpu_class = cuml.ensemble.RandomForestRegressor
+if hasattr(cuml.ensemble, "SPORFRegressor") and hasattr(cuml.ensemble, "SPORFClassifier"):
+    __all__.extend(["SPORFRegressor", "SPORFClassifier"])
 
-    def _gpu_fit(self, X, y, sample_weight=None):
-        if sample_weight is not None:
-            raise UnsupportedOnGPU("`sample_weight` is not supported")
-        return self._gpu.fit(X, y)
+    class SPORFRegressor(ProxyBase):
+        _gpu_class = cuml.ensemble.SPORFRegressor
 
-    def _gpu_score(self, X, y, sample_weight=None):
-        if sample_weight is not None:
-            raise UnsupportedOnGPU("`sample_weight` is not supported")
-        return self._gpu.score(X, y)
+        def _gpu_fit(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.fit(X, y)
 
-    def __len__(self):
-        return self._call_method("__len__")
+        def _gpu_score(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.score(X, y)
 
-    def __iter__(self):
-        return self._call_method("__iter__")
+        def __len__(self):
+            return self._call_method("__len__")
 
-    def __getitem__(self, index):
-        return self._call_method("__getitem__", index)
+        def __iter__(self):
+            return self._call_method("__iter__")
+
+        def __getitem__(self, index):
+            return self._call_method("__getitem__", index)
 
 
-class SPORFClassifier(ProxyBase):
-    _gpu_class = cuml.ensemble.SPORFClassifier
+    class SPORFClassifier(ProxyBase):
+        _gpu_class = cuml.ensemble.SPORFClassifier
 
-    def _gpu_fit(self, X, y, sample_weight=None):
-        if sample_weight is not None:
-            raise UnsupportedOnGPU("`sample_weight` is not supported")
-        return self._gpu.fit(X, y)
+        def _gpu_fit(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.fit(X, y)
 
-    def _gpu_score(self, X, y, sample_weight=None):
-        if sample_weight is not None:
-            raise UnsupportedOnGPU("`sample_weight` is not supported")
-        return self._gpu.score(X, y)
+        def _gpu_score(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.score(X, y)
 
-    def __len__(self):
-        return self._call_method("__len__")
+        def __len__(self):
+            return self._call_method("__len__")
 
-    def __iter__(self):
-        return self._call_method("__iter__")
+        def __iter__(self):
+            return self._call_method("__iter__")
 
-    def __getitem__(self, index):
-        return self._call_method("__getitem__", index)
+        def __getitem__(self, index):
+            return self._call_method("__getitem__", index)

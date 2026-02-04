@@ -370,8 +370,6 @@ void fit(const raft::handle_t& user_handle,
          RF_params rf_params,
          rapids_logger::level_enum verbosity)
 {
-  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
   ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
@@ -393,8 +391,6 @@ void fit(const raft::handle_t& user_handle,
          RF_params rf_params,
          rapids_logger::level_enum verbosity)
 {
-  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
   ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");

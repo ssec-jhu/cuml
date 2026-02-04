@@ -44,52 +44,65 @@ from pylibraft.common.handle cimport handle_t
 from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
-cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT" nogil:
 
-# defined in sporfdecisiontree.hpp
-#
-# namespace ML {
-#   namespace DT {
-#
-#     typedef enum {
-#        HISTOGRAM_METHOD_EXACT = 0,
-#        HISTOGRAM_METHOD_SAMPLED = 1
-#     } HISTOGRAM_METHOD;
 
-    ctypedef enum HISTOGRAM_METHOD:
-        HISTOGRAM_METHOD_EXACT = 0,
-        HISTOGRAM_METHOD_SAMPLED = 1
+# Declare SPORF-specific tree params and enums from ML::DT so we can
+# include them in the SPORF_params layout below. Matches
+# cpp/include/cuml/tree/sporfdecisiontree.hpp
+cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT":
+    cdef enum HISTOGRAM_METHOD:
+        HISTOGRAM_METHOD_EXACT
+        HISTOGRAM_METHOD_SAMPLED
+
+    cdef cppclass DecisionTreeParams:
+        int max_depth
+        int max_leaves
+        float max_features
+        int max_n_bins
+        int min_samples_leaf
+        int min_samples_split
+        CRITERION split_criterion
+        float min_impurity_decrease
+        int max_batch_size
+
+    cdef cppclass SPORFDecisionTreeParams(DecisionTreeParams):
+        float density
+        HISTOGRAM_METHOD histogram_method
+
+# Expose enum values as Python-level ints so they can be used as
+# default values in Python signatures and are pickle/JSON friendly.
+HISTOGRAM_METHOD_EXACT_PY = int(HISTOGRAM_METHOD_EXACT)
+HISTOGRAM_METHOD_SAMPLED_PY = int(HISTOGRAM_METHOD_SAMPLED)
+
 
 cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
 
 # defined in sporf.hpp
 #
-# namespace ML {
+# struct SPORF_params {
+#   ... RF_params members ...
+#   int n_trees;
+#   bool bootstrap;
+#   float max_samples;
+#   uint64_t seed;
+#   int n_streams;
 #
-#   struct SPORF_params {
-#     ... RF_params members ...
-#     int n_trees;
-#     bool bootstrap;
-#     float max_samples;
-#     uint64_t seed;
-#     int n_streams;
+#   DT::SPORFDecisionTreeParams tree_params;
+# };
 #
-#     DT::SPORFDecisionTreeParams tree_params;
-#   };
-#
-#   template <class T, class L>
-#   struct SPORFMetaData {
-#     std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
-#     SPORF_params rf_params;
-#   };
-# }; // (namespace ML)
+# template <class T, class L>
+# struct SPORFMetaData {
+#   std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
+#   SPORF_params rf_params;
+# };
 
     cdef cppclass SPORF_params:
         int n_trees
         bool bootstrap
         float max_samples
         uint64_t seed
-        pass
+        int n_streams
+        SPORFDecisionTreeParams tree_params
 
     cdef cppclass SPORFMetaData[T, L]:
         void* trees
@@ -345,14 +358,9 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             **super()._attrs_to_cpu(model),
         }
 
-    def __init__(self,
-                 *,
-                 split_criterion=0,                 # random forest parameters
-                 handle=None,
-                 verbose=False,
-                 output_type=None,
-                 density=0.0,                       # SPORF-specific parameters
-                 histogram_method=HISTOGRAM_METHOD_EXACT,
+    def __init__(self, *, split_criterion=0, handle=None, verbose=False,
+                 output_type=None, density=0.5,
+                 histogram_method=HISTOGRAM_METHOD_SAMPLED_PY,
                  **kwargs):
 
         dtPrint( 'HELLO FROM __init__ IN sporfclassifier.pyx')
@@ -364,10 +372,21 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             output_type=output_type,
             **kwargs)
 
-        # initialize SPORF-specific instance variables
+        # Store SPORF-specific tree params on the Python object so they
+        # are available for pickling via __getstate__ and passed into
+        # set_sporf_params() during fit(). Use an int for the enum so it's
+        # JSON/pickle friendly.
         self.density = density
-        self.histogram_method = histogram_method
-        return    
+        if histogram_method is None:
+            # default to the sampled histogram method
+            self.histogram_method = int(HISTOGRAM_METHOD_SAMPLED)
+        else:
+            # allow passing either the enum constant or an int
+            try:
+                self.histogram_method = int(histogram_method)
+            except Exception:
+                # fallback: store as-is (will likely raise later if invalid)
+                self.histogram_method = histogram_method
 
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
@@ -399,6 +418,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         state["treelite_serialized_bytes"] = self.treelite_serialized_bytes
         state["split_criterion"] = self.split_criterion
         state["handle"] = self.handle
+        state["density"] = self.density
+        state["histogram_method"] = self.histogram_method
 
         return state
 
@@ -414,9 +435,22 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         self.n_cols = state['n_cols']
         if self.n_cols:
             rf_forest.rf_params = state["rf_params"]
+            # restore SPORF-specific tree params (density and histogram_method)
+            # if they were saved in the state (backwards-compatible)
+            try:
+                rf_forest.rf_params.tree_params.density = <float> state["density"]
+                rf_forest.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
+            except Exception:
+                # older pickles may not have these keys; ignore in that case
+                pass
             state["rf_forest"] = <uintptr_t>rf_forest
 
             rf_forest64.rf_params = state["rf_params64"]
+            try:
+                rf_forest64.rf_params.tree_params.density = <float> state["density"]
+                rf_forest64.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
+            except Exception:
+                pass
             state["rf_forest64"] = <uintptr_t>rf_forest64
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
@@ -532,24 +566,21 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             seed_val = <uintptr_t>check_random_seed(self.random_state)
 
         rf_params = set_sporf_params(<int> self.max_depth,
-                                        <int> self.max_leaves,
-                                        <float> max_feature_val,
-                                        <int> self.n_bins,
-                                        <int> self.min_samples_leaf,
-                                        <int> self.min_samples_split,
-                                        <float> self.min_impurity_decrease,
-                                        <bool> self.bootstrap,
-                                        <int> self.n_estimators,
-                                        <float> self.max_samples,
-                                        <uint64_t> seed_val,
-                                        <CRITERION> self.split_criterion,
-                                        <int> self.n_streams,
-                                        <int> self.max_batch_size,
-                                        <float> self.density,
-                                        <HISTOGRAM_METHOD> self.histogram_method)
-
-        print( "density:", self.density )
-        print( "histogram_method:", self.histogram_method )
+                                     <int> self.max_leaves,
+                                     <float> max_feature_val,
+                                     <int> self.n_bins,
+                                     <int> self.min_samples_leaf,
+                                     <int> self.min_samples_split,
+                                     <float> self.min_impurity_decrease,
+                                     <bool> self.bootstrap,
+                                     <int> self.n_estimators,
+                                     <float> self.max_samples,
+                                     <uint64_t> seed_val,
+                                     <CRITERION> self.split_criterion,
+                                     <int> self.n_streams,
+                                     <int> self.max_batch_size,
+                                     <float> self.density,
+                                     <HISTOGRAM_METHOD> self.histogram_method)
 
         if self.dtype == np.float32:
             fit(handle_[0],

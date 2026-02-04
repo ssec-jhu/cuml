@@ -19,16 +19,23 @@
 #pragma once
 
 #include "batched-levelalgo/builder.cuh"
+#include "batched-levelalgo/objectives.cuh"
 #include "batched-levelalgo/sporfbuilder.cuh"
+#include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
 #include "batched-levelalgo/quantiles.cuh"
 #include "treelite_util.h"
 
+#include <cublas_v2.h>
+
 #include <cuml/common/logger.hpp>
 #include <cuml/tree/flatnode.h>
+#include <cuml/tree/sporfdecisiontree.hpp>
 
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
 #include <raft/util/cudart_utils.hpp>
+
+#include <thrust/sequence.h>
 
 #include <treelite/c_api.h>
 #include <treelite/tree.h>
@@ -56,11 +63,92 @@ namespace ML {
 */
 
 namespace DT {
+  static constexpr int TPB_DEFAULT = 128;
+
+  /**
+ * Structure that manages the iterative batched-level training and building of nodes
+ * in the host.
+ */
+template <typename DataT, typename LabelT>
+class SPORFPredictNodeQueue {
+  using NodeT = SparseTreeNode<DataT, LabelT>;
+  using TreeMetaDataNodeT = DT::ObliqueTreeMetaDataNode<DataT, LabelT>;
+  using NodeWorkItem = SPORFDT::NodeWorkItem;
+  const TreeMetaDataNodeT& tree;
+  size_t max_batch_size;
+  std::vector<SPORFDT::InstanceRange> node_instances_;
+  std::vector<NodeWorkItem> leaves_;
+  std::deque<NodeWorkItem> work_items_;
+
+ public:
+  SPORFPredictNodeQueue(const TreeMetaDataNodeT& tree, size_t n_rows, size_t max_batch_size)
+    : tree(tree), max_batch_size(max_batch_size)
+  {
+    node_instances_.reserve(tree.sparsetree.size());
+    node_instances_.emplace_back(SPORFDT::InstanceRange{0, n_rows});
+    work_items_.emplace_back(NodeWorkItem{0, 0, 0, node_instances_.back()});
+  }
+
+  const std::vector<NodeWorkItem>& GetLeaves() { return leaves_; }
+  const TreeMetaDataNodeT& GetTree() { return tree; }
+  const std::vector<SPORFDT::InstanceRange>& GetInstanceRanges() { return node_instances_; }
+
+  bool HasWork() { return work_items_.size() > 0; }
+
+  auto Pop()
+  {
+    std::vector<NodeWorkItem> result;
+    result.reserve(std::min(max_batch_size, work_items_.size()));
+    while (work_items_.size() > 0 && result.size() < max_batch_size) {
+      result.emplace_back(work_items_.front());
+      work_items_.pop_front();
+    }
+    return result;
+  }
+
+  void Push(const std::vector<NodeWorkItem>& work_items)
+  {
+    // Update node queue based on partitioning results
+    for (std::size_t i = 0; i < work_items.size(); i++) {
+      auto item         = work_items[i];
+      auto parent         = tree.sparsetree[item.idx];
+      auto parent_range = item.instances;
+
+      if(parent.IsLeaf()) {
+        leaves_.push_back(item);
+        continue;
+      }
+
+      auto left_child = tree.sparsetree[parent.LeftChildId()];
+      auto right_child = tree.sparsetree[parent.RightChildId()];
+      // left
+      // Do not add a work item if this child is definitely a leaf
+      if (left_child.IsLeaf() == false) {
+        work_items_.emplace_back(
+          NodeWorkItem{static_cast<size_t>(parent.LeftChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin, item.nLeft}});
+      }
+
+      // right
+      // Do not add a work item if this child is definitely a leaf
+      if (right_child.IsLeaf() == false) {
+        work_items_.emplace_back(
+          NodeWorkItem{static_cast<size_t>(parent.RightChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin + item.nLeft, parent_range.count - item.nLeft}});
+      }
+    }
+  }
+};
+
 
 class SPORFDecisionTree {
+  using NodeWorkItem = SPORFDT::NodeWorkItem;
+  using IdxT = unsigned long;
+
+  template <class... Args>
+  using TreeMetaDataNode = typename DT::ObliqueTreeMetaDataNode<Args...>;
+
  public:
   template <class DataT, class LabelT>
-  static std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> fit(
+  static std::shared_ptr<TreeMetaDataNode<DataT, LabelT>> fit(
     const raft::handle_t& handle,
     const cudaStream_t s,
     const DataT* data,
@@ -174,9 +262,26 @@ class SPORFDecisionTree {
     }
   }
 
+  inline static size_t calculateAlignedBytes(size_t actual_size) {
+    constexpr size_t align = 256;  // same alignTo used in builder
+    return raft::alignTo(actual_size, align);
+  }
+
   template <class DataT, class LabelT>
   static void predict(const raft::handle_t& handle,
-                      const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+                      const TreeMetaDataNode<DataT, LabelT>& tree,
+                      size_t max_batch_size,
+                      const DataT* rows,
+                      std::size_t n_rows,
+                      std::size_t n_cols,
+                      DataT* predictions,
+                      int num_outputs,
+                      rapids_logger::level_enum verbosity);
+
+  /*
+  template <class DataT, class LabelT>
+  static void predict(const raft::handle_t& handle,
+                      const TreeMetaDataNode<DataT, LabelT>& tree,
                       const DataT* rows,
                       std::size_t n_rows,
                       std::size_t n_cols,
@@ -197,7 +302,7 @@ class SPORFDecisionTree {
   }
 
   template <class DataT, class LabelT>
-  static void predict_all(const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+  static void predict_all(const TreeMetaDataNode<DataT, LabelT>& tree,
                           const DataT* rows,
                           std::size_t n_rows,
                           std::size_t n_cols,
@@ -211,7 +316,7 @@ class SPORFDecisionTree {
 
   template <class DataT, class LabelT>
   static void predict_one(const DataT* row,
-                          const DT::TreeMetaDataNode<DataT, LabelT>& tree,
+                          const TreeMetaDataNode<DataT, LabelT>& tree,
                           DataT* preds_out,
                           int num_outputs)
   {
@@ -229,6 +334,7 @@ class SPORFDecisionTree {
       preds_out[i] += tree.vector_leaf[idx * num_outputs + i];
     }
   }
+    */
 
 };  // End DecisionTree Class
 
