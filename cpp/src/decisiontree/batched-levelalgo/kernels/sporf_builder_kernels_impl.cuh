@@ -270,6 +270,15 @@ static __global__ void computeSplitKernel(BinT* histograms,
 
   // getting the n_bins for that feature
   IdxT n_bins = min(max_n_bins, static_cast<IdxT>(floor(range_len / min_samples_leaf)));//  quantiles.n_bins_array[col];
+if (threadIdx.x == 0 && offset_blockid == 0 && col == dataset.n_sampled_cols - 1) {
+  for (IdxT b = 0; b < n_bins; ++b) {
+    IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + col) * max_n_bins + b];
+    IdxT row_id = dataset.row_ids[quantile_index];
+    DataT qvalue = dataset.data[row_id + col_offset];
+    printf("num_blocks=%d offset_blockid=%d nid=%d col=%d bin %d: quantile index=%d row_id=%d qvalue=%g\n", int(num_blocks), int(offset_blockid),
+           int(nid), int(col), int(b), int(quantile_index), int(row_id), double(qvalue));
+  }
+}
 
   auto end                  = range_start + range_len;
   auto shared_histogram_len = n_bins * objective.NumClasses();
@@ -311,6 +320,14 @@ static __global__ void computeSplitKernel(BinT* histograms,
   }
   __syncthreads();
 
+
+// if (threadIdx.x == 0 && blockIdx.y == 0 && nid == 0) {
+//   printf("nid=%d col=%d n_bins=%d quantiles:", int(nid), int(col), int(n_bins));
+//   for (IdxT b = 0; b < n_bins; ++b) {
+//     printf(" %g", double(shared_quantiles[b]));
+//   }
+//   printf("\n\n");
+// }
 
   // compute pdf shared histogram for all bins for all classes in shared mem
 

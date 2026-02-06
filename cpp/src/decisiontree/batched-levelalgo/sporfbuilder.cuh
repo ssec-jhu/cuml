@@ -535,11 +535,11 @@ struct SPORFBuilder {
         dataset.data,                     // in
         count,                            // number of rows of output matrix
         dataset.N,                        // number of columns of output matrix
-        d_contiguous.data() + begin * dataset.N,    // out
+        d_contiguous.data() + begin, // d_contiguous.data() + begin * dataset.N,    // out
         dataset.row_ids + begin,        // row indices to copy
         count,
         builder_stream,
-        false                             // do-row-major
+        false                             // do-row-major (false, i.e. do column-major)
       );
       RAFT_CUDA_TRY(cudaPeekAtLastError());
 
@@ -571,18 +571,22 @@ struct SPORFBuilder {
         rproj_params.random_state = random_state;
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJfit(handle, &random_matrix, &rproj_params);
+        printf("candidate random projection matrix for node %zu, colid=%d:\n", i, c);
+        print_rand_mat(random_matrix, builder_stream);
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJtransform<DataT>(
           handle,
           d_contiguous.data() + begin * dataset.N,
           &random_matrix,
-          d_trans.data() + begin * dataset.n_sampled_cols + c,
+          //d_trans.data() + begin * dataset.n_sampled_cols + c,
+          d_trans.data() + (c * dataset.n_sampled_rows) + begin,
           &rproj_params
         );
 
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
+        // TODO: randomize the order here!
         std::sample(
           universe.begin(), universe.end(), h_quantile_indices.begin() + (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins), params.max_n_bins, rng
         );
@@ -591,6 +595,34 @@ struct SPORFBuilder {
     // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
     raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
+
+    std::vector<DataT> h_trans(dataset.n_sampled_cols * dataset.n_sampled_rows);
+    RAFT_CUDA_TRY(cudaMemcpyAsync(h_trans.data(), d_trans.data(), dataset.n_sampled_cols * dataset.n_sampled_rows * sizeof(DataT), cudaMemcpyDeviceToHost, builder_stream));
+    for(size_t i = 0; i < work_items.size(); i++ ) {
+      std::vector<IdxT> h_row_ids(work_items[i].instances.count);
+      RAFT_CUDA_TRY(cudaMemcpyAsync(h_row_ids.data(), dataset.row_ids + work_items[i].instances.begin, work_items[i].instances.count * sizeof(IdxT), cudaMemcpyDeviceToHost, builder_stream));
+      RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));  // wait
+
+      // for(int c = 0; c < dataset.n_sampled_cols; c++ ) {
+      {
+        int c = dataset.n_sampled_cols - 1;  // just print the last one for now
+        int offset = (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins);
+        std::cout << "n_sampled_cols=" << dataset.n_sampled_cols << "\n";
+        std::cout << "Quantile indices for node " << i << ", colid=" << c << ":\n";
+        raft::print_device_vector("d_quantile_indices", d_quantile_indices.begin() + offset, static_cast<size_t>(params.max_n_bins), std::cout);
+        std::cout << "quantile row_ids for node " << i << ", colid=" << c << ":\n";
+        for(int j = 0; j < params.max_n_bins; j++ ) {
+          std::cout << h_row_ids[h_quantile_indices[offset + j]] << " ";
+        }
+        std::cout << std::endl;
+        std::cout << "quantile values for node " << i << ", colid=" << c << ":\n";
+        for(int j = 0; j < params.max_n_bins; j++ ) {
+          int row_id = h_row_ids[h_quantile_indices[offset + j]];
+          std::cout << h_trans[(c * dataset.n_sampled_rows) + row_id] << " ";
+        }
+        std::cout << std::endl;
+      }
+    }
     dataset_proj.data = d_trans.data();
 
     // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
@@ -605,6 +637,12 @@ struct SPORFBuilder {
       // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
       // printf("\n");
     }
+    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+    printf( "Completed computeSplit loop at %s LINE %d\n", __FILE__, __LINE__ );
+    DT::printSplits(splits,
+                    static_cast<IdxT>(work_items.size()),
+                    builder_stream);
+    printf( "\n\n");
 
     // printf( "OUT OF LOOP AT %s LINE %d\n", __FILE__, __LINE__ );
 
@@ -626,10 +664,18 @@ struct SPORFBuilder {
 
     raft::common::nvtx::pop_range();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
+    handle.sync_stream(builder_stream);
 
+    for(size_t i = 0; i < work_items.size(); i++ ) {
+      printf("random_matrix for node %zu, colid=%d:\n", i, h_splits[i].colid);
+      if(h_splits[i].colid < 0 || h_splits[i].colid >= dataset.n_sampled_cols ) {
+        printf("  invalid colid %d\n", h_splits[i].colid);
+        continue;
+      }
+      print_rand_mat(*h_sparse_matrices[i * dataset.n_sampled_cols + h_splits[i].colid], builder_stream);
+    }
     // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
 
-    handle.sync_stream(builder_stream);
     return std::make_tuple(h_splits, work_items.size());
   }
 

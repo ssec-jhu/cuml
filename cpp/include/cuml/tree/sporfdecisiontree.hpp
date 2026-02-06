@@ -21,6 +21,7 @@
 #include <cuml/random_projection/rproj_c.h>
 
 #include "decisiontree.hpp"
+#include <iostream>
 
 
 namespace ML {
@@ -73,6 +74,30 @@ ML::rand_mat<DataT> clone_rand_mat(const ML::rand_mat<DataT>& src) {
   return dst;  // move/NRVO, no copy
 }
 
+template <typename DataT>
+void print_rand_mat(const ML::rand_mat<DataT>& mat, cudaStream_t stream) {
+  switch (mat.type) {
+    case ML::dense:
+      printf("Dense matrix:\n");
+      raft::print_device_vector("data",
+                                mat.dense_data.data(),
+                                mat.dense_data.size(),
+                                std::cout);
+      break;
+    case ML::sparse:
+      printf("Sparse matrix in CSC format:\n");
+      raft::print_device_vector(
+        "indices", mat.indices.data(), mat.indices.size(), std::cout);
+      raft::print_device_vector(
+        "indptr", mat.indptr.data(), mat.indptr.size(), std::cout);
+      raft::print_device_vector(
+        "data", mat.sparse_data.data(), mat.sparse_data.size(), std::cout);
+      break;
+    case ML::unset:
+    default:
+      printf("Empty matrix\n");
+  }
+}
 
 /***
  * TODO: maybe define alternate implementations for the following (defined in decisiontree.hpp):

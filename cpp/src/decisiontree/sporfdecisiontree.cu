@@ -82,6 +82,10 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         auto& begin = work_item.instances.begin;
         auto& count = work_item.instances.count;
 
+        printf( "Processing node %zu, begin=%zu, count=%zu\n", work_item.idx, begin, count);
+        printf("random_matrix:\n");
+        print_rand_mat(*random_matrix, handle.get_stream());
+
         raft::matrix::copyRows<DataT, IdxT, size_t>(
           rows,                     // in
           count,                            // number of rows of output matrix

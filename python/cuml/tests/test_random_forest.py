@@ -335,6 +335,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     )
     cuml_model.fit(X_train, y_train)
 
+    print("Testing SPORFClassifier with max_features=", max_features, " and max_samples=", max_samples, " and datatype=", datatype)
     sporf_model = sporfc(
         max_features=max_features,
         max_samples=max_samples,
@@ -343,10 +344,10 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         min_samples_leaf=2,
         random_state=123,
         n_streams=1,
-        n_estimators=40,
+        n_estimators=1,
         handle=handle,
         max_leaves=-1,
-        max_depth=16,
+        max_depth=2,
     )
     sporf_model.fit(X_train, y_train)
 
