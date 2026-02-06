@@ -36,7 +36,9 @@ namespace ML {
 namespace SPORFDT {
 
 static constexpr int TPB_DEFAULT = 128;
-static constexpr int ITEMS_PER_THREAD = 16;
+// Keep items-per-thread small; when n_bins <= TPB, using >1 causes the extra
+// keys to be written outside the valid range.
+static constexpr int ITEMS_PER_THREAD = 1;
 
 
 /**
@@ -267,18 +269,20 @@ static __global__ void computeSplitKernel(BinT* histograms,
     col           = colids[nid * dataset.n_sampled_cols + colIndex];
   }
   std::size_t col_offset = std::size_t(col) * dataset.M;
+  IdxT PRINTCOL = dataset.n_sampled_cols - 1;
+
 
   // getting the n_bins for that feature
-  IdxT n_bins = min(max_n_bins, static_cast<IdxT>(floor(range_len / min_samples_leaf)));//  quantiles.n_bins_array[col];
-if (threadIdx.x == 0 && offset_blockid == 0 && col == dataset.n_sampled_cols - 1) {
-  for (IdxT b = 0; b < n_bins; ++b) {
-    IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + col) * max_n_bins + b];
-    IdxT row_id = dataset.row_ids[quantile_index];
-    DataT qvalue = dataset.data[row_id + col_offset];
-    printf("num_blocks=%d offset_blockid=%d nid=%d col=%d bin %d: quantile index=%d row_id=%d qvalue=%g\n", int(num_blocks), int(offset_blockid),
-           int(nid), int(col), int(b), int(quantile_index), int(row_id), double(qvalue));
-  }
-}
+  IdxT n_bins = min(max_n_bins, static_cast<IdxT>(floor(range_len / min_samples_leaf)));
+// if (threadIdx.x == 0 && offset_blockid == 0 && col == PRINTCOL) {
+//   for (IdxT b = 0; b < n_bins; ++b) {
+//     IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + col) * max_n_bins + b];
+//     IdxT row_id = dataset.row_ids[quantile_index];
+//     DataT qvalue = dataset.data[row_id + col_offset];
+//     printf("num_blocks=%d offset_blockid=%d nid=%d col=%d bin %d: quantile index=%d row_id=%d qvalue=%g\n", int(num_blocks), int(offset_blockid),
+//            int(nid), int(col), int(b), int(quantile_index), int(row_id), double(qvalue));
+//   }
+// }
 
   auto end                  = range_start + range_len;
   auto shared_histogram_len = n_bins * objective.NumClasses();
@@ -295,6 +299,10 @@ if (threadIdx.x == 0 && offset_blockid == 0 && col == dataset.n_sampled_cols - 1
     IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + col) * max_n_bins + b];
     IdxT row_id = dataset.row_ids[quantile_index];
     shared_quantiles[b] = dataset.data[row_id + col_offset];
+
+    if(offset_blockid == 0 && col == PRINTCOL) {
+      printf("nid=%d col=%d bin=%d quantile index=%d row_id=%d qvalue=%g\n", int(nid), int(col), int(b), int(quantile_index), int(row_id), double(shared_quantiles[b]));
+    }
   }
 
   using BlockSort = cub::BlockRadixSort<DataT, TPB, IPT>;
@@ -321,13 +329,13 @@ if (threadIdx.x == 0 && offset_blockid == 0 && col == dataset.n_sampled_cols - 1
   __syncthreads();
 
 
-// if (threadIdx.x == 0 && blockIdx.y == 0 && nid == 0) {
-//   printf("nid=%d col=%d n_bins=%d quantiles:", int(nid), int(col), int(n_bins));
-//   for (IdxT b = 0; b < n_bins; ++b) {
-//     printf(" %g", double(shared_quantiles[b]));
-//   }
-//   printf("\n\n");
-// }
+if (threadIdx.x == 0 && offset_blockid == 0 && col == PRINTCOL) {
+  printf("nid=%d col=%d n_bins=%d quantiles:", int(nid), int(col), int(n_bins));
+  for (IdxT b = 0; b < n_bins; ++b) {
+    printf(" %g", double(shared_quantiles[b]));
+  }
+  printf("\n\n");
+}
 
   // compute pdf shared histogram for all bins for all classes in shared mem
 
@@ -370,16 +378,51 @@ if (threadIdx.x == 0 && offset_blockid == 0 && col == dataset.n_sampled_cols - 1
     __syncthreads();
   }
 
+  if (threadIdx.x == 0 && offset_blockid == 0 && col == PRINTCOL) {
+  printf("nid=%d col=%d hist:\n", int(nid), int(col));
+  for (IdxT b = 0; b < n_bins; ++b) {
+    printf("  bin %d cutoff %g:\n", int(b), double(shared_quantiles[b]));
+    for (IdxT cls = 0; cls < objective.NumClasses(); ++cls) {
+    auto v = shared_histogram[b + cls * max_n_bins];
+      if constexpr (std::is_same_v<BinT, ML::DT::CountBin>) {
+        printf("    cls %d count %d\n", int(cls), v.x);
+       }
+       else {
+         printf("    cls %d sum %g count %d\n", int(cls), v.label_sum, v.count);
+       }      
+    }
+  }
+  printf("\n");
+}
+
   // PDF to CDF inplace in `shared_histogram`
   for (IdxT c = 0; c < objective.NumClasses(); ++c) {
     // left to right scan operation for scanning
     // "lesser-than-or-equal" counts
-    BinT total_sum = SPORFDT::pdf_to_cdf<BinT, IdxT, TPB>(shared_histogram + n_bins * c, n_bins);
+    // shared_histogram is laid out with stride = max_n_bins per class
+    BinT total_sum = SPORFDT::pdf_to_cdf<BinT, IdxT, TPB>(shared_histogram + max_n_bins * c, n_bins);
     // now, `shared_histogram[n_bins * c + i]` will have count of datapoints of class `c`
     // that are less than or equal to `shared_quantiles[i]`.
   }
 
   __syncthreads();
+
+  // After pdf_to_cdf and __syncthreads()
+if (threadIdx.x == 0 && offset_blockid == 0 && col == PRINTCOL) {
+  printf("nid=%d col=%d CDF:\n", int(nid), int(col));
+  for (IdxT b = 0; b < n_bins; ++b) {
+    printf("  bin %d cutoff %g:\n", int(b), double(shared_quantiles[b]));
+    for (IdxT cls = 0; cls < objective.NumClasses(); ++cls) {
+      auto v = shared_histogram[b + cls * max_n_bins];
+      if constexpr (std::is_same_v<BinT, ML::DT::CountBin>) {
+        printf("    cls %d count %d\n", int(cls), v.x);
+       }
+       else {
+         printf("    cls %d sum %g count %d\n", int(cls), v.label_sum, v.count);
+       }
+    }
+  }
+}
 
   // calculate the best candidate bins (one for each thread in the block) in current feature and
   // corresponding information gain for splitting

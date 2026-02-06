@@ -182,7 +182,9 @@ struct SPORFBuilder {
 
   /** default threads per block for most kernels in here */
   static constexpr int TPB_DEFAULT = 128;
-  static constexpr int ITEMS_PER_THREAD = 16;
+  // When n_bins <= TPB, using >1 item per thread makes sorted quantiles
+  // vanish into out-of-range slots. Keep this at 1.
+  static constexpr int ITEMS_PER_THREAD = 1;
   /** handle to get device properties */
   const raft::handle_t& handle;
   /** stream to launch kernels */
@@ -576,7 +578,8 @@ struct SPORFBuilder {
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJtransform<DataT>(
           handle,
-          d_contiguous.data() + begin * dataset.N,
+          //d_contiguous.data() + begin * dataset.N,
+          d_contiguous.data() + begin,
           &random_matrix,
           //d_trans.data() + begin * dataset.n_sampled_cols + c,
           d_trans.data() + (c * dataset.n_sampled_rows) + begin,
