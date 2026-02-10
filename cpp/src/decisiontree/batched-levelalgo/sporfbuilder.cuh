@@ -467,7 +467,7 @@ struct SPORFBuilder {
     while (queue.HasWork()) {
       // printf( "INVOKING Pop at %s LINE %d\n", __FILE__, __LINE__ );
       auto work_items                      = queue.Pop();
-      // printf( "INVOKING doSplit at %s LINE %d\n", __FILE__, __LINE__ );
+      printf( "\n***INVOKING doSplit at %s LINE %d\n", __FILE__, __LINE__ );
       auto [splits_host_ptr, splits_count] = doSplit(work_items);
       // printf( "INVOKING Push at %s LINE %d\n", __FILE__, __LINE__ );
       queue.Push(work_items, splits_host_ptr, h_sparse_matrices);
@@ -476,6 +476,23 @@ struct SPORFBuilder {
     auto tree = queue.GetTree();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());
     tree->train_time = timer.getElapsedMilliseconds();
+
+    std::cout << "\n\nOK HERE'S THE TREE:\n";
+    for(size_t i = 0; i < tree->sparsetree.size(); i++) {
+      NodeT* node = &tree->sparsetree[i];
+      if( node->IsLeaf() ) {
+        std::cout << "Node " << i << " LEAF instance_count " << node->InstanceCount() << " prediction ";
+        for(int o = 0; o < dataset.num_outputs; o++ ) {
+          std::cout << tree->vector_leaf[i * dataset.num_outputs + o] << " ";
+        }
+        std::cout << "\n";
+      } else {
+        std::cout << "Node " << i << " quesval " << node->QueryValue() << " best_metric_val " << node->BestMetric() << " instance_count " << node->InstanceCount() << "\n projection_vector:\n";
+        print_rand_mat(*(tree->projection_vectors.data()[i]), builder_stream);
+      }
+    }
+    printf("\n\n");
+
     return tree;
   }
 
@@ -573,8 +590,8 @@ struct SPORFBuilder {
         rproj_params.random_state = random_state;
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJfit(handle, &random_matrix, &rproj_params);
-        printf("candidate random projection matrix for node %zu, colid=%d:\n", i, c);
-        print_rand_mat(random_matrix, builder_stream);
+        // printf("candidate random projection matrix for node %zu, colid=%d:\n", i, c);
+        // print_rand_mat(random_matrix, builder_stream);
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJtransform<DataT>(
           handle,
@@ -607,24 +624,24 @@ struct SPORFBuilder {
       RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));  // wait
 
       // for(int c = 0; c < dataset.n_sampled_cols; c++ ) {
-      {
-        int c = dataset.n_sampled_cols - 1;  // just print the last one for now
-        int offset = (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins);
-        std::cout << "n_sampled_cols=" << dataset.n_sampled_cols << "\n";
-        std::cout << "Quantile indices for node " << i << ", colid=" << c << ":\n";
-        raft::print_device_vector("d_quantile_indices", d_quantile_indices.begin() + offset, static_cast<size_t>(params.max_n_bins), std::cout);
-        std::cout << "quantile row_ids for node " << i << ", colid=" << c << ":\n";
-        for(int j = 0; j < params.max_n_bins; j++ ) {
-          std::cout << h_row_ids[h_quantile_indices[offset + j]] << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "quantile values for node " << i << ", colid=" << c << ":\n";
-        for(int j = 0; j < params.max_n_bins; j++ ) {
-          int row_id = h_row_ids[h_quantile_indices[offset + j]];
-          std::cout << h_trans[(c * dataset.n_sampled_rows) + row_id] << " ";
-        }
-        std::cout << std::endl;
-      }
+      // {
+      //   int c = dataset.n_sampled_cols - 1;  // just print the last one for now
+      //   int offset = (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins);
+      //   std::cout << "n_sampled_cols=" << dataset.n_sampled_cols << "\n";
+      //   std::cout << "Quantile indices for node " << i << ", colid=" << c << ":\n";
+      //   raft::print_device_vector("d_quantile_indices", d_quantile_indices.begin() + offset, static_cast<size_t>(params.max_n_bins), std::cout);
+      //   std::cout << "quantile row_ids for node " << i << ", colid=" << c << ":\n";
+      //   for(int j = 0; j < params.max_n_bins; j++ ) {
+      //     std::cout << h_row_ids[h_quantile_indices[offset + j]] << " ";
+      //   }
+      //   std::cout << std::endl;
+      //   std::cout << "quantile values for node " << i << ", colid=" << c << ":\n";
+      //   for(int j = 0; j < params.max_n_bins; j++ ) {
+      //     int row_id = h_row_ids[h_quantile_indices[offset + j]];
+      //     std::cout << h_trans[(c * dataset.n_sampled_rows) + row_id] << " ";
+      //   }
+      //   std::cout << std::endl;
+      // }
     }
     dataset_proj.data = d_trans.data();
 
@@ -633,8 +650,8 @@ struct SPORFBuilder {
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
-      // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-      // printf( "c=%d n_blocks_dimx=%d n_large_nodes=%d\n", c, n_blocks_dimx, n_large_nodes);
+      printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
+      printf( "c=%d n_blocks_dimx=%d n_large_nodes=%d\n", c, n_blocks_dimx, n_large_nodes);
       computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
       // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
@@ -642,10 +659,17 @@ struct SPORFBuilder {
     }
     RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
     printf( "Completed computeSplit loop at %s LINE %d\n", __FILE__, __LINE__ );
-    DT::printSplits(splits,
-                    static_cast<IdxT>(work_items.size()),
-                    builder_stream);
-    printf( "\n\n");
+
+      raft::update_host(h_splits, splits, work_items.size(), builder_stream);
+      RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+      for(size_t i = 0; i < work_items.size(); i++ ) {
+        printf("winner node %lu: colid=%d, quesval=%f, best_metric_val=%f, nLeft=%d\n", work_items[i].idx, h_splits[i].colid, h_splits[i].quesval, h_splits[i].best_metric_val, h_splits[i].nLeft);
+      }
+    // YEAH DON'T CALL THE FOLLOWING FUNCTION. EVER. MY EXPERIENCE WITH IT HAS BEEN THAT IT OVERWRITES THE MEMORY THAT YOU'RE TRYING TO PRINT
+    // DT::printSplits(splits,
+    //                 static_cast<IdxT>(work_items.size()),
+    //                 builder_stream);
+    // printf( "\n\n");
 
     // printf( "OUT OF LOOP AT %s LINE %d\n", __FILE__, __LINE__ );
 
@@ -670,7 +694,7 @@ struct SPORFBuilder {
     handle.sync_stream(builder_stream);
 
     for(size_t i = 0; i < work_items.size(); i++ ) {
-      printf("random_matrix for node %zu, colid=%d:\n", i, h_splits[i].colid);
+      printf("random_matrix for node %zu, colid=%d:\n", work_items[i].idx, h_splits[i].colid);
       if(h_splits[i].colid < 0 || h_splits[i].colid >= dataset.n_sampled_cols ) {
         printf("  invalid colid %d\n", h_splits[i].colid);
         continue;

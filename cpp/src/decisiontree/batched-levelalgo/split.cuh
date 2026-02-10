@@ -142,6 +142,10 @@ struct Split {
         split_reg.colid           = split->colid;
         split_reg.best_metric_val = split->best_metric_val;
         split_reg.nLeft           = split->nLeft;
+
+        bool false_win = best_metric_val < split_reg.best_metric_val;
+        int old_colid = split_reg.colid;
+        double old_gain = double(split_reg.best_metric_val);
         bool update_result =
           split_reg.update({this->quesval, this->colid, this->best_metric_val, this->nLeft});
         if (update_result) {
@@ -151,6 +155,9 @@ struct Split {
           split->nLeft           = split_reg.nLeft;
         }
         __threadfence();
+  // if (update_result && (split->colid == colid && split->best_metric_val != old_gain)) {
+  //   printf("winner: col %d -> %d cutoff %g gain %g -> %g\n", int(old_colid), int(split->colid), double(split->quesval), double(old_gain), double(split->best_metric_val));
+  // }
         atomicExch(mutex, 0);
       }
     }

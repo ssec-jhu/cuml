@@ -35,6 +35,8 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 int num_outputs,
                                 rapids_logger::level_enum verbosity)
   {
+    std::cout << "*** SPORFDecisionTree::predict() called with max_batch_size=" << max_batch_size << " ***" << std::endl;
+
     IdxT n_classes = 0; // Dummy variable, not used in prediction
     rmm::device_uvector<IdxT> row_ids(0, handle.get_stream());
     rmm::device_uvector<DataT> d_contiguous(0, handle.get_stream());

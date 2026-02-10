@@ -347,7 +347,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         n_estimators=1,
         handle=handle,
         max_leaves=-1,
-        max_depth=2,
+        max_depth=16,
     )
     sporf_model.fit(X_train, y_train)
 
