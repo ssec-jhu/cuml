@@ -595,10 +595,8 @@ struct SPORFBuilder {
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         RPROJtransform<DataT>(
           handle,
-          //d_contiguous.data() + begin * dataset.N,
           d_contiguous.data() + begin,
           &random_matrix,
-          //d_trans.data() + begin * dataset.n_sampled_cols + c,
           d_trans.data() + (c * dataset.n_sampled_rows) + begin,
           &rproj_params
         );

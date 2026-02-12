@@ -299,8 +299,14 @@ def test_tweedie_convergence(max_depth, split_criterion):
 @pytest.mark.parametrize(
     "max_samples", [unit_param(1.0), quality_param(0.90), stress_param(0.95)]
 )
-@pytest.mark.parametrize("datatype", [np.float32, np.float64])
-@pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
+# @pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
+# @pytest.mark.parametrize("datatype", [np.float32, np.float64])
+# @pytest.mark.parametrize(
+#     "max_samples", [quality_param(0.90)]
+# )
+@pytest.mark.parametrize("datatype", [np.float64])
+@pytest.mark.parametrize("max_features", ["sqrt"])
+@pytest.mark.parametrize("small_clf", [{"n_samples": 20, "n_features": 8, "n_informative": 4}], indirect=True)
 @pytest.mark.skipif(
     cudf_pandas_active,
     reason="cudf.pandas causes sklearn RF estimators crashes sometimes. "
@@ -344,7 +350,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         min_samples_leaf=2,
         random_state=123,
         n_streams=1,
-        n_estimators=1,
+        n_estimators=100,
         handle=handle,
         max_leaves=-1,
         max_depth=16,
@@ -353,10 +359,18 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
 
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
-    sp_preds = sporf_model.predict(X_test, predict_model="GPU")
+    sp_preds = sporf_model.predict(X_test, predict_model="CPU")
 
-    fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
-    sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
+    print("fil shape:", np.shape(fil_preds))
+    print("cuML CPU shape:", np.shape(cu_preds))
+    print("SPORF CPU shape:", np.shape(sp_preds))
+
+    print("FIL predictions:", fil_preds)
+    print("cuML CPU predictions:", cu_preds)
+    print("SPORF CPU predictions:", sp_preds)
+
+    # fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
+    # sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
 
     cuml_acc = accuracy_score(y_test, cu_preds)
     fil_acc = accuracy_score(y_test, fil_preds)

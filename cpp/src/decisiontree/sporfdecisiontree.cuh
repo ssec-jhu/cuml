@@ -114,6 +114,7 @@ class SPORFPredictNodeQueue {
       auto parent         = tree.sparsetree[item.idx];
       auto parent_range = item.instances;
 
+      std::cout << "Processing results for node " << item.idx << ", nLeft=" << item.nLeft << ", count=" << parent_range.count << std::endl;
       if(parent.IsLeaf()) {
         leaves_.push_back(item);
         continue;
@@ -121,16 +122,16 @@ class SPORFPredictNodeQueue {
 
       auto left_child = tree.sparsetree[parent.LeftChildId()];
       auto right_child = tree.sparsetree[parent.RightChildId()];
-      // left
-      // Do not add a work item if this child is definitely a leaf
-      if (left_child.IsLeaf() == false) {
+      // left: only enqueue if child is non-leaf and will receive samples
+      if (!left_child.IsLeaf() && item.nLeft > 0) {
+        std::cout << "Adding left child " << parent.LeftChildId() << std::endl;
         work_items_.emplace_back(
           NodeWorkItem{static_cast<size_t>(parent.LeftChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin, item.nLeft}});
       }
 
-      // right
-      // Do not add a work item if this child is definitely a leaf
-      if (right_child.IsLeaf() == false) {
+      // right: only enqueue if child is non-leaf and will receive samples
+      if (!right_child.IsLeaf() && item.nLeft < parent_range.count) {
+        std::cout << "Adding right child " << parent.RightChildId() << std::endl;
         work_items_.emplace_back(
           NodeWorkItem{static_cast<size_t>(parent.RightChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin + item.nLeft, parent_range.count - item.nLeft}});
       }
