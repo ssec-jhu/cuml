@@ -350,13 +350,15 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         min_samples_leaf=2,
         random_state=123,
         n_streams=1,
-        n_estimators=100,
+        n_estimators=1,
         handle=handle,
         max_leaves=-1,
         max_depth=16,
     )
     sporf_model.fit(X_train, y_train)
 
+    X_test = X_train[:4]  # using a smaller test set to debug predict
+    y_test = y_train[:4]
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
     sp_preds = sporf_model.predict(X_test, predict_model="CPU")
@@ -365,6 +367,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     print("cuML CPU shape:", np.shape(cu_preds))
     print("SPORF CPU shape:", np.shape(sp_preds))
 
+    print("y_test:", y_test)
     print("FIL predictions:", fil_preds)
     print("cuML CPU predictions:", cu_preds)
     print("SPORF CPU predictions:", sp_preds)

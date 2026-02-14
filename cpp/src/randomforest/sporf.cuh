@@ -29,6 +29,7 @@
 #include <raft/stats/accuracy.cuh>
 #include <raft/stats/regression_metrics.cuh>
 #include <raft/util/cudart_utils.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <thrust/execution_policy.h>
 #include <thrust/sequence.h>
@@ -37,6 +38,7 @@
 #include <decisiontree/decisiontree.cuh>
 #include <decisiontree/sporfdecisiontree.cuh>
 #include <decisiontree/treelite_util.h>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -233,45 +235,51 @@ class SPORF {
   {
     ML::default_logger().set_level(verbosity);
     this->error_checking(input, predictions, n_rows, n_cols, true);
-    std::vector<L> h_predictions(n_rows);
     cudaStream_t stream = user_handle.get_stream();
+    RAFT_CUDA_TRY(cudaMemsetAsync(predictions, 0, sizeof(L) * n_rows, stream));
+
+    rmm::device_uvector<T> d_prediction_buffer(n_rows * forest->trees[0]->num_outputs, stream);
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      d_prediction_buffer.data(), 0, sizeof(T) * d_prediction_buffer.size(), stream));
 
     std::vector<T> h_input(std::size_t(n_rows) * n_cols);
     raft::update_host(h_input.data(), input, std::size_t(n_rows) * n_cols, stream);
     user_handle.sync_stream(stream);
 
-    int row_size = n_cols;
-
     default_logger().set_pattern("%v");
+    for (int i = 0; i < this->rf_params.n_trees; i++) {
+      DT::SPORFDecisionTree::predict(user_handle,
+        *forest->trees[i],
+        this->rf_params.tree_params.max_batch_size,
+        h_input.data(),
+        n_rows,
+        n_cols,
+        1.0 / this->rf_params.n_trees,  // scale (accumulate unscaled; normalize later)
+        d_prediction_buffer.data(),
+        forest->trees[i]->num_outputs,
+        verbosity);
+    }
+
+    // Copy averaged predictions back to host to select class / return regression value
+    std::vector<T> h_probs(std::size_t(n_rows) * forest->trees[0]->num_outputs);
+    raft::update_host(h_probs.data(), d_prediction_buffer.data(), h_probs.size(), stream);
+    user_handle.sync_stream(stream);
+
+    std::vector<L> h_predictions(n_rows);
     for (int row_id = 0; row_id < n_rows; row_id++) {
-      std::vector<T> row_prediction(forest->trees[0]->num_outputs);
-      for (int i = 0; i < this->rf_params.n_trees; i++) {
-        DT::SPORFDecisionTree::predict(user_handle,
-          *forest->trees[i],
-          this->rf_params.tree_params.max_batch_size,
-          &h_input[row_id * row_size],
-          1,
-          n_cols,
-          row_prediction.data(),
-          forest->trees[i]->num_outputs,
-          verbosity);
-      }
-      for (int k = 0; k < forest->trees[0]->num_outputs; k++) {
-        row_prediction[k] /= this->rf_params.n_trees;
-      }
-      if (rf_type == RF_type::CLASSIFICATION) {  // classification task: use 'majority' prediction
+      if (rf_type == RF_type::CLASSIFICATION) {
         L best_class = 0;
         T best_prob  = 0.0;
         for (int k = 0; k < forest->trees[0]->num_outputs; k++) {
-          if (row_prediction[k] > best_prob) {
+          T p = h_probs[row_id * forest->trees[0]->num_outputs + k];
+          if (p > best_prob) {
             best_class = k;
-            best_prob  = row_prediction[k];
+            best_prob  = p;
           }
         }
-
         h_predictions[row_id] = best_class;
       } else {
-        h_predictions[row_id] = row_prediction[0];
+        h_predictions[row_id] = h_probs[row_id * forest->trees[0]->num_outputs];
       }
     }
 
