@@ -164,7 +164,15 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
           &rproj_params
         );
 
-        std::cout << "Data transformed for node " << work_item.idx << std::endl;
+        std::cout << "Transformed data for node " << work_item.idx << ":" << std::endl;
+        raft::print_device_vector("d_trans", d_trans.data() + begin, count, std::cout);
+        // std::vector<DataT> h_trans(count);
+        // RAFT_CUDA_TRY(cudaMemcpyAsync(h_trans.data(), d_trans.data() + begin, count * sizeof(DataT), cudaMemcpyDeviceToHost, stream));
+        // RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        // for (size_t j = 0; j < std::min(count, static_cast<size_t>(10)); j++) {
+        //   std::cout << h_trans[j] << " ";
+        // }
+        // std::cout << std::endl;
 
         auto first = thrust::make_counting_iterator<IdxT>(begin);
         auto last  = first + count;
@@ -173,7 +181,8 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
           first,
           last,
           [=] __device__(IdxT row_id) {
-            return dataset.data[row_id * dataset.N + colid] <= node.QueryValue();
+            //return dataset.data[row_id * dataset.N + colid] <= node.QueryValue();
+            return dataset.data[(colid * 1) + row_id] <= node.QueryValue(); // column major, but num components is 1 and colid is always 0 for now
           });
         // auto split = Split(node.QueryValue(), colid, node.BestMetric(), work_item.nLeft);
 

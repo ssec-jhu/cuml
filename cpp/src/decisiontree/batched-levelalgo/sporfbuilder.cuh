@@ -663,33 +663,24 @@ struct SPORFBuilder {
 
     raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
 
-    std::vector<DataT> h_trans(dataset.n_sampled_cols * dataset.n_sampled_rows);
+    std::vector<LabelT> h_labels(dataset.M); // labels come from the (full) raw dataset
+    RAFT_CUDA_TRY(cudaMemcpyAsync(h_labels.data(), dataset.labels, dataset.M * sizeof(LabelT), cudaMemcpyDeviceToHost, builder_stream));
+    std::vector<DataT> h_trans(dataset.n_sampled_cols * dataset.n_sampled_rows); // transformed data is just for the sampled rows and projected columns
     RAFT_CUDA_TRY(cudaMemcpyAsync(h_trans.data(), d_trans.data(), dataset.n_sampled_cols * dataset.n_sampled_rows * sizeof(DataT), cudaMemcpyDeviceToHost, builder_stream));
+    std::vector<IdxT> h_row_ids(dataset.n_sampled_rows); // row_ids also just for the sampled rows
+    RAFT_CUDA_TRY(cudaMemcpyAsync(h_row_ids.data(), dataset.row_ids, dataset.n_sampled_rows * sizeof(IdxT), cudaMemcpyDeviceToHost, builder_stream));
     for(size_t i = 0; i < work_items.size(); i++ ) {
-      std::vector<IdxT> h_row_ids(work_items[i].instances.count);
-      RAFT_CUDA_TRY(cudaMemcpyAsync(h_row_ids.data(), dataset.row_ids + work_items[i].instances.begin, work_items[i].instances.count * sizeof(IdxT), cudaMemcpyDeviceToHost, builder_stream));
-      RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));  // wait
-
-      // for(int c = 0; c < dataset.n_sampled_cols; c++ ) {
-      // {
-      //   int c = dataset.n_sampled_cols - 1;  // just print the last one for now
-      //   int offset = (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins);
-      //   std::cout << "n_sampled_cols=" << dataset.n_sampled_cols << "\n";
-      //   std::cout << "Quantile indices for node " << i << ", colid=" << c << ":\n";
-      //   raft::print_device_vector("d_quantile_indices", d_quantile_indices.begin() + offset, static_cast<size_t>(params.max_n_bins), std::cout);
-      //   std::cout << "quantile row_ids for node " << i << ", colid=" << c << ":\n";
-      //   for(int j = 0; j < params.max_n_bins; j++ ) {
-      //     std::cout << h_row_ids[h_quantile_indices[offset + j]] << " ";
-      //   }
-      //   std::cout << std::endl;
-      //   std::cout << "quantile values for node " << i << ", colid=" << c << ":\n";
-      //   for(int j = 0; j < params.max_n_bins; j++ ) {
-      //     int row_id = h_row_ids[h_quantile_indices[offset + j]];
-      //     std::cout << h_trans[(c * dataset.n_sampled_rows) + row_id] << " ";
-      //   }
-      //   std::cout << std::endl;
-      // }
+      std::cout << "Node " << work_items[i].idx << " transformed data: " << std::endl;
+      for(int c = 0; c < dataset.n_sampled_cols; c++ ) {
+        std::cout << "  col " << c << ": ";
+        for(auto r = work_items[i].instances.begin; r < work_items[i].instances.begin + work_items[i].instances.count; r++ ) {
+          auto row_id = h_row_ids[r];
+          std::cout << "  row " << row_id << ": " << h_trans[c * dataset.n_sampled_rows + r] << " ";
+        }
+        std::cout << std::endl;
+      }
     }
+
     dataset_proj.data = d_trans.data();
 
     // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
