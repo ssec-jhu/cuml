@@ -306,7 +306,7 @@ def test_tweedie_convergence(max_depth, split_criterion):
 # )
 @pytest.mark.parametrize("datatype", [np.float64])
 @pytest.mark.parametrize("max_features", ["sqrt"])
-@pytest.mark.parametrize("small_clf", [{"n_samples": 20, "n_features": 8, "n_informative": 4}], indirect=True)
+@pytest.mark.parametrize("small_clf", [{"n_samples": 10, "n_features": 8, "n_informative": 4}], indirect=True)
 @pytest.mark.skipif(
     cudf_pandas_active,
     reason="cudf.pandas causes sklearn RF estimators crashes sometimes. "
@@ -357,12 +357,17 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     )
     sporf_model.fit(X_train, y_train)
 
-    X_test = X_train[:4]  # using a smaller test set to debug predict
-    y_test = y_train[:4]
+    X_test = X_train[:4].copy()  # using a smaller test set to debug predict
+    y_test = y_train[:4].copy()
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
     sp_preds = sporf_model.predict(X_test, predict_model="CPU")
 
+    print("X_train: ", X_train)
+    print("y_train: ", y_train)
+    print("X_test: ", X_test)
+    print("y_test: ", y_test)
+    
     print("fil shape:", np.shape(fil_preds))
     print("cuML CPU shape:", np.shape(cu_preds))
     print("SPORF CPU shape:", np.shape(sp_preds))

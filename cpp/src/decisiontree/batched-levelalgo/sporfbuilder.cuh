@@ -493,6 +493,55 @@ struct SPORFBuilder {
     }
     printf("\n\n");
 
+    std::vector<DataT> h_input(dataset.M * dataset.N);
+    raft::update_host(h_input.data(), dataset.data, dataset.M * dataset.N, builder_stream);
+    std::vector<LabelT> h_labels(dataset.M);
+    raft::update_host(h_labels.data(), dataset.labels, dataset.M, builder_stream);
+    std::vector<IdxT> h_row_ids(dataset.n_sampled_rows);
+    raft::update_host(h_row_ids.data(), dataset.row_ids, dataset.n_sampled_rows, builder_stream);
+    auto ranges = queue.GetInstanceRanges();
+    std::cout << "sparsetree size " << tree->sparsetree.size() << " ranges size " << ranges.size() << " row_ids size: " << dataset.n_sampled_rows << "\n";
+    std::cout << "And here's the leaves:\n";
+    for(size_t i = 0; i < tree->sparsetree.size(); i++) {
+      NodeT* node = &tree->sparsetree[i];
+      if( node->IsLeaf() ) {
+        std::cout << "Node " << i << " LEAF instance_count " << node->InstanceCount() << std::endl;
+        std::cout << "  range begin " << ranges[i].begin << " count " << ranges[i].count << " row_id indices: ";
+
+        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
+          // std::cout << " " << dataset.row_ids[r];
+          std::cout << " " << r;
+        }
+
+        std::cout.flush();
+        std::cout << " row_id values: ";
+        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
+          std::cout << " " << h_row_ids[r];
+        }
+        std::cout << std::endl;
+
+        std::cout << "  data values:\n";
+        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
+          auto row_id = h_row_ids[r];
+          std::cout << "    row_id " << row_id << ": ";
+          for(int c = 0; c < dataset.N; c++ ) {
+            std::cout << h_input[c * dataset.M + row_id] << " ";
+          }
+          std::cout << " | " << h_labels[row_id] << std::endl;
+        }
+        std::cout << std::endl;
+      }
+    }
+    std::cout << "\n\n";
+
+    std::cout << "HERE'S THE RAW DATA AGAIN:\n";
+    for(int i = 0; i < dataset.M; i++) {
+      std::cout << "row_id " << i << ": ";
+      for(int c = 0; c < dataset.N; c++ ) {
+        std::cout << h_input[c * dataset.M + i] << " ";
+      }
+      std::cout << " | " << h_labels[i] << std::endl;
+    }
     return tree;
   }
 

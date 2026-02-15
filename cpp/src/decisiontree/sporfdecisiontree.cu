@@ -53,16 +53,16 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
     size_t aligned_elems = aligned_bytes / sizeof(DataT);
     d_rows.resize(aligned_elems, stream);
+    d_contiguous.resize(aligned_elems, stream);
 
     req_bytes     = n_rows * sizeof(IdxT);
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(IdxT);
     row_ids.resize(aligned_elems, stream);
 
-    req_bytes     = n_rows * n_cols * sizeof(DataT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(DataT);
-    d_contiguous.resize(aligned_elems, stream);
+    // req_bytes     = n_rows * n_cols * sizeof(DataT);
+    // aligned_bytes = calculateAlignedBytes(req_bytes);
+    // aligned_elems = aligned_bytes / sizeof(DataT);
 
     req_bytes     = n_rows * sizeof(DataT);
     aligned_bytes = calculateAlignedBytes(req_bytes);
@@ -74,15 +74,26 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     // aligned_elems = aligned_bytes / sizeof(IdxT);
     // smem.resize(aligned_elems, handle.get_stream());
 
+    // for some inexplicable reason, the input data is passed in row-major format,
+    // but we copy it to the device in column-major format to work with absolutely everything else in this entire codebase.
     std::cout << "Copying input data to device buffer..." << std::endl;
-    RAFT_CUDA_TRY(cudaMemcpyAsync(d_rows.data(),
+    RAFT_CUDA_TRY(cudaMemcpyAsync(d_contiguous.data(), // just use d_contiguous as a temporary buffer for the input data
                                   rows,
                                   n_rows * n_cols * sizeof(DataT),
                                   cudaMemcpyHostToDevice,
                                   stream));
-
-    std::cout << "Preparing row IDs..." << std::endl;
     thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
+    raft::matrix::copyRows<DataT, IdxT, size_t>(
+      d_contiguous.data(),            // in
+      n_rows,                         // 
+      n_cols,                         // 
+      d_rows.data(),                  // out
+      row_ids.data(),                 // row indices (not needed for contiguous copy)
+      n_rows,                              // number of rows to copy (0 means all)
+      stream,
+      true                            // input is row-major
+    );
+
 
     Dataset<DataT, LabelT, IdxT> dataset = {
       d_trans.data(),         // projected data (single column)
@@ -94,7 +105,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       row_ids.data(),
       n_classes};
 
-    raft::common::nvtx::range fun_scope("SPORFBuilder::train @sporfbuilder.cuh [batched-levelalgo]");
+    raft::common::nvtx::range fun_scope("SPORFBuilder::predict @sporfdecisiontree.cu [batched-levelalgo]");
     MLCommon::TimerCPU timer;
     SPORFPredictNodeQueue<DataT, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
@@ -235,6 +246,15 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
 
     raft::print_device_vector("prediction_leaves", d_prediction_leaves.data(), n_rows, std::cout);
     raft::print_device_vector("predictions", predictions, n_rows * num_outputs, std::cout);
+
+    std::cout << "HERE'S THE RAW TEST DATA:" << std::endl;
+    for(size_t i = 0; i < n_rows; i++) {
+      std::cout << "Row " << i << ": ";
+      for (size_t j = 0; j < n_cols; j++) {
+        std::cout << rows[i * n_cols + j] << " "; // remember the host input data is in row-major format
+      }
+      std::cout << std::endl;
+    }
     // std::cout << "Copying prediction_leaves to host..." << std::endl;
     // std::vector<IdxT> h_prediction_leaves(n_rows);
     // RAFT_CUDA_TRY(cudaMemcpyAsync(h_prediction_leaves.data(),
