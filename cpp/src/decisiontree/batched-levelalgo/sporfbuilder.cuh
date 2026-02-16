@@ -103,7 +103,10 @@ class SPORFNodeQueue {
   }
 
   template <typename SplitT>
-  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items, SplitT* h_splits, std::vector<std::unique_ptr<rand_mat<DataT>>>& h_sparse_matrices)
+  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items,
+            SplitT* h_splits,
+            std::vector<std::unique_ptr<rand_mat<DataT>>>& h_sparse_matrices,
+            std::size_t n_sampled_cols)
   {
     // Update node queue based on splits
     for (std::size_t i = 0; i < work_items.size(); i++) {
@@ -129,9 +132,13 @@ class SPORFNodeQueue {
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
-      tree->projection_vectors.at(item.idx) = std::make_unique<rand_mat<DataT>>(h_sparse_matrices[i]->stream);
-      clone_rand_mat(*h_sparse_matrices[i], *tree->projection_vectors.at(item.idx));
+
+      auto winner_idx = i * n_sampled_cols + split.colid;
+      tree->projection_vectors.at(item.idx) =
+        std::make_unique<rand_mat<DataT>>(h_sparse_matrices[winner_idx]->stream);
+      clone_rand_mat(*h_sparse_matrices[winner_idx], *tree->projection_vectors.at(item.idx));
       tree->leaf_counter++;
+
       // left
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(split.nLeft));
@@ -470,7 +477,7 @@ struct SPORFBuilder {
       printf( "\n***INVOKING doSplit at %s LINE %d\n", __FILE__, __LINE__ );
       auto [splits_host_ptr, splits_count] = doSplit(work_items);
       // printf( "INVOKING Push at %s LINE %d\n", __FILE__, __LINE__ );
-      queue.Push(work_items, splits_host_ptr, h_sparse_matrices);
+      queue.Push(work_items, splits_host_ptr, h_sparse_matrices, dataset.n_sampled_cols);
     }
     // printf( "INVOKING GetTree at %s LINE %d\n", __FILE__, __LINE__ );
     auto tree = queue.GetTree();
@@ -542,6 +549,9 @@ struct SPORFBuilder {
       }
       std::cout << " | " << h_labels[i] << std::endl;
     }
+    std::cout << std::endl;
+    std::cout << std::endl;
+
     return tree;
   }
 
@@ -601,11 +611,11 @@ struct SPORFBuilder {
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       raft::matrix::copyRows<DataT, IdxT, size_t>(
         dataset.data,                     // in
-        count,                            // number of rows of output matrix
+        dataset.M,                        // total rows in input matrix (col-major)
         dataset.N,                        // number of columns of output matrix
-        d_contiguous.data() + begin, // d_contiguous.data() + begin * dataset.N,    // out
-        dataset.row_ids + begin,        // row indices to copy
-        count,
+        d_contiguous.data() + begin,      // out (contiguous block for this node)
+        dataset.row_ids + begin,          // row indices to copy
+        count,                            // rows to copy for this node
         builder_stream,
         false                             // do-row-major (false, i.e. do column-major)
       );
@@ -638,7 +648,9 @@ struct SPORFBuilder {
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         rproj_params.random_state = random_state;
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
-        RPROJfit(handle, &random_matrix, &rproj_params);
+        do {
+          RPROJfit(handle, &random_matrix, &rproj_params);
+        } while (random_matrix.indices.size() == 0);  // ensure we don't get an empty projection
         // printf("candidate random projection matrix for node %zu, colid=%d:\n", i, c);
         // print_rand_mat(random_matrix, builder_stream);
       // printf( "at %s LINE %d\n", __FILE__, __LINE__ );

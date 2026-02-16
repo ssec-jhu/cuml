@@ -1,6 +1,7 @@
 // sporfdecisiontree.cu
 #include "sporfdecisiontree.cuh"               // class/decl
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
+#include <raft/linalg/transpose.cuh>                      // for transposing input data
 #include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
 // pull in the device definitions but skip the explicit instantiations to avoid
 // clashes with the fixed _DataT/_LabelT aliases in this TU.
@@ -77,24 +78,25 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     // for some inexplicable reason, the input data is passed in row-major format,
     // but we copy it to the device in column-major format to work with absolutely everything else in this entire codebase.
     std::cout << "Copying input data to device buffer..." << std::endl;
-    RAFT_CUDA_TRY(cudaMemcpyAsync(d_contiguous.data(), // just use d_contiguous as a temporary buffer for the input data
+    // Copy host row-major input to device staging buffer
+    RAFT_CUDA_TRY(cudaMemcpyAsync(d_contiguous.data(),
                                   rows,
                                   n_rows * n_cols * sizeof(DataT),
                                   cudaMemcpyHostToDevice,
                                   stream));
+
+    // Materialize a column-major view (d_rows) from the row-major staging buffer
+    auto total = n_rows * n_cols;
+    thrust::for_each(thrust::cuda::par.on(stream),
+                     thrust::make_counting_iterator<size_t>(0),
+                     thrust::make_counting_iterator<size_t>(total),
+                     [in = d_contiguous.data(), out = d_rows.data(), n_rows, n_cols] __device__(size_t idx) {
+                       size_t r = idx / n_cols;
+                       size_t c = idx % n_cols;
+                       out[c * n_rows + r] = in[r * n_cols + c];
+                     });
+
     thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
-    raft::matrix::copyRows<DataT, IdxT, size_t>(
-      d_contiguous.data(),            // in
-      n_rows,                         // 
-      n_cols,                         // 
-      d_rows.data(),                  // out
-      row_ids.data(),                 // row indices (not needed for contiguous copy)
-      n_rows,                              // number of rows to copy (0 means all)
-      stream,
-      true                            // input is row-major
-    );
-
-
     Dataset<DataT, LabelT, IdxT> dataset = {
       d_trans.data(),         // projected data (single column)
       nullptr,                // labels (unused in predict)
@@ -106,6 +108,21 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       n_classes};
 
     raft::common::nvtx::range fun_scope("SPORFBuilder::predict @sporfdecisiontree.cu [batched-levelalgo]");
+
+    std::cout << "HERE'S THE TREE PASSED TO PREDICT:" << std::endl;
+    for(size_t i = 0; i < tree.sparsetree.size(); i++) {
+      auto& node = tree.sparsetree[i];
+      std::cout << "Node " << i << ": is_leaf=" << node.IsLeaf() << ", quesval=" << node.QueryValue() << ", best_metric_val=" << node.BestMetric() << std::endl;
+      if(!node.IsLeaf()) {
+        auto& random_matrix = tree.projection_vectors[i];
+        std::cout << "  Projection vector for node " << i << ":" << std::endl;
+        print_rand_mat(*random_matrix, stream);
+      }
+    }
+    std::cout << std::endl;
+    std::cout << std::endl;
+
+
     MLCommon::TimerCPU timer;
     SPORFPredictNodeQueue<DataT, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
@@ -132,15 +149,14 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         print_rand_mat(*random_matrix, stream);
 
         raft::matrix::copyRows<DataT, IdxT, size_t>(
-          d_rows.data(),                  // in (device)
-          count,                          // number of rows of output matrix
-          n_cols,                         // number of columns of output matrix
-          d_contiguous.data() + begin,    // out
-          dataset.row_ids + begin,        // row indices to copy
-          count,
+          d_rows.data(),               // in (device, column-major, lda = n_rows)
+          n_rows,                      // input leading dimension / total rows
+          n_cols,                      // number of columns of input/output
+          d_contiguous.data() + begin, // out (contiguous block for this node)
+          dataset.row_ids + begin,     // row indices to copy
+          count,                       // number of rows to copy for this node
           stream,
-          false                           // do-row-major
-        );
+          false);                      // input is column-major
 
         std::cout << "Data copied to contiguous buffer for node " << work_item.idx << std::endl;
 
@@ -155,7 +171,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
           0                        // random seed
         };
 
-        std::cout << "Fitting random projection for node " << work_item.idx << std::endl;
+        std::cout << "Transforming data for node " << work_item.idx << std::endl;
         RPROJtransform<DataT>(
           handle,
           d_contiguous.data() + begin,
@@ -180,9 +196,9 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
           thrust::cuda::par.on(stream),
           first,
           last,
-          [=] __device__(IdxT row_id) {
-            //return dataset.data[row_id * dataset.N + colid] <= node.QueryValue();
-            return dataset.data[(colid * 1) + row_id] <= node.QueryValue(); // column major, but num components is 1 and colid is always 0 for now
+          [=] __device__(IdxT pos) {
+            // dataset.data is column-major and aligned with the current row ordering; index by position
+            return dataset.data[(colid * dataset.M) + pos] <= node.QueryValue();
           });
         // auto split = Split(node.QueryValue(), colid, node.BestMetric(), work_item.nLeft);
 
@@ -261,6 +277,18 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       std::cout << "Row " << i << ": ";
       for (size_t j = 0; j < n_cols; j++) {
         std::cout << rows[i * n_cols + j] << " "; // remember the host input data is in row-major format
+      }
+      std::cout << std::endl;
+    }
+
+    std::cout << "FROM THE DEVICE:" << std::endl;
+    std::vector<DataT> h_buf(n_rows * n_cols);
+    RAFT_CUDA_TRY(cudaMemcpyAsync(h_buf.data(), d_rows.data(), n_rows * n_cols * sizeof(DataT), cudaMemcpyDeviceToHost, stream));
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    for(size_t i = 0; i < n_rows; i++) {
+      std::cout << "Row " << i << ": ";
+      for (size_t j = 0; j < n_cols; j++) {
+        std::cout << h_buf[i + j * n_rows] << " "; // device data is in column-major format
       }
       std::cout << std::endl;
     }

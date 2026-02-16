@@ -71,8 +71,10 @@ DI void partitionSamples(const DT::Dataset<DataT, LabelT, IdxT>& dataset,
   while (loffset < part && roffset < end) {
     // find the samples in the left that belong to right and vice-versa
     auto loff = loffset + tid, roff = roffset + tid;
-    if (llen == minlen) lflag = loff < part ? col[row_ids[loff]] > split.quesval : 0;
-    if (rlen == minlen) rflag = roff < end ? col[row_ids[roff]] <= split.quesval : 0;
+    // d_trans (dataset.data) is aligned with the current row ordering,
+    // so index by position within row_ids, not the raw row_id value.
+    if (llen == minlen) lflag = loff < part ? col[loff] > split.quesval : 0;
+    if (rlen == minlen) rflag = roff < end ? col[roff] <= split.quesval : 0;
     // scan to compute the locations for each 'misfit' in the two partitions
     int lidx, ridx;
     BlockScanT(temp1).ExclusiveSum(lflag, lidx, llen);
