@@ -146,6 +146,7 @@ void fit(const raft::handle_t& user_handle,
          int n_unique_labels,
          RF_params rf_params,
          rapids_logger::level_enum verbosity = rapids_logger::level_enum::info);
+
 void fit(const raft::handle_t& user_handle,
          RandomForestClassifierD*& forest,
          double* input,

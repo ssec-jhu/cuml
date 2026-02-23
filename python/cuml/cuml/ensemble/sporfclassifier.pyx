@@ -1,4 +1,5 @@
-# randomforestclassifier.pyx
+#
+# sporfclassifier.pyx
 #
 # Copyright (c) 2019-2025, NVIDIA CORPORATION.
 #
@@ -17,10 +18,14 @@
 # distutils: language = c++
 
 import numpy as np
+from numpy._core.multiarray import set_typeDict
 from treelite import Model as TreeliteModel
 
 import cuml.internals
 import cuml.internals.nvtx as nvtx
+
+from cuml.common import dtPrint,dtLog,sbgb # (SPORF debug/test only)
+
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
@@ -40,30 +45,112 @@ from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
 
-cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
+
+# Declare SPORF-specific tree params and enums from ML::DT so we can
+# include them in the SPORF_params layout below. Matches
+# cpp/include/cuml/tree/sporfdecisiontree.hpp
+cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT":
+    cdef enum HISTOGRAM_METHOD:
+        HISTOGRAM_METHOD_EXACT
+        HISTOGRAM_METHOD_SAMPLED
+
+    cdef cppclass DecisionTreeParams:
+        int max_depth
+        int max_leaves
+        float max_features
+        int max_n_bins
+        int min_samples_leaf
+        int min_samples_split
+        CRITERION split_criterion
+        float min_impurity_decrease
+        int max_batch_size
+
+    cdef cppclass SPORFDecisionTreeParams(DecisionTreeParams):
+        float density
+        HISTOGRAM_METHOD histogram_method
+
+# Expose enum values as Python-level ints so they can be used as
+# default values in Python signatures and are pickle/JSON friendly.
+HISTOGRAM_METHOD_EXACT_PY = int(HISTOGRAM_METHOD_EXACT)
+HISTOGRAM_METHOD_SAMPLED_PY = int(HISTOGRAM_METHOD_SAMPLED)
+
+
+cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
+
+# defined in sporf.hpp
+#
+# struct SPORF_params {
+#   ... RF_params members ...
+#   int n_trees;
+#   bool bootstrap;
+#   float max_samples;
+#   uint64_t seed;
+#   int n_streams;
+#
+#   DT::SPORFDecisionTreeParams tree_params;
+# };
+#
+# template <class T, class L>
+# struct SPORFMetaData {
+#   std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
+#   SPORF_params rf_params;
+# };
+
+    cdef cppclass SPORF_params:
+        int n_trees
+        bool bootstrap
+        float max_samples
+        uint64_t seed
+        int n_streams
+        SPORFDecisionTreeParams tree_params
+
+    cdef cppclass SPORFMetaData[T, L]:
+        void* trees
+        SPORF_params rf_params
+
+    # (the corresponding cdef for set_rf_params() is in randomforest_shared.pxd)
+    cdef SPORF_params set_sporf_params(int,
+                                        int,
+                                        float,
+                                        int,
+                                        int,
+                                        int,
+                                        float,
+                                        bool,
+                                        int,
+                                        float,
+                                        uint64_t,
+                                        CRITERION,
+                                        int,
+                                        int,
+                                        float,
+                                        HISTOGRAM_METHOD) except +
+
+    ctypedef SPORFMetaData[float, int] SPORFClassifierF
+    ctypedef SPORFMetaData[double, int] SPORFClassifierD
 
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[float, int]*,
+                  SPORFMetaData[float, int]*,
                   float*,
                   int,
                   int,
                   int*,
                   int,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[double, int]*,
+                  SPORFMetaData[double, int]*,
                   double*,
                   int,
                   int,
                   int*,
                   int,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[float, int] *,
+                      SPORFMetaData[float, int] *,
                       float*,
                       int,
                       int,
@@ -71,7 +158,7 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[double, int]*,
+                      SPORFMetaData[double, int]*,
                       double*,
                       int,
                       int,
@@ -79,24 +166,23 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[float, int]*,
+                          SPORFMetaData[float, int]*,
                           int*,
                           int,
                           int*,
                           level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[double, int]*,
+                          SPORFMetaData[double, int]*,
                           int*,
                           int,
                           int*,
                           level_enum) except +
 
-
-class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
+class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
     """
-    Implements a Random Forest classifier model which fits multiple decision
-    tree classifiers in an ensemble.
+    Implements a Sparse Projection Oblique Random Forest regressor model which fits
+    multiple decision trees in an ensemble.
 
     .. note:: Note that the underlying algorithm for tree node splits differs
       from that used in scikit-learn. By default, the cuML Random Forest uses a
@@ -115,7 +201,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     .. code-block:: python
 
         >>> import cupy as cp
-        >>> from cuml.ensemble import RandomForestClassifier as cuRFC
+        >>> from cuml.ensemble import SPORFClassifier as cuRFC
 
         >>> X = cp.random.normal(size=(10,4)).astype(cp.float32)
         >>> y = cp.asarray([0,1]*5, dtype=cp.int32)
@@ -124,7 +210,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         ...                    n_bins=8,
         ...                    n_estimators=40)
         >>> cuml_model.fit(X,y)
-        RandomForestClassifier()
+        SPORFClassifier()
         >>> cuml_predict = cuml_model.predict(X)
 
         >>> print("Predicted labels : ", cuml_predict)
@@ -238,8 +324,18 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     """
     classes_ = CumlArrayDescriptor()
 
-    _cpu_class_path = "sklearn.ensemble.RandomForestClassifier"
+    # TODO: FIGURE THIS OUT:
+    _cpu_class_path = "sklearn.ensemble.SPORFClassifier"
     RF_type = CLASSIFICATION
+
+    @classmethod
+    def _get_param_names(cls):
+        dtPrint( "HELLO FROM _get_param_names() IN sporfclassifier.pyx")
+        return [
+            *super()._get_param_names(),    # class BaseRandomForestModel(Base, InteropMixin) in randomforest_common.pyx
+            "device",
+            "histogram_method",
+        ]
 
     @classmethod
     def _params_from_cpu(cls, model):
@@ -263,8 +359,12 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         }
 
     def __init__(self, *, split_criterion=0, handle=None, verbose=False,
-                 output_type=None,
+                 output_type=None, density=0.5,
+                 histogram_method=HISTOGRAM_METHOD_SAMPLED_PY,
                  **kwargs):
+
+        dtPrint( 'HELLO FROM __init__ IN sporfclassifier.pyx')
+
         super().__init__(
             split_criterion=split_criterion,
             handle=handle,
@@ -272,29 +372,45 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             output_type=output_type,
             **kwargs)
 
+        # Store SPORF-specific tree params on the Python object so they
+        # are available for pickling via __getstate__ and passed into
+        # set_sporf_params() during fit(). Use an int for the enum so it's
+        # JSON/pickle friendly.
+        self.density = density
+        if histogram_method is None:
+            # default to the sampled histogram method
+            self.histogram_method = int(HISTOGRAM_METHOD_SAMPLED)
+        else:
+            # allow passing either the enum constant or an int
+            try:
+                self.histogram_method = int(histogram_method)
+            except Exception:
+                # fallback: store as-is (will likely raise later if invalid)
+                self.histogram_method = histogram_method
+
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
     # Link to the above issue on github:
     # https://github.com/rapidsai/cuml/issues/691
     def __getstate__(self):
         state = self.__dict__.copy()
+        
         cdef size_t params_t
-        cdef  RandomForestMetaData[float, int] *rf_forest
-        cdef  RandomForestMetaData[double, int] *rf_forest64
+        cdef RandomForestMetaData[float, int]* rf_forest
+        cdef RandomForestMetaData[double, int]* rf_forest64
         cdef size_t params_t64
+
         if self.n_cols:
             # only if model has been fit previously
             self._serialize_treelite_bytes()  # Ensure we have this cached
             if self.rf_forest:
-                params_t = <uintptr_t> self.rf_forest
-                rf_forest = \
-                    <RandomForestMetaData[float, int]*>params_t
+                params_t = <uintptr_t>self.rf_forest
+                rf_forest = <RandomForestMetaData[float, int]*>params_t
                 state["rf_params"] = rf_forest.rf_params
 
             if self.rf_forest64:
                 params_t64 = <uintptr_t> self.rf_forest64
-                rf_forest64 = \
-                    <RandomForestMetaData[double, int]*>params_t64
+                rf_forest64 = <RandomForestMetaData[double, int]*>params_t64
                 state["rf_params64"] = rf_forest64.rf_params
 
         state["n_cols"] = self.n_cols
@@ -302,25 +418,39 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         state["treelite_serialized_bytes"] = self.treelite_serialized_bytes
         state["split_criterion"] = self.split_criterion
         state["handle"] = self.handle
+        state["density"] = self.density
+        state["histogram_method"] = self.histogram_method
 
         return state
 
     def __setstate__(self, state):
-        super(RandomForestClassifier, self).__init__(
+        super(SPORFClassifier, self).__init__(
             split_criterion=state["split_criterion"],
             handle=state["handle"],
             verbose=state["_verbose"])
-        cdef  RandomForestMetaData[float, int] *rf_forest = \
-            new RandomForestMetaData[float, int]()
-        cdef  RandomForestMetaData[double, int] *rf_forest64 = \
-            new RandomForestMetaData[double, int]()
+
+        cdef RandomForestMetaData[float, int] *rf_forest = new RandomForestMetaData[float, int]()
+        cdef RandomForestMetaData[double, int] *rf_forest64 = new RandomForestMetaData[double, int]()
 
         self.n_cols = state['n_cols']
         if self.n_cols:
             rf_forest.rf_params = state["rf_params"]
+            # restore SPORF-specific tree params (density and histogram_method)
+            # if they were saved in the state (backwards-compatible)
+            try:
+                rf_forest.rf_params.tree_params.density = <float> state["density"]
+                rf_forest.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
+            except Exception:
+                # older pickles may not have these keys; ignore in that case
+                pass
             state["rf_forest"] = <uintptr_t>rf_forest
 
             rf_forest64.rf_params = state["rf_params64"]
+            try:
+                rf_forest64.rf_params.tree_params.density = <float> state["density"]
+                rf_forest64.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
+            except Exception:
+                pass
             state["rf_forest64"] = <uintptr_t>rf_forest64
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
@@ -332,14 +462,10 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     def _reset_forest_data(self):
         """Free memory allocated by this instance and clear instance vars."""
         if hasattr(self, "rf_forest") and self.rf_forest:
-            delete_rf_metadata(
-                <RandomForestMetaData[float, int]*><uintptr_t>
-                self.rf_forest)
+            delete_rf_metadata( <RandomForestMetaData[float, int]*><uintptr_t>self.rf_forest )
             self.rf_forest = 0
         if hasattr(self, "rf_forest64") and self.rf_forest64:
-            delete_rf_metadata(
-                <RandomForestMetaData[double, int]*><uintptr_t>
-                self.rf_forest64)
+            delete_rf_metadata( <RandomForestMetaData[double, int]*><uintptr_t>self.rf_forest64 )
             self.rf_forest64 = 0
         self.treelite_serialized_bytes = None
         self.n_cols = None
@@ -397,7 +523,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         )
 
     @nvtx.annotate(
-        message="fit RF-Classifier @randomforestclassifier.pyx",
+        message="fit RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @generate_docstring(skip_parameters_heading=True,
                         y='dense_intdtype',
@@ -416,6 +542,9 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             y to be of dtype int32. This will increase memory used for
             the method.
         """
+
+        dtPrint( "HELLO FROM fit(self, X, y, *, convert_dtype) IN FILE sporfclassifier.pyx")
+
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
         # Track the labels to see if update is necessary
         self.update_labels = not check_labels(y_m, self.classes_)
@@ -424,14 +553,11 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         X_ptr = X_m.ptr
         y_ptr = y_m.ptr
 
-        cdef handle_t* handle_ =\
-            <handle_t*><uintptr_t>self.handle.getHandle()
+        cdef handle_t* handle_ = <handle_t*><uintptr_t>self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            new RandomForestMetaData[float, int]()
+        cdef SPORFClassifierF* rf_forest = new SPORFMetaData[float, int]()
         self.rf_forest = <uintptr_t> rf_forest
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            new RandomForestMetaData[double, int]()
+        cdef SPORFClassifierD* rf_forest64 = new SPORFMetaData[double, int]()
         self.rf_forest64 = <uintptr_t> rf_forest64
 
         if self.random_state is None:
@@ -439,20 +565,22 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         else:
             seed_val = <uintptr_t>check_random_seed(self.random_state)
 
-        rf_params = set_rf_params(<int> self.max_depth,
-                                  <int> self.max_leaves,
-                                  <float> max_feature_val,
-                                  <int> self.n_bins,
-                                  <int> self.min_samples_leaf,
-                                  <int> self.min_samples_split,
-                                  <float> self.min_impurity_decrease,
-                                  <bool> self.bootstrap,
-                                  <int> self.n_estimators,
-                                  <float> self.max_samples,
-                                  <uint64_t> seed_val,
-                                  <CRITERION> self.split_criterion,
-                                  <int> self.n_streams,
-                                  <int> self.max_batch_size)
+        rf_params = set_sporf_params(<int> self.max_depth,
+                                     <int> self.max_leaves,
+                                     <float> max_feature_val,
+                                     <int> self.n_bins,
+                                     <int> self.min_samples_leaf,
+                                     <int> self.min_samples_split,
+                                     <float> self.min_impurity_decrease,
+                                     <bool> self.bootstrap,
+                                     <int> self.n_estimators,
+                                     <float> self.max_samples,
+                                     <uint64_t> seed_val,
+                                     <CRITERION> self.split_criterion,
+                                     <int> self.n_streams,
+                                     <int> self.max_batch_size,
+                                     <float> self.density,
+                                     <HISTOGRAM_METHOD> self.histogram_method)
 
         if self.dtype == np.float32:
             fit(handle_[0],
@@ -507,11 +635,11 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         cdef handle_t* handle_ = \
             <handle_t*> <uintptr_t> self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*> <uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*> <uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*> <uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*> <uintptr_t> self.rf_forest64
         if self.dtype == np.float32:
             predict(handle_[0],
                     rf_forest,
@@ -540,7 +668,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         return preds
 
     @nvtx.annotate(
-        message="predict RF-Classifier @randomforestclassifier.pyx",
+        message="predict RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @insert_into_docstring(parameters=[('dense', '(n_samples, n_features)')],
                            return_values=[('dense', '(n_samples, 1)')])
@@ -656,7 +784,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         )
 
     @nvtx.annotate(
-        message="score RF-Classifier @randomforestclassifier.pyx",
+        message="score RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @insert_into_docstring(parameters=[('dense', '(n_samples, n_features)'),
                                        ('dense_intdtype', '(n_samples, 1)')])
@@ -733,11 +861,11 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         cdef handle_t* handle_ =\
             <handle_t*><uintptr_t>self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float32:
             self.stats = score(handle_[0],
@@ -767,11 +895,9 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         """
         Obtain the text summary of the random forest model
         """
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef RandomForestMetaData[float, int] *rf_forest = <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef RandomForestMetaData[double, int] *rf_forest64 = <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float64:
             return get_rf_summary_text(rf_forest64).decode('utf-8')
@@ -782,11 +908,9 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         """
         Obtain the detailed information for the random forest model, as text
         """
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef RandomForestMetaData[float, int] *rf_forest = <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef RandomForestMetaData[double, int] *rf_forest64 = <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float64:
             return get_rf_detailed_text(rf_forest64).decode('utf-8')
