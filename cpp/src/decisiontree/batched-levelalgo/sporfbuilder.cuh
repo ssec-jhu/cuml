@@ -110,8 +110,6 @@ class SPORFNodeQueue {
   {
     // Update node queue based on splits
     for (std::size_t i = 0; i < work_items.size(); i++) {
-      // printf( "Pushing work item %d at %s LINE %d\n", i, __FILE__, __LINE__ );
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
       auto split        = h_splits[i];
       auto item         = work_items[i];
@@ -120,18 +118,15 @@ class SPORFNodeQueue {
             split, params.min_impurity_decrease, params.min_samples_leaf, parent_range.count)) {
         continue;
       }
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
       if (params.max_leaves != -1 && tree->leaf_counter >= params.max_leaves) break;
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       // parent
       tree->sparsetree.at(item.idx) = NodeT::CreateSplitNode(split.colid,
                                                              split.quesval,
                                                              split.best_metric_val,
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
       auto winner_idx = i * n_sampled_cols + split.colid;
       tree->projection_vectors.at(item.idx) =
@@ -140,31 +135,26 @@ class SPORFNodeQueue {
       tree->leaf_counter++;
 
       // left
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(split.nLeft));
       node_instances_.emplace_back(SPORFDT::InstanceRange{parent_range.begin, std::size_t(split.nLeft)});
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
           SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, 0, node_instances_.back()});
       }
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
       // right
       tree->sparsetree.emplace_back(NodeT::CreateLeafNode(parent_range.count - split.nLeft));
       node_instances_.emplace_back(
         SPORFDT::InstanceRange{parent_range.begin + split.nLeft, parent_range.count - split.nLeft});
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
         work_items_.emplace_back(
           SPORFDT::NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, 0, node_instances_.back()});
       }
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       // update depth
       tree->depth_counter = max(tree->depth_counter, item.depth + 1);
     }
@@ -472,85 +462,14 @@ struct SPORFBuilder {
     SPORFNodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs);
     while (queue.HasWork()) {
-      // printf( "INVOKING Pop at %s LINE %d\n", __FILE__, __LINE__ );
       auto work_items                      = queue.Pop();
-      printf( "\n***INVOKING doSplit at %s LINE %d\n", __FILE__, __LINE__ );
       auto [splits_host_ptr, splits_count] = doSplit(work_items);
-      // printf( "INVOKING Push at %s LINE %d\n", __FILE__, __LINE__ );
       queue.Push(work_items, splits_host_ptr, h_sparse_matrices, dataset.n_sampled_cols);
     }
-    // printf( "INVOKING GetTree at %s LINE %d\n", __FILE__, __LINE__ );
     auto tree = queue.GetTree();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());
     tree->train_time = timer.getElapsedMilliseconds();
 
-    std::cout << "\n\nOK HERE'S THE TREE:\n";
-    for(size_t i = 0; i < tree->sparsetree.size(); i++) {
-      NodeT* node = &tree->sparsetree[i];
-      if( node->IsLeaf() ) {
-        std::cout << "Node " << i << " LEAF instance_count " << node->InstanceCount() << " prediction ";
-        for(int o = 0; o < dataset.num_outputs; o++ ) {
-          std::cout << tree->vector_leaf[i * dataset.num_outputs + o] << " ";
-        }
-        std::cout << "\n";
-      } else {
-        std::cout << "Node " << i << " quesval " << node->QueryValue() << " best_metric_val " << node->BestMetric() << " instance_count " << node->InstanceCount() << "\n projection_vector:\n";
-        print_rand_mat(*(tree->projection_vectors.data()[i]), builder_stream);
-      }
-    }
-    printf("\n\n");
-
-    std::vector<DataT> h_input(dataset.M * dataset.N);
-    raft::update_host(h_input.data(), dataset.data, dataset.M * dataset.N, builder_stream);
-    std::vector<LabelT> h_labels(dataset.M);
-    raft::update_host(h_labels.data(), dataset.labels, dataset.M, builder_stream);
-    std::vector<IdxT> h_row_ids(dataset.n_sampled_rows);
-    raft::update_host(h_row_ids.data(), dataset.row_ids, dataset.n_sampled_rows, builder_stream);
-    auto ranges = queue.GetInstanceRanges();
-    std::cout << "sparsetree size " << tree->sparsetree.size() << " ranges size " << ranges.size() << " row_ids size: " << dataset.n_sampled_rows << "\n";
-    std::cout << "And here's the leaves:\n";
-    for(size_t i = 0; i < tree->sparsetree.size(); i++) {
-      NodeT* node = &tree->sparsetree[i];
-      if( node->IsLeaf() ) {
-        std::cout << "Node " << i << " LEAF instance_count " << node->InstanceCount() << std::endl;
-        std::cout << "  range begin " << ranges[i].begin << " count " << ranges[i].count << " row_id indices: ";
-
-        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
-          // std::cout << " " << dataset.row_ids[r];
-          std::cout << " " << r;
-        }
-
-        std::cout.flush();
-        std::cout << " row_id values: ";
-        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
-          std::cout << " " << h_row_ids[r];
-        }
-        std::cout << std::endl;
-
-        std::cout << "  data values:\n";
-        for(auto r = ranges[i].begin; r < ranges[i].begin + ranges[i].count; r++ ) {
-          auto row_id = h_row_ids[r];
-          std::cout << "    row_id " << row_id << ": ";
-          for(int c = 0; c < dataset.N; c++ ) {
-            std::cout << h_input[c * dataset.M + row_id] << " ";
-          }
-          std::cout << " | " << h_labels[row_id] << std::endl;
-        }
-        std::cout << std::endl;
-      }
-    }
-    std::cout << "\n\n";
-
-    std::cout << "HERE'S THE RAW DATA AGAIN:\n";
-    for(int i = 0; i < dataset.M; i++) {
-      std::cout << "row_id " << i << ": ";
-      for(int c = 0; c < dataset.N; c++ ) {
-        std::cout << h_input[c * dataset.M + i] << " ";
-      }
-      std::cout << " | " << h_labels[i] << std::endl;
-    }
-    std::cout << std::endl;
-    std::cout << std::endl;
 
     return tree;
   }
@@ -589,8 +508,6 @@ struct SPORFBuilder {
 
     auto [n_blocks_dimx, n_large_nodes] = this->updateWorkloadInfo(work_items);
 
-    // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
     for(IdxT i = 0; i < params.max_batch_size; i++ ) {
       for( IdxT c = 0; c < dataset.n_sampled_cols; c++ ) {
         h_colids[i * dataset.n_sampled_cols + c] = c;
@@ -598,17 +515,14 @@ struct SPORFBuilder {
     }
     raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
 
-    // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
     // TODO: parallelize this over work_items
     for (size_t i = 0; i < work_items.size(); i++) {
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       auto& begin = work_items[i].instances.begin;
       auto& count = work_items[i].instances.count;
 
       if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       raft::matrix::copyRows<DataT, IdxT, size_t>(
         dataset.data,                     // in
         dataset.M,                        // total rows in input matrix (col-major)
@@ -621,7 +535,6 @@ struct SPORFBuilder {
       );
       RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       // TODO: fix rproj to use better types than int for everything
       paramsRPROJ rproj_params{
         static_cast<int>(count), // number of samples
@@ -634,26 +547,20 @@ struct SPORFBuilder {
         0                        // random seed
       };
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
       std::vector<IdxT> universe(work_items[i].instances.count);
       std::iota(universe.begin(), universe.end(), 0);
 
       for(int c = 0; c < dataset.n_sampled_cols; c++) {
-        // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols + c]);
         random_matrix.reset();
-        // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i + c) &
                                             0x7fffffffULL);
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         rproj_params.random_state = random_state;
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
+
         do {
           RPROJfit(handle, &random_matrix, &rproj_params);
         } while (random_matrix.indices.size() == 0);  // ensure we don't get an empty projection
-        // printf("candidate random projection matrix for node %zu, colid=%d:\n", i, c);
-        // print_rand_mat(random_matrix, builder_stream);
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
+
         RPROJtransform<DataT>(
           handle,
           d_contiguous.data() + begin,
@@ -662,66 +569,33 @@ struct SPORFBuilder {
           &rproj_params
         );
 
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
-      // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
         // TODO: randomize the order here!
         std::sample(
           universe.begin(), universe.end(), h_quantile_indices.begin() + (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins), params.max_n_bins, rng
         );
       }
     }
-    // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
     raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
 
-    std::vector<LabelT> h_labels(dataset.M); // labels come from the (full) raw dataset
-    RAFT_CUDA_TRY(cudaMemcpyAsync(h_labels.data(), dataset.labels, dataset.M * sizeof(LabelT), cudaMemcpyDeviceToHost, builder_stream));
-    std::vector<DataT> h_trans(dataset.n_sampled_cols * dataset.n_sampled_rows); // transformed data is just for the sampled rows and projected columns
-    RAFT_CUDA_TRY(cudaMemcpyAsync(h_trans.data(), d_trans.data(), dataset.n_sampled_cols * dataset.n_sampled_rows * sizeof(DataT), cudaMemcpyDeviceToHost, builder_stream));
-    std::vector<IdxT> h_row_ids(dataset.n_sampled_rows); // row_ids also just for the sampled rows
-    RAFT_CUDA_TRY(cudaMemcpyAsync(h_row_ids.data(), dataset.row_ids, dataset.n_sampled_rows * sizeof(IdxT), cudaMemcpyDeviceToHost, builder_stream));
-    for(size_t i = 0; i < work_items.size(); i++ ) {
-      std::cout << "Node " << work_items[i].idx << " transformed data: " << std::endl;
-      for(int c = 0; c < dataset.n_sampled_cols; c++ ) {
-        std::cout << "  col " << c << ": ";
-        for(auto r = work_items[i].instances.begin; r < work_items[i].instances.begin + work_items[i].instances.count; r++ ) {
-          auto row_id = h_row_ids[r];
-          std::cout << "  row " << row_id << ": " << h_trans[c * dataset.n_sampled_rows + r] << " ";
-        }
-        std::cout << std::endl;
-      }
-    }
-
     dataset_proj.data = d_trans.data();
-
-    // printf( "at %s LINE %d\n", __FILE__, __LINE__ );
 
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
-      printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-      printf( "c=%d n_blocks_dimx=%d n_large_nodes=%d\n", c, n_blocks_dimx, n_large_nodes);
       computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
-      // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-      // printf("\n");
     }
     RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-    printf( "Completed computeSplit loop at %s LINE %d\n", __FILE__, __LINE__ );
 
-      raft::update_host(h_splits, splits, work_items.size(), builder_stream);
-      RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-      for(size_t i = 0; i < work_items.size(); i++ ) {
-        printf("winner node %lu: colid=%d, quesval=%f, best_metric_val=%f, nLeft=%d\n", work_items[i].idx, h_splits[i].colid, h_splits[i].quesval, h_splits[i].best_metric_val, h_splits[i].nLeft);
-      }
+    raft::update_host(h_splits, splits, work_items.size(), builder_stream);
+    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
     // YEAH DON'T CALL THE FOLLOWING FUNCTION. EVER. MY EXPERIENCE WITH IT HAS BEEN THAT IT OVERWRITES THE MEMORY THAT YOU'RE TRYING TO PRINT
     // DT::printSplits(splits,
     //                 static_cast<IdxT>(work_items.size()),
     //                 builder_stream);
     // printf( "\n\n");
-
-    // printf( "OUT OF LOOP AT %s LINE %d\n", __FILE__, __LINE__ );
 
     // create child nodes (or make the current ones leaf)
     raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
@@ -737,21 +611,10 @@ struct SPORFBuilder {
                                                             builder_stream);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-    // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
     raft::common::nvtx::pop_range();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     handle.sync_stream(builder_stream);
 
-    for(size_t i = 0; i < work_items.size(); i++ ) {
-      printf("random_matrix for node %zu, colid=%d:\n", work_items[i].idx, h_splits[i].colid);
-      if(h_splits[i].colid < 0 || h_splits[i].colid >= dataset.n_sampled_cols ) {
-        printf("  invalid colid %d\n", h_splits[i].colid);
-        continue;
-      }
-      print_rand_mat(*h_sparse_matrices[i * dataset.n_sampled_cols + h_splits[i].colid], builder_stream);
-    }
-    // printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
 
     return std::make_tuple(h_splits, work_items.size());
   }

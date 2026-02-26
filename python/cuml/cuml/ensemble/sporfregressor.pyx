@@ -463,6 +463,9 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
         convert_dtype = True,
     ) -> CumlArray:
         cdef uintptr_t X_ptr
+
+        # TODO: Regressor wrapper still uses order='C' and needs coordinated migration (to order='F')
+        # to match SPORF C++ predict column-major expectation.
         X_m, n_rows, n_cols, dtype = \
             input_to_cuml_array(X, order='C',
                                 convert_to_dtype=(self.dtype if convert_dtype

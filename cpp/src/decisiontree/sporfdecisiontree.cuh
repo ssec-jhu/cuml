@@ -119,26 +119,16 @@ class SPORFPredictNodeQueue {
         continue;
       }
 
-      // auto left_child = tree.sparsetree[parent.LeftChildId()];
-      // auto right_child = tree.sparsetree[parent.RightChildId()];
       auto nLeft = item.nLeft;
       auto nRight = parent_range.count - nLeft;
-      std::cout << "Node " << item.idx << " count: " << parent_range.count << " leftChildId=" << parent.LeftChildId() << ", nLeft=" << nLeft;
-      std::cout << ", rightChildId=" << parent.RightChildId() << ", nRight=" << nRight << std::endl;
 
       // left
-      // Do not add a work item if this child is definitely a leaf
-      // if (left_child.IsLeaf() == false {
       work_items_.emplace_back(
         NodeWorkItem{static_cast<size_t>(parent.LeftChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin, nLeft}});
-      // }
 
       // right
-      // // Do not add a work item if this child is definitely a leaf
-      // if (right_child.IsLeaf() == false) {
       work_items_.emplace_back(
         NodeWorkItem{static_cast<size_t>(parent.RightChildId()), item.depth + 1, 0, SPORFDT::InstanceRange{parent_range.begin + nLeft, nRight}});
-      // }
     }
   }
 };

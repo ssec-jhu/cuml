@@ -606,7 +606,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
     ) -> CumlArray:
         cdef uintptr_t X_ptr
         X_m, n_rows, n_cols, _dtype = \
-            input_to_cuml_array(X, order='C',
+            input_to_cuml_array(X, order='F',
                                 convert_to_dtype=(self.dtype if convert_dtype
                                                   else None),
                                 check_cols=self.n_cols)

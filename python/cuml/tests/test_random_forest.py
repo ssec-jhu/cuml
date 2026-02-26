@@ -299,14 +299,10 @@ def test_tweedie_convergence(max_depth, split_criterion):
 @pytest.mark.parametrize(
     "max_samples", [unit_param(1.0), quality_param(0.90), stress_param(0.95)]
 )
-# @pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
-# @pytest.mark.parametrize("datatype", [np.float32, np.float64])
-# @pytest.mark.parametrize(
-#     "max_samples", [quality_param(0.90)]
-# )
-@pytest.mark.parametrize("datatype", [np.float64])
-@pytest.mark.parametrize("max_features", ["sqrt"])
-@pytest.mark.parametrize("small_clf", [{"n_samples": 10, "n_features": 8, "n_informative": 4}], indirect=True)
+#@pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
+@pytest.mark.parametrize("max_features", [1.0])
+@pytest.mark.parametrize("datatype", [np.float32, np.float64])
+#@pytest.mark.parametrize("small_clf", [{"n_samples": 10, "n_features": 8, "n_informative": 4}], indirect=True)
 @pytest.mark.skipif(
     cudf_pandas_active,
     reason="cudf.pandas causes sklearn RF estimators crashes sometimes. "
@@ -341,7 +337,6 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     )
     cuml_model.fit(X_train, y_train)
 
-    print("Testing SPORFClassifier with max_features=", max_features, " and max_samples=", max_samples, " and datatype=", datatype)
     sporf_model = sporfc(
         max_features=max_features,
         max_samples=max_samples,
@@ -350,32 +345,16 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         min_samples_leaf=2,
         random_state=123,
         n_streams=1,
-        n_estimators=1,
+        n_estimators=40,
         handle=handle,
         max_leaves=-1,
         max_depth=16,
     )
     sporf_model.fit(X_train, y_train)
 
-    # X_test = X_train[:4].copy()  # using a smaller test set to debug predict
-    # y_test = y_train[:4].copy()
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
     sp_preds = sporf_model.predict(X_test, predict_model="CPU")
-
-    print("X_train: ", X_train)
-    print("y_train: ", y_train)
-    print("X_test: ", X_test)
-    print("y_test: ", y_test)
-
-    print("fil shape:", np.shape(fil_preds))
-    print("cuML CPU shape:", np.shape(cu_preds))
-    print("SPORF CPU shape:", np.shape(sp_preds))
-
-    print("y_test:", y_test)
-    print("FIL predictions:", fil_preds)
-    print("cuML CPU predictions:", cu_preds)
-    print("SPORF CPU predictions:", sp_preds)
 
     # fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
     # sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
@@ -383,6 +362,11 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     cuml_acc = accuracy_score(y_test, cu_preds)
     fil_acc = accuracy_score(y_test, fil_preds)
     sp_acc = accuracy_score(y_test, sp_preds)
+
+    print("n_test:", X_test.shape[0])
+    print("cuML CPU accuracy: {cuml_acc}, n_wrong: {n_wrong}".format(cuml_acc=cuml_acc, n_wrong=np.sum(y_test != cu_preds)))
+    print("FIL accuracy: {fil_acc}, n_wrong: {n_wrong}".format(fil_acc=fil_acc, n_wrong=np.sum(y_test != fil_preds)))
+    print("SPORF CPU accuracy: {sp_acc}, n_wrong: {n_wrong}".format(sp_acc=sp_acc, n_wrong=np.sum(y_test != sp_preds)))
     if X.shape[0] < 500000:
         sk_model = skrfc(
             n_estimators=40,

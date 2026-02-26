@@ -135,9 +135,6 @@ class SPORF {
            int n_unique_labels,
            SPORFMetaData<T, L>*& forest)
   {
-    
-    printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
     raft::common::nvtx::range fun_scope("SPORF::fit @sporf.cuh");
     this->error_checking(input, labels, n_rows, n_cols, false);
     const raft::handle_t& handle = user_handle;
@@ -178,9 +175,6 @@ class SPORF {
     }
 
 
-    printf( "**** top of parallel loops: n_streams=%d n_trees=%d\n", n_streams, this->rf_params.n_trees );
-
-
     #pragma omp parallel for num_threads(n_streams)
     for (int i = 0; i < this->rf_params.n_trees; i++) {
       int stream_id = omp_get_thread_num();
@@ -218,7 +212,7 @@ class SPORF {
   /**
    * @brief Predict target feature for input data
    * @param[in] user_handle: raft::handle_t.
-   * @param[in] input: test data (n_rows samples, n_cols features) in row major format. GPU
+   * @param[in] input: test data (n_rows samples, n_cols features) in column major format. GPU
    * pointer.
    * @param[in] n_rows: number of  data samples.
    * @param[in] n_cols: number of features (excluding target feature).
@@ -242,16 +236,20 @@ class SPORF {
     RAFT_CUDA_TRY(cudaMemsetAsync(
       d_prediction_buffer.data(), 0, sizeof(T) * d_prediction_buffer.size(), stream));
 
-    std::vector<T> h_input(std::size_t(n_rows) * n_cols);
-    raft::update_host(h_input.data(), input, std::size_t(n_rows) * n_cols, stream);
-    user_handle.sync_stream(stream);
+    // TODO(sporf): Predict now expects column-major GPU input for classifier path.
+    // Regressor CPU predict path still packs X as row-major ('C') in sporfregressor.pyx
+    // and must be updated before enabling this layout assumption for regression.
+
+    // std::vector<T> h_input(std::size_t(n_rows) * n_cols);
+    // raft::update_host(h_input.data(), input, std::size_t(n_rows) * n_cols, stream);
+    // user_handle.sync_stream(stream);
 
     default_logger().set_pattern("%v");
     for (int i = 0; i < this->rf_params.n_trees; i++) {
       DT::SPORFDecisionTree::predict(user_handle,
         *forest->trees[i],
         this->rf_params.tree_params.max_batch_size,
-        h_input.data(),
+        input, // h_input.data(),
         n_rows,
         n_cols,
         1.0 / this->rf_params.n_trees,  // scale (accumulate unscaled; normalize later)
@@ -260,6 +258,7 @@ class SPORF {
         verbosity);
     }
 
+    user_handle.sync_stream(stream);
     // Copy averaged predictions back to host to select class / return regression value
     std::vector<T> h_probs(std::size_t(n_rows) * forest->trees[0]->num_outputs);
     raft::update_host(h_probs.data(), d_prediction_buffer.data(), h_probs.size(), stream);
@@ -291,11 +290,8 @@ class SPORF {
   /**
    * @brief Predict target feature for input data and score against ref_labels.
    * @param[in] user_handle: raft::handle_t.
-   * @param[in] input: test data (n_rows samples, n_cols features) in row major format. GPU
-   * pointer.
    * @param[in] ref_labels: label values for cross validation (n_rows elements); GPU pointer.
    * @param[in] n_rows: number of  data samples.
-   * @param[in] n_cols: number of features (excluding target feature).
    * @param[in] predictions: n_rows predicted labels. GPU pointer, user allocated.
    * @param[in] verbosity: verbosity level for logging messages during execution
    * @param[in] rf_type: task type: 0 for classification, 1 for regression

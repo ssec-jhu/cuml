@@ -133,8 +133,6 @@ void fit(const raft::handle_t& user_handle,
                 SPORF_params rf_params,
                 rapids_logger::level_enum verbosity)
 {
-  printf( "HELLO FROM %s LINE %d\n", __FILE__, __LINE__ );
-
   raft::common::nvtx::range fun_scope("RF::fit @sporf.cu");
   ML::default_logger().set_level(verbosity);
   ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
@@ -175,7 +173,7 @@ void fit(const raft::handle_t& user_handle,
  * @param[in] user_handle: raft::handle_t.
  * @param[in] forest: CPU pointer to RandomForestMetaData object.
  *   The user should have previously called fit to build the random forest.
- * @param[in] input: test data (n_rows samples, n_cols features) in row major format. GPU pointer.
+ * @param[in] input: test data (n_rows samples, n_cols features) in column major format. GPU pointer.
  * @param[in] n_rows: number of  data samples.
  * @param[in] n_cols: number of features (excluding target feature).
  * @param[in, out] predictions: n_rows predicted labels. GPU pointer, user allocated.
@@ -216,10 +214,8 @@ void predict(const raft::handle_t& user_handle,
  * @param[in] user_handle: raft::handle_t.
  * @param[in] forest: CPU pointer to SPORFMetaData object.
  *   The user should have previously called fit to build the random forest.
- * @param[in] input: test data (n_rows samples, n_cols features) in row major format. GPU pointer.
  * @param[in] ref_labels: label values for cross validation (n_rows elements); GPU pointer.
  * @param[in] n_rows: number of  data samples.
- * @param[in] n_cols: number of features (excluding target feature).
  * @param[in] predictions: n_rows predicted labels. GPU pointer, user allocated.
  * @param[in] verbosity: verbosity level for logging messages during execution
  * @return RF_metrics struct with classification score (i.e., accuracy)
