@@ -587,10 +587,10 @@ struct SPORFBuilder {
       computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
-    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+    // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
 
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+    // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
     // YEAH DON'T CALL THE FOLLOWING FUNCTION. EVER. MY EXPERIENCE WITH IT HAS BEEN THAT IT OVERWRITES THE MEMORY THAT YOU'RE TRYING TO PRINT
     // DT::printSplits(splits,
     //                 static_cast<IdxT>(work_items.size()),

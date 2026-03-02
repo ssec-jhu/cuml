@@ -320,8 +320,10 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     # Create a handle for the cuml model
     handle, stream = get_handle(use_handle, n_streams=1)
 
+    import time
     # Initialize, fit and predict using cuML's
     # random forest classification model
+    t_start = time.perf_counter()
     cuml_model = curfc(
         max_features=max_features,
         max_samples=max_samples,
@@ -336,7 +338,9 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         max_depth=16,
     )
     cuml_model.fit(X_train, y_train)
+    cuml_train_time = time.perf_counter() - t_start
 
+    t_start = time.perf_counter()
     sporf_model = sporfc(
         max_features=max_features,
         max_samples=max_samples,
@@ -351,10 +355,19 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         max_depth=16,
     )
     sporf_model.fit(X_train, y_train)
+    sporf_train_time = time.perf_counter() - t_start
 
+    t_start = time.perf_counter()
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
+    cuml_gpu_pred_time = time.perf_counter() - t_start
+
+    t_start = time.perf_counter()
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
+    cuml_cpu_pred_time = time.perf_counter() - t_start
+
+    t_start = time.perf_counter()
     sp_preds = sporf_model.predict(X_test, predict_model="CPU")
+    sporf_cpu_pred_time = time.perf_counter() - t_start
 
     # fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
     # sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
@@ -364,9 +377,15 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     sp_acc = accuracy_score(y_test, sp_preds)
 
     print("n_test:", X_test.shape[0])
-    print("cuML CPU accuracy: {cuml_acc}, n_wrong: {n_wrong}".format(cuml_acc=cuml_acc, n_wrong=np.sum(y_test != cu_preds)))
-    print("FIL accuracy: {fil_acc}, n_wrong: {n_wrong}".format(fil_acc=fil_acc, n_wrong=np.sum(y_test != fil_preds)))
-    print("SPORF CPU accuracy: {sp_acc}, n_wrong: {n_wrong}".format(sp_acc=sp_acc, n_wrong=np.sum(y_test != sp_preds)))
+    print("cuML CPU accuracy: {cuml_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        cuml_acc=cuml_acc, n_wrong=np.sum(y_test != cu_preds), train_time=cuml_train_time, pred_time=cuml_cpu_pred_time
+    ))
+    print("FIL accuracy: {fil_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        fil_acc=fil_acc, n_wrong=np.sum(y_test != fil_preds), train_time=cuml_train_time, pred_time=cuml_gpu_pred_time
+    ))
+    print("SPORF CPU accuracy: {sp_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        sp_acc=sp_acc, n_wrong=np.sum(y_test != sp_preds), train_time=sporf_train_time, pred_time=sporf_cpu_pred_time
+    ))
     if X.shape[0] < 500000:
         sk_model = skrfc(
             n_estimators=40,
