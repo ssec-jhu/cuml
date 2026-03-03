@@ -34,6 +34,7 @@
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
 #include <raft/matrix/matrix.cuh>
+#include <raft/sparse/detail/cusparse_wrappers.h>
 #include <raft/util/cuda_utils.cuh>
 
 #include <rmm/device_uvector.hpp>
@@ -128,10 +129,13 @@ class SPORFNodeQueue {
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
 
-      auto winner_idx = i * n_sampled_cols + split.colid;
+      // auto winner_idx = i * n_sampled_cols + split.colid;
+      // tree->projection_vectors.at(item.idx) =
+      //   std::make_unique<rand_mat<DataT>>(h_sparse_matrices[winner_idx]->stream);
+      // clone_rand_mat(*h_sparse_matrices[winner_idx], *tree->projection_vectors.at(item.idx));
       tree->projection_vectors.at(item.idx) =
-        std::make_unique<rand_mat<DataT>>(h_sparse_matrices[winner_idx]->stream);
-      clone_rand_mat(*h_sparse_matrices[winner_idx], *tree->projection_vectors.at(item.idx));
+        std::make_unique<rand_mat<DataT>>(h_sparse_matrices[i]->stream);
+      clone_column_to_column_vector(*h_sparse_matrices[i], split.colid, *tree->projection_vectors.at(item.idx));
       tree->leaf_counter++;
 
       // left
@@ -244,6 +248,16 @@ struct SPORFBuilder {
   std::vector<std::unique_ptr<rand_mat<DataT>>> h_sparse_matrices;
   DatasetT dataset_trans;
 
+  struct Stats {
+    double t_sampling;
+    double t_rproj_fit;
+    double t_rproj_transform;
+    double t_histogram;
+    double t_split;
+
+    Stats() : t_sampling(0), t_rproj_fit(0), t_rproj_transform(0), t_histogram(0), t_split(0) {}
+  } stats;
+
   SPORFBuilder(const raft::handle_t& handle,
           cudaStream_t s,
           IdxT treeid,
@@ -329,7 +343,8 @@ struct SPORFBuilder {
     dataset_trans.data = d_trans.data();
 
     // initialize host-owned rand_mat objects so they own their device buffers
-    h_sparse_matrices.reserve(params.max_batch_size * dataset.n_sampled_cols);
+    //h_sparse_matrices.reserve(params.max_batch_size * dataset.n_sampled_cols);
+    h_sparse_matrices.reserve(params.max_batch_size);
     for (int i = 0; i < params.max_batch_size; ++i) {
       h_sparse_matrices.emplace_back(std::make_unique<rand_mat<DataT>>(builder_stream));
     }
@@ -470,6 +485,13 @@ struct SPORFBuilder {
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());
     tree->train_time = timer.getElapsedMilliseconds();
 
+    std::cout << "SPORFBuilder::train: sampling: " << stats.t_sampling <<
+      " ms, rproj fit: " << stats.t_rproj_fit <<
+      " ms, rproj transform: " << stats.t_rproj_transform <<
+      " ms, histogram: " << stats.t_histogram <<
+      " ms, split: " << stats.t_split <<
+      " ms" << std::endl;
+
 
     return tree;
   }
@@ -516,6 +538,7 @@ struct SPORFBuilder {
     raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
 
 
+      auto t0 = std::chrono::steady_clock::now();
     // TODO: parallelize this over work_items
     for (size_t i = 0; i < work_items.size(); i++) {
       auto& begin = work_items[i].instances.begin;
@@ -539,7 +562,7 @@ struct SPORFBuilder {
       paramsRPROJ rproj_params{
         static_cast<int>(count), // number of samples
         dataset.N,               // number of features
-        1,                       // number of components
+        dataset.n_sampled_cols,  // number of components
         -1.0f,                   // error tolerance (not used)
         false,                   // gaussian or sparse method
         -1.0,                    // auto density (-1: auto-deduction)
@@ -547,28 +570,75 @@ struct SPORFBuilder {
         0                        // random seed
       };
 
+      t0 = std::chrono::steady_clock::now();
+      //rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols]);
+      rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i]);
+      random_matrix.reset();
+      auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i) & 0x7fffffffULL);
+      rproj_params.random_state = random_state;
+      RPROJfit(handle, &random_matrix, &rproj_params);
+stats.t_rproj_fit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        t0 = std::chrono::steady_clock::now();
+
+        {
+    auto cusparse_handle = handle.get_cusparse_handle();
+
+    const DataT alfa = 1;
+    const DataT beta = 0;
+
+    auto& m         = rproj_params.n_samples;
+    auto& n         = rproj_params.n_components;
+    auto& k         = rproj_params.n_features;
+    std::size_t nnz = random_matrix.sparse_data.size();
+
+    auto& lda = m;
+    auto& ldc = dataset.n_sampled_rows;
+
+    // TODO: Need to wrap this in a RAFT public API.
+    RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsegemmi(cusparse_handle,
+                                                          m,
+                                                          n,
+                                                          k,
+                                                          nnz,
+                                                          &alfa,
+                                                          d_contiguous.data() + begin,
+                                                          lda,
+                                                          random_matrix.sparse_data.data(),
+                                                          random_matrix.indptr.data(),
+                                                          random_matrix.indices.data(),
+                                                          &beta,
+                                                          d_trans.data() + begin,
+                                                          ldc,
+                                                          builder_stream));
+
+        }
+stats.t_rproj_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+      t0 = std::chrono::steady_clock::now();
       std::vector<IdxT> universe(work_items[i].instances.count);
       std::iota(universe.begin(), universe.end(), 0);
 
-      for(int c = 0; c < dataset.n_sampled_cols; c++) {
-        rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols + c]);
-        random_matrix.reset();
-        auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i + c) &
-                                            0x7fffffffULL);
-        rproj_params.random_state = random_state;
+for(int c = 0; c < dataset.n_sampled_cols; c++) {
+        // rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols + c]);
+        // random_matrix.reset();
+        // auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i + c) &
+        //                                     0x7fffffffULL);
+        // rproj_params.random_state = random_state;
 
-        do {
-          RPROJfit(handle, &random_matrix, &rproj_params);
-        } while (random_matrix.indices.size() == 0);  // ensure we don't get an empty projection
-
-        RPROJtransform<DataT>(
-          handle,
-          d_contiguous.data() + begin,
-          &random_matrix,
-          d_trans.data() + (c * dataset.n_sampled_rows) + begin,
-          &rproj_params
-        );
-
+//         t0 = std::chrono::steady_clock::now();
+//         do {
+//           RPROJfit(handle, &random_matrix, &rproj_params);
+//         } while (random_matrix.indices.size() == 0);  // ensure we don't get an empty projection
+// stats.t_rproj_fit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+//         t0 = std::chrono::steady_clock::now();
+//         RPROJtransform<DataT>(
+//           handle,
+//           d_contiguous.data() + begin,
+//           &random_matrix,
+//           d_trans.data() + (c * dataset.n_sampled_rows) + begin,
+//           &rproj_params
+//         );
+// stats.t_rproj_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
         // TODO: randomize the order here!
         std::sample(
@@ -578,9 +648,10 @@ struct SPORFBuilder {
     }
 
     raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
+        stats.t_sampling += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     dataset_proj.data = d_trans.data();
-
+t0 = std::chrono::steady_clock::now();
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
@@ -588,7 +659,8 @@ struct SPORFBuilder {
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
     // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-
+stats.t_histogram += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    t0 = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
     // YEAH DON'T CALL THE FOLLOWING FUNCTION. EVER. MY EXPERIENCE WITH IT HAS BEEN THAT IT OVERWRITES THE MEMORY THAT YOU'RE TRYING TO PRINT
@@ -614,7 +686,7 @@ struct SPORFBuilder {
     raft::common::nvtx::pop_range();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     handle.sync_stream(builder_stream);
-
+stats.t_split += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     return std::make_tuple(h_splits, work_items.size());
   }
