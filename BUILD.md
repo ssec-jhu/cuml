@@ -281,3 +281,23 @@ cuML's cmake has the following configurable flags available:
 | KERNEL_INFO | [ON, OFF]  | OFF  | Enable/disable kernel resource usage info in nvcc. |
 | LINE_INFO | [ON, OFF]  | OFF  | Enable/disable lineinfo in nvcc.  |
 | NVTX | [ON, OFF]  | OFF  | Enable/disable nvtx markers in libcuml++.  |
+
+
+
+
+
+
+====== how to find files that contain SPORF-related code:
+find . -name "*sporf*"
+grep -Ri --include='__init__.py' 'SPORF' .
+
+# The following should be edited manually so that ths SPORF build parallels the base random forest build:
+./python/cuml/cuml/ensemble/CMakeLists.txt
+./cpp/CMakeLists.txt
+
+
+
+
+====== build using build.sh ======
+./build.sh clean
+CUML_EXTRA_CMAKE_ARGS="-DCUDA_ENABLE_LINE_INFO=OFF -DCMAKE_CUDA_ARCHITECTURES='70'" ./build.sh libcuml cuml -v &> build.test.log

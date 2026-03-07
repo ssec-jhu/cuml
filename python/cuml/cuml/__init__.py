@@ -1,6 +1,17 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2022-2025, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
 
 # If libcuml was installed as a wheel, we must request it to load the library symbols.
@@ -13,8 +24,7 @@ else:
     libcuml.load_library()
     del libcuml
 
-import cupy
-from rmm.allocators.cupy import rmm_cupy_allocator
+from pylibraft.common import Handle
 
 import cuml.feature_extraction
 from cuml._version import __git_commit__, __version__
@@ -23,7 +33,6 @@ from cuml.cluster.dbscan import DBSCAN
 from cuml.cluster.hdbscan import HDBSCAN
 from cuml.cluster.kmeans import KMeans
 from cuml.common.pointer_utils import device_of_gpu_matrix
-from cuml.covariance.ledoit_wolf import LedoitWolf
 from cuml.datasets.arima import make_arima
 from cuml.datasets.blobs import make_blobs
 from cuml.datasets.classification import make_classification
@@ -33,6 +42,10 @@ from cuml.decomposition.pca import PCA
 from cuml.decomposition.tsvd import TruncatedSVD
 from cuml.ensemble.randomforestclassifier import RandomForestClassifier
 from cuml.ensemble.randomforestregressor import RandomForestRegressor
+
+from cuml.ensemble.sporfclassifier import SPORFClassifier
+from cuml.ensemble.sporfregressor import SPORFRegressor
+
 from cuml.explainer.kernel_shap import KernelExplainer
 from cuml.explainer.permutation_shap import PermutationExplainer
 from cuml.explainer.tree_shap import TreeExplainer
@@ -42,7 +55,10 @@ from cuml.internals.global_settings import (
     GlobalSettings,
     _global_settings_data,
 )
-from cuml.internals.outputs import set_global_output_type, using_output_type
+from cuml.internals.memory_utils import (
+    set_global_output_type,
+    using_output_type,
+)
 from cuml.kernel_ridge.kernel_ridge import KernelRidge
 from cuml.linear_model.elastic_net import ElasticNet
 from cuml.linear_model.lasso import Lasso
@@ -75,30 +91,15 @@ from cuml.tsa.arima import ARIMA
 from cuml.tsa.auto_arima import AutoARIMA
 from cuml.tsa.holtwinters import ExponentialSmoothing
 
-# Enable rmm_cupy_allocator
-cupy.cuda.set_allocator(rmm_cupy_allocator)
-del cupy, rmm_cupy_allocator
-
 
 def __getattr__(name):
+
     if name == "global_settings":
         try:
             return _global_settings_data.settings
         except AttributeError:
             _global_settings_data.settings = GlobalSettings()
             return _global_settings_data.settings
-    elif name == "Handle":
-        import warnings
-
-        from pylibraft.common import Handle
-
-        warnings.warn(
-            "cuml.Handle was deprecated in 26.02 and will be removed in 26.04. "
-            "There is no need to manually specify a `handle`, cuml now manages "
-            "this resource for you automatically.",
-            FutureWarning,
-        )
-        return Handle
 
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
@@ -134,7 +135,6 @@ __all__ = [
     "KNeighborsClassifier",
     "KNeighborsRegressor",
     "Lasso",
-    "LedoitWolf",
     "LinearRegression",
     "LinearSVC",
     "LinearSVR",

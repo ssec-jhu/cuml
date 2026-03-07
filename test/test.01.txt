@@ -1,0 +1,13 @@
+#
+# test.01.txt
+#
+
+Do this in a shell in the cuml_dev virtual environment.
+
+pidmon.sh python test.01.py \
+ params.01.csv classification \
+ task=classification dataset="classification dataset" n_samples=1024 n_estimators=40
+
+
+python test.01.py params.01.csv c00 task=classification dataset=classification n_samples=1024 n_estimators=40
+

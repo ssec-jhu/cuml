@@ -6,10 +6,8 @@
 # =============================================================================
 
 set(cython_sources "")
-add_module_gpu_default(
-  "randomforest_common.pyx" ${randomforestclassifier_algo} ${randomforestregressor_algo}
-  ${ensemble_algo}
-)
+add_module_gpu_default("randomforest_common.pyx" ${randomforestclassifier_algo} ${randomforestregressor_algo} ${ensemble_algo})
+add_module_gpu_default("sporf_common.pyx" ${sporfclassifier_algo} ${sporfregressor_algo} ${ensemble_algo})
 
 set(linked_libraries ${cuml_sg_libraries} ${CUML_PYTHON_TREELITE_TARGET})
 
