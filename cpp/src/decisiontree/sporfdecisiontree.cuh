@@ -64,12 +64,13 @@ namespace ML {
 
 namespace DT {
   static constexpr int TPB_DEFAULT = 128;
+  static constexpr size_t MIN_ROWS_PER_BATCH = 4096; // 16384;  // heuristic to ensure enough parallelism for GPU kernels
 
   /**
  * Structure that manages the iterative batched-level training and building of nodes
  * in the host.
  */
-template <typename DataT, typename LabelT>
+template <typename DataT, typename IdxT, typename LabelT>
 class SPORFPredictNodeQueue {
   using NodeT = SparseTreeNode<DataT, LabelT>;
   using TreeMetaDataNodeT = DT::ObliqueTreeMetaDataNode<DataT, LabelT>;
@@ -95,15 +96,66 @@ class SPORFPredictNodeQueue {
 
   bool HasWork() { return work_items_.size() > 0; }
 
+  //   auto Pop()
+  // {
+  //   std::vector<NodeWorkItem> result;
+  //   result.reserve(std::min(max_batch_size, work_items_.size()));
+  //   while (work_items_.size() > 0 && result.size() < max_batch_size) {
+  //     result.emplace_back(work_items_.front());
+  //     work_items_.pop_front();
+  //   }
+  //   return result;
+  // }
   auto Pop()
   {
-    std::vector<NodeWorkItem> result;
-    result.reserve(std::min(max_batch_size, work_items_.size()));
-    while (work_items_.size() > 0 && result.size() < max_batch_size) {
-      result.emplace_back(work_items_.front());
-      work_items_.pop_front();
+    size_t total_rows = 0;
+    std::vector<NodeWorkItem> popped;
+    std::vector<ProjectionMatrix<DataT, int>> projection_matrices;
+    std::vector<BlockTask<IdxT>> block_tasks;
+    popped.reserve(std::min(max_batch_size, work_items_.size()));
+    projection_matrices.reserve(std::min(max_batch_size, work_items_.size()));
+    block_tasks.reserve(std::min(max_batch_size, work_items_.size()));
+
+    while (work_items_.size() > 0 && total_rows < MIN_ROWS_PER_BATCH && popped.size() < max_batch_size) {
+      // inline block so we can reuse the `work_item` identifier
+      {
+        auto work_item = std::move(work_items_.front());
+        work_items_.pop_front();
+
+        bool needs_projection = !(tree.sparsetree[work_item.idx].IsLeaf() || work_item.instances.count == 0);
+        popped.emplace_back(std::move(work_item));
+
+        if (!needs_projection) { continue; }  // leaves and empty nodes don't need projection tasks
+      }
+      auto* work_item = &popped.back();
+      auto* random_matrix = tree.projection_vectors[work_item->idx].get();
+
+      total_rows += work_item->instances.count;
+
+      projection_matrices.emplace_back(ProjectionMatrix<DataT, int>{
+        static_cast<int>(random_matrix->indptr.size()) - 1,
+        random_matrix->indptr.data(),
+        random_matrix->indices.data(),
+        random_matrix->sparse_data.data()
+      });
+
+      for(size_t i = 0; i < work_item->instances.count; i++) {
+        if(block_tasks.empty() || block_tasks.back().count == BLOCK_TASK_SIZE) {
+          block_tasks.emplace_back(BlockTask{});
+          block_tasks.back().count = 0;
+        }
+        auto* block_task = &block_tasks.back();
+        block_task->row_ids_ids[block_task->count] = work_item->instances.begin + i;
+        block_task->proj_ids[block_task->count] = projection_matrices.size() - 1;
+        block_task->count++;
+      }
     }
-    return result;
+
+    // std::cout << "Popped " << popped.size() << " work items with total " << total_rows << " rows, "
+    //           << projection_matrices.size() << " projection matrices, "
+    //           << block_tasks.size() << " block tasks." << std::endl;
+
+    return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(block_tasks));
   }
 
   void Push(const std::vector<NodeWorkItem>& work_items)
@@ -333,6 +385,35 @@ class SPORFDecisionTree {
     */
 
 };  // End DecisionTree Class
+
+template <typename DataT, typename IdxT>
+__global__ void batched_projection_kernel(
+  const DataT* d_input_col_major,   // global input X, col-major [n_rows x n_cols]
+  IdxT n_rows,
+  IdxT n_cols,
+  const IdxT* d_row_ids,            // collated row-id map
+  const ProjectionMatrix<DataT, int>* d_proj_mats,
+  IdxT n_proj_mats,
+  const BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  DataT* d_out_col_major,           // projected output buffer
+  IdxT out_ld                        // usually n_rows
+);
+
+template <typename DataT, typename IdxT>
+void launch_batched_projection_kernel(
+  const DataT* d_input_col_major,
+  IdxT n_rows,
+  IdxT n_cols,
+  const IdxT* d_row_ids,
+  const ProjectionMatrix<DataT, int>* d_proj_mats,
+  IdxT n_proj_mats,
+  const BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  DataT* d_out_col_major,
+  IdxT out_ld,
+  cudaStream_t stream
+);
 
 // Class specializations
 /*template tl::Tree<float, float> build_treelite_tree<float, int>(

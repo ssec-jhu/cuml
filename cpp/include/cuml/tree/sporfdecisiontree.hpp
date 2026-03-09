@@ -35,6 +35,23 @@ enum HISTOGRAM_METHOD : int {
   HISTOGRAM_METHOD_SAMPLED = 1
 };
 
+template <typename DataT, typename IdxT = int>
+struct ProjectionMatrix {
+  IdxT n_proj_components; // number of projection components (columns in projection matrix)
+  const IdxT* d_proj_indptr; // projection matrix component non-zero-coefficient counts
+  const IdxT* d_proj_indices; // projection matrix component column indices
+  const DataT* d_proj_coeffs; // projection matrix component non-zero coefficients
+};
+
+static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads per block for GPU kernels
+template <typename IdxT = int>
+struct BlockTask {
+  IdxT row_ids_ids[BLOCK_TASK_SIZE]; // raw position in row_ids (equivalent to node.instances.begin + i, where i is in [0...node.instances.count])
+  IdxT count;                        // number of rows in this block, in [0...BLOCK_TASK_SIZE]
+  IdxT proj_ids[BLOCK_TASK_SIZE];    // index into array of projection matrices loaded for this batch
+};
+
+
 struct SPORFDecisionTreeParams : DecisionTreeParams {
   /**
    * Additional parameter(s) required for SPORF

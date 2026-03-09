@@ -12,6 +12,31 @@
 namespace ML {
 namespace DT {
 
+template <typename DataT, typename IdxT>
+__global__ void batched_projection_kernel(const DataT* d_input_col_major,
+                                          IdxT n_rows,
+                                          IdxT n_cols,
+                                          const IdxT* d_row_ids,
+                                          const ProjectionMatrix<DataT, int>* d_proj_mats,
+                                          IdxT n_proj_mats,
+                                          const BlockTask<IdxT>* d_block_tasks,
+                                          IdxT n_block_tasks,
+                                          DataT* d_out_col_major,
+                                          IdxT out_ld);
+
+template <typename DataT, typename IdxT>
+void launch_batched_projection_kernel(const DataT* d_input_col_major,
+                                      IdxT n_rows,
+                                      IdxT n_cols,
+                                      const IdxT* d_row_ids,
+                                      const ProjectionMatrix<DataT, int>* d_proj_mats,
+                                      IdxT n_proj_mats,
+                                      const BlockTask<IdxT>* d_block_tasks,
+                                      IdxT n_block_tasks,
+                                      DataT* d_out_col_major,
+                                      IdxT out_ld,
+                                      cudaStream_t stream);
+
 template <typename DataT, typename LabelT, typename IdxT>
 __global__ void partition_kernel(const Dataset<DataT, LabelT, IdxT> dataset,
                                  DataT split_quesval, IdxT split_colid, DataT split_best_metric_val,
@@ -42,17 +67,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
 
     IdxT n_classes = 0; // Dummy variable, not used in prediction
     rmm::device_uvector<IdxT> row_ids(0, stream);
-    rmm::device_uvector<DataT> d_contiguous(0, stream);
     rmm::device_uvector<DataT> d_trans(0, stream);
 
-    size_t req_bytes     = n_rows * n_cols * sizeof(DataT);
+    size_t req_bytes     = n_rows * sizeof(IdxT);
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
-    size_t aligned_elems = aligned_bytes / sizeof(DataT);
-    d_contiguous.resize(aligned_elems, stream);
-
-    req_bytes     = n_rows * sizeof(IdxT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(IdxT);
+    size_t aligned_elems = aligned_bytes / sizeof(IdxT);
     row_ids.resize(aligned_elems, stream);
 
     req_bytes     = n_rows * sizeof(DataT);
@@ -60,6 +79,18 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(DataT);
     d_trans.resize(aligned_elems, stream);
 
+    rmm::device_uvector<ProjectionMatrix<DataT, int>> d_projection_matrices(0, stream);
+    rmm::device_uvector<BlockTask<int>> d_block_tasks(0, stream);
+
+    req_bytes     = (n_rows / 2) * sizeof(ProjectionMatrix<DataT, int>); // heuristic for max projection matrices needed at once
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(ProjectionMatrix<DataT, int>);
+    d_projection_matrices.resize(aligned_elems, stream);
+
+    req_bytes     = (n_rows / 2) * sizeof(BlockTask<IdxT>); // heuristic for max block tasks needed at once
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(BlockTask<IdxT>);
+    d_block_tasks.resize(aligned_elems, stream);
 
     thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
     Dataset<DataT, LabelT, IdxT> dataset = {
@@ -74,53 +105,34 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     };
 
     MLCommon::TimerCPU timer;
-    SPORFPredictNodeQueue<DataT, LabelT> queue(tree, n_rows, max_batch_size);
+    SPORFPredictNodeQueue<DataT, int, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
-      auto work_items                      = queue.Pop();
+      auto [work_items, projection_matrices, block_tasks] = queue.Pop();
+      raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
+      raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
 
-      for (unsigned long i = 0; i < work_items.size(); i++) {
+      if (!block_tasks.empty()) {
+        launch_batched_projection_kernel<DataT, IdxT>(rows,
+                                                      static_cast<IdxT>(n_rows),
+                                                      static_cast<IdxT>(n_cols),
+                                                      dataset.row_ids,
+                                                      d_projection_matrices.data(),
+                                                      static_cast<IdxT>(projection_matrices.size()),
+                                                      d_block_tasks.data(),
+                                                      static_cast<IdxT>(block_tasks.size()),
+                                                      d_trans.data(),
+                                                      static_cast<IdxT>(dataset.M),
+                                                      stream);
+      }
+
+      for(unsigned long i = 0; i < work_items.size(); i++) {
         auto& work_item = work_items[i];
-
-        IdxT colid = 0;
-        auto node = tree.sparsetree[work_item.idx];
         auto& begin = work_item.instances.begin;
         auto& count = work_item.instances.count;
+        auto node = tree.sparsetree[work_item.idx];
+        if (node.IsLeaf() || count == 0) { continue; }
 
-        if (node.IsLeaf() || count == 0) {
-          continue; // leaves and empty nodes don't need to be processed further
-        }
-
-        auto* random_matrix = tree.projection_vectors[work_item.idx].get();
-
-        raft::matrix::copyRows<DataT, IdxT, size_t>(
-          rows, // d_rows.data(),               // in (device, column-major, lda = n_rows)
-          n_rows,                      // input leading dimension / total rows
-          n_cols,                      // number of columns of input/output
-          d_contiguous.data() + begin, // out (contiguous block for this node)
-          dataset.row_ids + begin,     // row indices to copy
-          count,                       // number of rows to copy for this node
-          stream,
-          false                        // input is column-major
-        );
-
-        paramsRPROJ rproj_params{
-          static_cast<int>(count), // number of samples
-          static_cast<int>(n_cols),               // number of features
-          1,                       // number of components
-          -1.0f,                   // error tolerance (not used)
-          false,                   // gaussian or sparse method
-          1.0,                     // density (ignored when gaussian_method==true)
-          false,                   // not used
-          0                        // random seed
-        };
-
-        RPROJtransform<DataT>(
-          handle,
-          d_contiguous.data() + begin,
-          random_matrix,
-          d_trans.data() + begin,
-          &rproj_params
-        );
+        IdxT colid = 0;
 
         auto first = thrust::make_counting_iterator<IdxT>(begin);
         auto last  = first + count;
@@ -184,6 +196,83 @@ template void SPORFDecisionTree::predict<float, int>(const raft::handle_t&, cons
 template void SPORFDecisionTree::predict<double, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
 template void SPORFDecisionTree::predict<float, float>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
 template void SPORFDecisionTree::predict<double, double>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
+
+template <typename DataT, typename IdxT>
+__global__ void batched_projection_kernel(
+  const DataT* d_input_col_major,   // global input X, col-major [n_rows x n_cols]
+  IdxT n_rows,
+  IdxT n_cols,
+  const IdxT* d_row_ids,            // collated row-id map
+  const ProjectionMatrix<DataT, int>* d_proj_mats,
+  IdxT n_proj_mats,
+  const BlockTask<int>* d_block_tasks,
+  IdxT n_block_tasks,
+  DataT* d_out_col_major,           // projected output buffer
+  IdxT out_ld                        // usually n_rows
+)
+{
+  auto block_id = static_cast<IdxT>(blockIdx.x);
+  if (block_id >= n_block_tasks) { return; }
+
+  auto tid = static_cast<IdxT>(threadIdx.x);
+  auto task = d_block_tasks[block_id];
+  if (tid >= task.count) { return; }
+
+  auto row_pos = task.row_ids_ids[tid];
+  auto proj_id = task.proj_ids[tid];
+  if (row_pos >= out_ld || proj_id >= n_proj_mats) { return; }
+
+  auto row_id = d_row_ids[row_pos];
+  if (row_id >= n_rows) { return; }
+
+  auto pm = d_proj_mats[proj_id];
+  for (IdxT comp = 0; comp < pm.n_proj_components; comp++) {
+    int start = pm.d_proj_indptr[comp];
+    int end = pm.d_proj_indptr[comp + 1];
+    DataT acc = DataT(0);
+
+    for (int nz = start; nz < end; nz++) {
+      auto feat = static_cast<IdxT>(pm.d_proj_indices[nz]);
+      if (feat >= n_cols) { continue; }
+      auto coeff = pm.d_proj_coeffs[nz];
+      acc += d_input_col_major[feat * n_rows + row_id] * coeff;
+    }
+    d_out_col_major[comp * out_ld + row_pos] = acc;
+  }
+}
+
+template <typename DataT, typename IdxT>
+void launch_batched_projection_kernel(
+  const DataT* d_input_col_major,
+  IdxT n_rows,
+  IdxT n_cols,
+  const IdxT* d_row_ids,
+  const ProjectionMatrix<DataT, int>* d_proj_mats,
+  IdxT n_proj_mats,
+  const BlockTask<int>* d_block_tasks,
+  IdxT n_block_tasks,
+  DataT* d_out_col_major,
+  IdxT out_ld,
+  cudaStream_t stream
+)
+{
+  constexpr int TPB = BLOCK_TASK_SIZE;  // or 128
+  dim3 block(TPB);
+  dim3 grid(n_block_tasks);             // one block per BlockTask for first version
+  batched_projection_kernel<DataT, IdxT><<<grid, block, 0, stream>>>(
+    d_input_col_major,
+    n_rows,
+    n_cols,
+    d_row_ids,
+    d_proj_mats,
+    n_proj_mats,
+    d_block_tasks,
+    n_block_tasks,
+    d_out_col_major,
+    out_ld
+  );
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
 
 }  // namespace DT
 }  // namespace ML

@@ -59,6 +59,7 @@ class SPORFNodeQueue {
   std::shared_ptr<TreeMetaDataNodeT> tree;
   std::vector<SPORFDT::InstanceRange> node_instances_;
   std::deque<SPORFDT::NodeWorkItem> work_items_;
+  const size_t MIN_ROWS_PER_BATCH = 1; //65536;  // heuristic to ensure enough parallelism for GPU kernels
 
  public:
   SPORFNodeQueue(SPORFDecisionTreeParams params, size_t max_nodes, size_t sampled_rows, int num_outputs)
@@ -85,11 +86,13 @@ class SPORFNodeQueue {
 
   auto Pop()
   {
+    size_t total_rows = 0;
     std::vector<SPORFDT::NodeWorkItem> result;
     result.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
     while (work_items_.size() > 0 && result.size() < std::size_t(params.max_batch_size)) {
       result.emplace_back(work_items_.front());
       work_items_.pop_front();
+      total_rows += result.back().instances.count;
     }
     return result;
   }
@@ -250,12 +253,14 @@ struct SPORFBuilder {
 
   struct Stats {
     double t_sampling;
+    double t_copy;
     double t_rproj_fit;
+    double t_pre_transform;
     double t_rproj_transform;
     double t_histogram;
     double t_split;
 
-    Stats() : t_sampling(0), t_rproj_fit(0), t_rproj_transform(0), t_histogram(0), t_split(0) {}
+    Stats() : t_sampling(0), t_copy(0), t_rproj_fit(0), t_pre_transform(0), t_rproj_transform(0), t_histogram(0), t_split(0) {}
   } stats;
 
   SPORFBuilder(const raft::handle_t& handle,
@@ -486,7 +491,9 @@ struct SPORFBuilder {
     tree->train_time = timer.getElapsedMilliseconds();
 
     std::cout << "SPORFBuilder::train: sampling: " << stats.t_sampling <<
+      " ms, copy: " << stats.t_copy <<
       " ms, rproj fit: " << stats.t_rproj_fit <<
+      " ms, pre-transform: " << stats.t_pre_transform <<
       " ms, rproj transform: " << stats.t_rproj_transform <<
       " ms, histogram: " << stats.t_histogram <<
       " ms, split: " << stats.t_split <<
@@ -546,6 +553,7 @@ struct SPORFBuilder {
 
       if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
 
+      t0 = std::chrono::steady_clock::now();
       raft::matrix::copyRows<DataT, IdxT, size_t>(
         dataset.data,                     // in
         dataset.M,                        // total rows in input matrix (col-major)
@@ -557,6 +565,7 @@ struct SPORFBuilder {
         false                             // do-row-major (false, i.e. do column-major)
       );
       RAFT_CUDA_TRY(cudaPeekAtLastError());
+stats.t_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
       // TODO: fix rproj to use better types than int for everything
       paramsRPROJ rproj_params{
@@ -571,7 +580,6 @@ struct SPORFBuilder {
       };
 
       t0 = std::chrono::steady_clock::now();
-      //rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols]);
       rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i]);
       random_matrix.reset();
       auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i) & 0x7fffffffULL);
@@ -593,7 +601,9 @@ stats.t_rproj_fit += std::chrono::duration<double, std::milli>(std::chrono::stea
 
     auto& lda = m;
     auto& ldc = dataset.n_sampled_rows;
+stats.t_pre_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
+t0 = std::chrono::steady_clock::now();
     // TODO: Need to wrap this in a RAFT public API.
     RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsegemmi(cusparse_handle,
                                                           m,
@@ -619,26 +629,6 @@ stats.t_rproj_transform += std::chrono::duration<double, std::milli>(std::chrono
       std::iota(universe.begin(), universe.end(), 0);
 
 for(int c = 0; c < dataset.n_sampled_cols; c++) {
-        // rand_mat<DataT>& random_matrix = *(h_sparse_matrices[i * dataset.n_sampled_cols + c]);
-        // random_matrix.reset();
-        // auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i + c) &
-        //                                     0x7fffffffULL);
-        // rproj_params.random_state = random_state;
-
-//         t0 = std::chrono::steady_clock::now();
-//         do {
-//           RPROJfit(handle, &random_matrix, &rproj_params);
-//         } while (random_matrix.indices.size() == 0);  // ensure we don't get an empty projection
-// stats.t_rproj_fit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-//         t0 = std::chrono::steady_clock::now();
-//         RPROJtransform<DataT>(
-//           handle,
-//           d_contiguous.data() + begin,
-//           &random_matrix,
-//           d_trans.data() + (c * dataset.n_sampled_rows) + begin,
-//           &rproj_params
-//         );
-// stats.t_rproj_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
         // TODO: randomize the order here!
         std::sample(
