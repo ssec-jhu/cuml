@@ -64,7 +64,7 @@ namespace ML {
 
 namespace DT {
   static constexpr int TPB_DEFAULT = 128;
-  static constexpr size_t MIN_ROWS_PER_BATCH = 4096; // 16384;  // heuristic to ensure enough parallelism for GPU kernels
+  static constexpr size_t MIN_ROWS_PER_BATCH = 16384;  // heuristic to ensure enough parallelism for GPU kernels
 
   /**
  * Structure that manages the iterative batched-level training and building of nodes
@@ -96,16 +96,22 @@ class SPORFPredictNodeQueue {
 
   bool HasWork() { return work_items_.size() > 0; }
 
-  //   auto Pop()
-  // {
-  //   std::vector<NodeWorkItem> result;
-  //   result.reserve(std::min(max_batch_size, work_items_.size()));
-  //   while (work_items_.size() > 0 && result.size() < max_batch_size) {
-  //     result.emplace_back(work_items_.front());
-  //     work_items_.pop_front();
-  //   }
-  //   return result;
-  // }
+  
+  /**
+   * Pop the next prediction batch and build GPU-ready metadata.
+   *
+   * Returns:
+   * 1) `popped`: all dequeued work items (including leaves/empty nodes so queue semantics stay intact).
+   * 2) `projection_matrices`: one entry per non-leaf/non-empty work item in this batch.
+   * 3) `block_tasks`: fixed-size row chunks for batched projection/count kernels.
+   *
+   * Guarantees:
+   * - `block_tasks[*].work_item_ids` are batch-local ids into `popped` (`popped_idx`).
+   * - Rows for a given `work_item_id` are appended contiguously in block-task order.
+   * - `row_ids_ids` are collated positions (`instances.begin + local_row`) into dataset.row_ids
+   *   and projected output buffers.
+   * - `proj_ids` are batch-local ids into `projection_matrices`.
+   */
   auto Pop()
   {
     size_t total_rows = 0;
@@ -145,15 +151,12 @@ class SPORFPredictNodeQueue {
           block_tasks.back().count = 0;
         }
         auto* block_task = &block_tasks.back();
+        block_task->work_item_ids[block_task->count] = static_cast<IdxT>(popped.size() - 1);
         block_task->row_ids_ids[block_task->count] = work_item->instances.begin + i;
         block_task->proj_ids[block_task->count] = projection_matrices.size() - 1;
         block_task->count++;
       }
     }
-
-    // std::cout << "Popped " << popped.size() << " work items with total " << total_rows << " rows, "
-    //           << projection_matrices.size() << " projection matrices, "
-    //           << block_tasks.size() << " block tasks." << std::endl;
 
     return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(block_tasks));
   }
@@ -386,12 +389,16 @@ class SPORFDecisionTree {
 
 };  // End DecisionTree Class
 
-template <typename DataT, typename IdxT>
+template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_projection_kernel(
   const DataT* d_input_col_major,   // global input X, col-major [n_rows x n_cols]
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,            // collated row-id map
+  const SparseTreeNode<DataT, LabelT>* const d_nodes,       // global tree nodes
+  const SPORFDT::NodeWorkItem* const d_work_items,       // work items for this batch
+  IdxT n_work_items,
+  IdxT* d_out_nLeft,              // output buffer for left child instance counts (used for partitioning), index-aligned with work items for this batch, strided by ProjectionMatrix.n_proj_components
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<IdxT>* d_block_tasks,
@@ -400,12 +407,16 @@ __global__ void batched_projection_kernel(
   IdxT out_ld                        // usually n_rows
 );
 
-template <typename DataT, typename IdxT>
+template <typename DataT, typename LabelT, typename IdxT>
 void launch_batched_projection_kernel(
   const DataT* d_input_col_major,
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,
+  const SparseTreeNode<DataT, LabelT>* const d_nodes,
+  const SPORFDT::NodeWorkItem* const d_work_items,
+  IdxT n_work_items,
+  IdxT* d_out_nLeft,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<IdxT>* d_block_tasks,

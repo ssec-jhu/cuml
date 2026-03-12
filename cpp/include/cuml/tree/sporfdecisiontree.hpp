@@ -37,6 +37,7 @@ enum HISTOGRAM_METHOD : int {
 
 template <typename DataT, typename IdxT = int>
 struct ProjectionMatrix {
+  // TODO: rename n_proj_components to n_output_dims
   IdxT n_proj_components; // number of projection components (columns in projection matrix)
   const IdxT* d_proj_indptr; // projection matrix component non-zero-coefficient counts
   const IdxT* d_proj_indices; // projection matrix component column indices
@@ -46,6 +47,7 @@ struct ProjectionMatrix {
 static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads per block for GPU kernels
 template <typename IdxT = int>
 struct BlockTask {
+  IdxT work_item_ids[BLOCK_TASK_SIZE]; // index into batch of work items (node splits) assigned to this block
   IdxT row_ids_ids[BLOCK_TASK_SIZE]; // raw position in row_ids (equivalent to node.instances.begin + i, where i is in [0...node.instances.count])
   IdxT count;                        // number of rows in this block, in [0...BLOCK_TASK_SIZE]
   IdxT proj_ids[BLOCK_TASK_SIZE];    // index into array of projection matrices loaded for this batch
