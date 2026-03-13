@@ -55,21 +55,7 @@ struct Split {
     nLeft                     = 0;
   }
 
-  /**
-   * @brief Assignment operator overload
-   *
-   * @param[in] other source object from where to copy
-   *
-   * @return the reference to the copied object (typically useful for chaining)
-   */
-  DI SplitT& operator=(const SplitT& other)
-  {
-    quesval         = other.quesval;
-    colid           = other.colid;
-    best_metric_val = other.best_metric_val;
-    nLeft           = other.nLeft;
-    return *this;
-  }
+  DI Split& operator=(const Split&) = default;
 
   /**
    * @brief updates the current split if the input gain is better

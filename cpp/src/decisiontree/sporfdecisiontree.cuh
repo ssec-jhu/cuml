@@ -103,23 +103,27 @@ class SPORFPredictNodeQueue {
    * Returns:
    * 1) `popped`: all dequeued work items (including leaves/empty nodes so queue semantics stay intact).
    * 2) `projection_matrices`: one entry per non-leaf/non-empty work item in this batch.
-   * 3) `block_tasks`: fixed-size row chunks for batched projection/count kernels.
+   * 3) `splits`: one entry per non-leaf/non-empty work item in this batch.
+   * 4) `block_tasks`: fixed-size row chunks for batched projection/count kernels.
    *
    * Guarantees:
    * - `block_tasks[*].work_item_ids` are batch-local ids into `popped` (`popped_idx`).
    * - Rows for a given `work_item_id` are appended contiguously in block-task order.
    * - `row_ids_ids` are collated positions (`instances.begin + local_row`) into dataset.row_ids
    *   and projected output buffers.
-   * - `proj_ids` are batch-local ids into `projection_matrices`.
+   * - `payload_ids` are batch-local ids into `projection_matrices` and `splits`.
+   * - `splits` are batch-local and initialized with `nLeft = 0`.
    */
   auto Pop()
   {
     size_t total_rows = 0;
     std::vector<NodeWorkItem> popped;
     std::vector<ProjectionMatrix<DataT, int>> projection_matrices;
+    std::vector<Split<DataT, IdxT>> splits;
     std::vector<BlockTask<IdxT>> block_tasks;
     popped.reserve(std::min(max_batch_size, work_items_.size()));
     projection_matrices.reserve(std::min(max_batch_size, work_items_.size()));
+    splits.reserve(std::min(max_batch_size, work_items_.size()));
     block_tasks.reserve(std::min(max_batch_size, work_items_.size()));
 
     while (work_items_.size() > 0 && total_rows < MIN_ROWS_PER_BATCH && popped.size() < max_batch_size) {
@@ -128,10 +132,10 @@ class SPORFPredictNodeQueue {
         auto work_item = std::move(work_items_.front());
         work_items_.pop_front();
 
-        bool needs_projection = !(tree.sparsetree[work_item.idx].IsLeaf() || work_item.instances.count == 0);
+        bool needs_split = !(tree.sparsetree[work_item.idx].IsLeaf() || work_item.instances.count == 0);
         popped.emplace_back(std::move(work_item));
 
-        if (!needs_projection) { continue; }  // leaves and empty nodes don't need projection tasks
+        if (!needs_split) { continue; }  // leaves and empty nodes don't need split tasks
       }
       auto* work_item = &popped.back();
       auto* random_matrix = tree.projection_vectors[work_item->idx].get();
@@ -144,6 +148,12 @@ class SPORFPredictNodeQueue {
         random_matrix->indices.data(),
         random_matrix->sparse_data.data()
       });
+      splits.emplace_back(Split<DataT, IdxT>{
+        tree.sparsetree[work_item->idx].QueryValue(),
+        tree.sparsetree[work_item->idx].ColumnId(),
+        Split<DataT, IdxT>::Min,
+        0
+      });
 
       for(size_t i = 0; i < work_item->instances.count; i++) {
         if(block_tasks.empty() || block_tasks.back().count == BLOCK_TASK_SIZE) {
@@ -153,12 +163,12 @@ class SPORFPredictNodeQueue {
         auto* block_task = &block_tasks.back();
         block_task->work_item_ids[block_task->count] = static_cast<IdxT>(popped.size() - 1);
         block_task->row_ids_ids[block_task->count] = work_item->instances.begin + i;
-        block_task->proj_ids[block_task->count] = projection_matrices.size() - 1;
+        block_task->payload_ids[block_task->count] = projection_matrices.size() - 1;
         block_task->count++;
       }
     }
 
-    return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(block_tasks));
+    return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(splits), std::move(block_tasks));
   }
 
   void Push(const std::vector<NodeWorkItem>& work_items)
@@ -398,7 +408,7 @@ __global__ void batched_projection_kernel(
   const SparseTreeNode<DataT, LabelT>* const d_nodes,       // global tree nodes
   const SPORFDT::NodeWorkItem* const d_work_items,       // work items for this batch
   IdxT n_work_items,
-  IdxT* d_out_nLeft,              // output buffer for left child instance counts (used for partitioning), index-aligned with work items for this batch, strided by ProjectionMatrix.n_proj_components
+  Split<DataT, int>* d_out_splits,              // output buffer for left child instance counts (used for partitioning), index-aligned with work items for this batch, strided by ProjectionMatrix.n_proj_components
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<IdxT>* d_block_tasks,
@@ -416,7 +426,7 @@ void launch_batched_projection_kernel(
   const SparseTreeNode<DataT, LabelT>* const d_nodes,
   const SPORFDT::NodeWorkItem* const d_work_items,
   IdxT n_work_items,
-  IdxT* d_out_nLeft,
+  Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<IdxT>* d_block_tasks,

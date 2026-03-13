@@ -20,7 +20,7 @@ __global__ void batched_projection_kernel(const DataT* d_input_col_major,
                                           const SparseTreeNode<DataT, LabelT>* const d_nodes,
                                           const NodeWorkItem* const d_work_items,
                                           IdxT n_work_items,
-                                          IdxT* d_out_nLeft,
+                                          Split<DataT, int>* d_out_splits,
                                           const ProjectionMatrix<DataT, int>* d_proj_mats,
                                           IdxT n_proj_mats,
                                           const BlockTask<IdxT>* d_block_tasks,
@@ -36,7 +36,7 @@ void launch_batched_projection_kernel(const DataT* d_input_col_major,
                                       const SparseTreeNode<DataT, LabelT>* const d_nodes,
                                       const NodeWorkItem* const d_work_items,
                                       IdxT n_work_items,
-                                      IdxT* d_out_nLeft,
+                                      Split<DataT, int>* d_out_splits,
                                       const ProjectionMatrix<DataT, int>* d_proj_mats,
                                       IdxT n_proj_mats,
                                       const BlockTask<IdxT>* d_block_tasks,
@@ -94,23 +94,14 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     d_sparsetree.resize(aligned_elems, stream);
     raft::update_device(d_sparsetree.data(), tree.sparsetree.data(), tree.sparsetree.size(), stream);
 
-    rmm::device_uvector<ProjectionMatrix<DataT, int>> d_projection_matrices(0, stream);
-    rmm::device_uvector<BlockTask<int>> d_block_tasks(0, stream);
+    // TODO: refactor out d_nodes since d_splits is necessary and sufficient
     rmm::device_uvector<SparseTreeNode<DataT, LabelT>> d_nodes(0, stream);
-    rmm::device_uvector<SPORFDT::NodeWorkItem> d_work_items(0, stream);
-    rmm::device_uvector<IdxT> d_nLeft(0, stream);
+    rmm::device_uvector<SPORFDT::NodeWorkItem>         d_work_items(0, stream);
+    rmm::device_uvector<ProjectionMatrix<DataT, int>>  d_projection_matrices(0, stream);
+    rmm::device_uvector<Split<DataT, int>>             d_splits(0, stream);
+    rmm::device_uvector<BlockTask<int>>                d_block_tasks(0, stream);
 
     // TODO: revisit these heuristics
-    req_bytes     = (n_rows / 2) * sizeof(ProjectionMatrix<DataT, int>); // heuristic for max projection matrices needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(ProjectionMatrix<DataT, int>);
-    d_projection_matrices.resize(aligned_elems, stream);
-
-    req_bytes     = (n_rows / 2) * sizeof(BlockTask<IdxT>); // heuristic for max block tasks needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(BlockTask<IdxT>);
-    d_block_tasks.resize(aligned_elems, stream);
-
     req_bytes     = tree.sparsetree.size() * sizeof(SparseTreeNode<DataT, LabelT>);
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(SparseTreeNode<DataT, LabelT>);
@@ -122,10 +113,20 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(SPORFDT::NodeWorkItem);
     d_work_items.resize(aligned_elems, stream);
 
-    req_bytes     = n_rows * sizeof(IdxT);
+    req_bytes     = (n_rows / 2) * sizeof(ProjectionMatrix<DataT, int>); // heuristic for max projection matrices needed at once
     aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(IdxT);
-    d_nLeft.resize(aligned_elems, stream);
+    aligned_elems = aligned_bytes / sizeof(ProjectionMatrix<DataT, int>);
+    d_projection_matrices.resize(aligned_elems, stream);
+
+    req_bytes     = (n_rows / 2) * sizeof(Split<DataT, int>); // heuristic for max splits needed at once
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(Split<DataT, int>);
+    d_splits.resize(aligned_elems, stream);
+
+    req_bytes     = (n_rows / 2) * sizeof(BlockTask<IdxT>); // heuristic for max block tasks needed at once
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(BlockTask<IdxT>);
+    d_block_tasks.resize(aligned_elems, stream);
 
     thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
     Dataset<DataT, LabelT, IdxT> dataset = {
@@ -142,11 +143,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     MLCommon::TimerCPU timer;
     SPORFPredictNodeQueue<DataT, int, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
-      auto [work_items, projection_matrices, block_tasks] = queue.Pop();
-      raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
-      raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
+      auto [work_items, projection_matrices, splits, block_tasks] = queue.Pop();
       raft::update_device(d_work_items.data(), work_items.data(), work_items.size(), stream);
-      RAFT_CUDA_TRY(cudaMemsetAsync(d_nLeft.data(), 0, work_items.size() * sizeof(IdxT), stream));
+      raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
+      raft::update_device(d_splits.data(), splits.data(), splits.size(), stream);
+      raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
 
       if (!block_tasks.empty()) {
         launch_batched_projection_kernel<DataT, LabelT, IdxT>(rows,
@@ -156,7 +157,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                                               d_nodes.data(),
                                                               d_work_items.data(),
                                                               static_cast<IdxT>(work_items.size()),
-                                                              d_nLeft.data(),
+                                                              d_splits.data(),
                                                               d_projection_matrices.data(),
                                                               static_cast<IdxT>(projection_matrices.size()),
                                                               d_block_tasks.data(),
@@ -166,12 +167,13 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                                               stream);
       }
 
-      std::vector<IdxT> h_nLeft(work_items.size(), 0);
-      if (!work_items.empty()) {
-        raft::update_host(h_nLeft.data(), d_nLeft.data(), h_nLeft.size(), stream);
+      if (!splits.empty()) {
+        raft::update_host(splits.data(), d_splits.data(), splits.size(), stream);
         RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
       }
 
+      // Split entries are ordered by the same non-leaf/non-empty visitation order as work_items.
+      size_t split_idx = 0;
       for(unsigned long i = 0; i < work_items.size(); i++) {
         auto& work_item = work_items[i];
         auto& begin = work_item.instances.begin;
@@ -180,7 +182,8 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         if (node.IsLeaf() || count == 0) { continue; }
 
         IdxT colid = 0;
-        work_item.nLeft = h_nLeft[i];
+        work_item.nLeft = static_cast<decltype(work_item.nLeft)>(splits[split_idx].nLeft);
+        split_idx++;
 
         partition_kernel<DataT, LabelT, IdxT> <<<1, TPB_DEFAULT, 2 * TPB_DEFAULT * sizeof(IdxT), stream>>>(
           dataset, node.QueryValue(), colid, node.BestMetric(), work_item
@@ -242,7 +245,7 @@ __global__ void batched_projection_kernel(
   const SparseTreeNode<DataT, LabelT>* const d_nodes,       // global tree nodes
   const SPORFDT::NodeWorkItem* const d_work_items,       // work items for this batch
   IdxT n_work_items,
-  IdxT* d_out_nLeft,
+  Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<int>* d_block_tasks,
@@ -259,7 +262,7 @@ __global__ void batched_projection_kernel(
   if (tid >= task.count) { return; }
 
   auto row_pos = task.row_ids_ids[tid];
-  auto proj_id = task.proj_ids[tid];
+  auto proj_id = task.payload_ids[tid];
   if (row_pos >= out_ld || proj_id >= n_proj_mats) { return; }
 
   auto row_id = d_row_ids[row_pos];
@@ -284,28 +287,26 @@ __global__ void batched_projection_kernel(
 
   if (tid == 0) {
     // Assumes SPORFPredictNodeQueue::Pop() guarantees:
-    // 1) work_item_ids are batch-local ids into `popped`,
-    // 2) rows for each work_item_id are appended contiguously in block-task order,
+    // 1) payload_ids are batch-local ids aligned with projection_matrices and splits,
+    // 2) rows for each payload_id are appended contiguously in block-task order,
     // 3) row_ids_ids are collated positions into row_ids/output buffers.
     // See the Pop() contract comment in sporfdecisiontree.cuh.
     // With those guarantees, run-length counting here is linear in task.count.
-    IdxT curr_work_item = static_cast<IdxT>(-1);
+    IdxT curr_payload = static_cast<IdxT>(-1);
     DataT curr_split = DataT(0);
     IdxT curr_left_count = 0;
 
     for (IdxT j = 0; j < task.count; j++) {
-      IdxT work_item_id = static_cast<IdxT>(task.work_item_ids[j]);
-      if (work_item_id >= n_work_items) { continue; }
+      IdxT payload_id = static_cast<IdxT>(task.payload_ids[j]);
+      if (payload_id >= n_proj_mats) { continue; }
 
-      if (work_item_id != curr_work_item) {
-        if (curr_work_item != static_cast<IdxT>(-1) && curr_left_count > 0) {
-          atomicAdd(d_out_nLeft + curr_work_item, curr_left_count);
+      if (payload_id != curr_payload) {
+        if (curr_payload != static_cast<IdxT>(-1) && curr_left_count > 0) {
+          atomicAdd(&d_out_splits[curr_payload].nLeft, curr_left_count);
         }
-        curr_work_item = work_item_id;
+        curr_payload = payload_id;
         curr_left_count = 0;
-
-        auto node_idx = static_cast<IdxT>(d_work_items[curr_work_item].idx);
-        curr_split = d_nodes[node_idx].QueryValue();
+        curr_split = d_out_splits[curr_payload].quesval;
       }
 
       IdxT row_pos_j = static_cast<IdxT>(task.row_ids_ids[j]);
@@ -316,8 +317,8 @@ __global__ void batched_projection_kernel(
       if (projected <= curr_split) { curr_left_count++; }
     }
 
-    if (curr_work_item != static_cast<IdxT>(-1) && curr_left_count > 0) {
-      atomicAdd(d_out_nLeft + curr_work_item, curr_left_count);
+    if (curr_payload != static_cast<IdxT>(-1) && curr_left_count > 0) {
+      atomicAdd(&d_out_splits[curr_payload].nLeft, curr_left_count);
     }
   }
 }
@@ -331,7 +332,7 @@ void launch_batched_projection_kernel(
   const SparseTreeNode<DataT, LabelT>* const d_nodes,
   const SPORFDT::NodeWorkItem* const d_work_items,
   IdxT n_work_items,
-  IdxT* d_out_nLeft,
+  Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   const BlockTask<int>* d_block_tasks,
@@ -352,7 +353,7 @@ void launch_batched_projection_kernel(
     d_nodes,
     d_work_items,
     n_work_items,
-    d_out_nLeft,
+    d_out_splits,
     d_proj_mats,
     n_proj_mats,
     d_block_tasks,

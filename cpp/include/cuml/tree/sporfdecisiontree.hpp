@@ -50,7 +50,7 @@ struct BlockTask {
   IdxT work_item_ids[BLOCK_TASK_SIZE]; // index into batch of work items (node splits) assigned to this block
   IdxT row_ids_ids[BLOCK_TASK_SIZE]; // raw position in row_ids (equivalent to node.instances.begin + i, where i is in [0...node.instances.count])
   IdxT count;                        // number of rows in this block, in [0...BLOCK_TASK_SIZE]
-  IdxT proj_ids[BLOCK_TASK_SIZE];    // index into array of projection matrices loaded for this batch
+  IdxT payload_ids[BLOCK_TASK_SIZE];    // index into array of thread-specific task info (i.e. projection matrices, partition splits, etc) loaded for this batch
 };
 
 
