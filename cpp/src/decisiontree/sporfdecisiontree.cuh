@@ -365,6 +365,19 @@ class SPORFDecisionTree {
                       int num_outputs,
                       rapids_logger::level_enum verbosity);
 
+  template <typename DataT, typename LabelT, typename IdxT = int>
+  static void predict(const raft::handle_t& handle,
+                      const TreeMetaDataNode<DataT, LabelT>& tree,
+                      size_t max_batch_size,
+                      const DataT* rows,
+                      std::size_t n_rows,
+                      std::size_t n_cols,
+                      double scale,
+                      DataT* predictions,
+                      int num_outputs,
+                      rapids_logger::level_enum verbosity,
+                      cudaStream_t stream);
+
   /*
   template <class DataT, class LabelT>
   static void predict(const raft::handle_t& handle,

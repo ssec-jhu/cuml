@@ -271,9 +271,35 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 DataT* predictions,
                                 int num_outputs,
                                 rapids_logger::level_enum verbosity)
+{
+  predict<DataT, LabelT, IdxT>(handle,
+                               tree,
+                               max_batch_size,
+                               rows,
+                               n_rows,
+                               n_cols,
+                               scale,
+                               predictions,
+                               num_outputs,
+                               verbosity,
+                               handle.get_stream());
+}
+
+// Template definition moved from the header
+template <typename DataT, typename LabelT, typename IdxT>
+void SPORFDecisionTree::predict(const raft::handle_t& handle,
+                                const TreeMetaDataNode<DataT, LabelT>& tree,
+                                std::size_t max_batch_size,
+                                const DataT* rows, // input data in column-major format, device pointer
+                                std::size_t n_rows,
+                                std::size_t n_cols,
+                                double scale,
+                                DataT* predictions,
+                                int num_outputs,
+                                rapids_logger::level_enum verbosity,
+                                cudaStream_t stream)
   {
     RAFT_CUDA_TRY(cudaSetDevice(handle.get_device()));
-    auto stream = handle.get_stream();
 
     IdxT n_classes = 0; // Dummy variable, not used in prediction
     rmm::device_uvector<IdxT> d_row_ids(0, stream);
@@ -499,6 +525,10 @@ template void SPORFDecisionTree::predict<float, int, int>(const raft::handle_t&,
 template void SPORFDecisionTree::predict<double, int, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
 template void SPORFDecisionTree::predict<float, float, int>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
 template void SPORFDecisionTree::predict<double, double, int>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<float, int, int>(const raft::handle_t&, const TreeMetaDataNode<float,int>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum, cudaStream_t);
+template void SPORFDecisionTree::predict<double, int, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, cudaStream_t);
+template void SPORFDecisionTree::predict<float, float, int>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum, cudaStream_t);
+template void SPORFDecisionTree::predict<double, double, int>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, cudaStream_t);
 
 template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_projection_kernel(

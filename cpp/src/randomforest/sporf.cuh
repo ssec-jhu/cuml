@@ -32,12 +32,16 @@
 #include <rmm/device_uvector.hpp>
 
 #include <thrust/execution_policy.h>
+#include <thrust/for_each.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
 
 #include <decisiontree/batched-levelalgo/quantiles.cuh>
 #include <decisiontree/decisiontree.cuh>
 #include <decisiontree/sporfdecisiontree.cuh>
 #include <decisiontree/treelite_util.h>
+#include <algorithm>
+#include <deque>
 #include <vector>
 
 #ifdef _OPENMP
@@ -50,6 +54,42 @@
 #include <map>
 
 namespace ML {
+
+template <typename T, typename L>
+__global__ void finalize_rf_predictions_kernel(const T* d_probs,
+                                               int n_rows,
+                                               int num_outputs,
+                                               int rf_type,
+                                               L* d_predictions)
+{
+  int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (row >= n_rows) { return; }
+  if (num_outputs <= 0) { return; }
+
+  if (rf_type == RF_type::CLASSIFICATION) {
+    int row_base = row * num_outputs;
+    int best_k   = 0;
+    T best_prob  = d_probs[row_base];
+    for (int k = 1; k < num_outputs; k++) {
+      T p = d_probs[row_base + k];
+      if (p > best_prob) {
+        best_prob = p;
+        best_k    = k;
+      }
+    }
+    d_predictions[row] = static_cast<L>(best_k);
+  } else {
+    d_predictions[row] = static_cast<L>(d_probs[row * num_outputs]);
+  }
+}
+
+template <typename T>
+__global__ void add_prediction_buffers_kernel(T* d_dst, const T* d_src, std::size_t n)
+{
+  auto i = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n) { return; }
+  d_dst[i] += d_src[i];
+}
 
   /*
   * Extended implementation of cuml RandomForest class.
@@ -230,11 +270,31 @@ class SPORF {
     ML::default_logger().set_level(verbosity);
     this->error_checking(input, predictions, n_rows, n_cols, true);
     cudaStream_t stream = user_handle.get_stream();
-    RAFT_CUDA_TRY(cudaMemsetAsync(predictions, 0, sizeof(L) * n_rows, stream));
 
     rmm::device_uvector<T> d_prediction_buffer(n_rows * forest->trees[0]->num_outputs, stream);
     RAFT_CUDA_TRY(cudaMemsetAsync(
       d_prediction_buffer.data(), 0, sizeof(T) * d_prediction_buffer.size(), stream));
+
+    int predict_streams = 1;
+    int pool_streams    = static_cast<int>(user_handle.get_stream_pool_size());
+    if (pool_streams > 0) {
+      predict_streams = std::min(4, std::min(pool_streams, this->rf_params.n_trees));
+    }
+
+    std::vector<cudaStream_t> tree_streams;
+    std::deque<rmm::device_uvector<T>> stream_prediction_buffers;
+    if (predict_streams > 1) {
+      tree_streams.reserve(predict_streams);
+      for (int s = 0; s < predict_streams; s++) {
+        auto tree_stream = user_handle.get_stream_from_stream_pool(s);
+        tree_streams.push_back(tree_stream);
+        stream_prediction_buffers.emplace_back(d_prediction_buffer.size(), tree_stream);
+        RAFT_CUDA_TRY(cudaMemsetAsync(stream_prediction_buffers.back().data(),
+                                      0,
+                                      sizeof(T) * stream_prediction_buffers.back().size(),
+                                      tree_stream));
+      }
+    }
 
     // TODO(sporf): Predict now expects column-major GPU input for classifier path.
     // Regressor CPU predict path still packs X as row-major ('C') in sporfregressor.pyx
@@ -246,6 +306,9 @@ class SPORF {
 
     default_logger().set_pattern("%v");
     for (int i = 0; i < this->rf_params.n_trees; i++) {
+      int sid = (predict_streams > 1) ? (i % predict_streams) : 0;
+      auto out_ptr = (predict_streams > 1) ? stream_prediction_buffers[sid].data() : d_prediction_buffer.data();
+      auto pred_stream = (predict_streams > 1) ? tree_streams[sid] : stream;
       DT::SPORFDecisionTree::predict(user_handle,
         *forest->trees[i],
         this->rf_params.tree_params.max_batch_size,
@@ -253,36 +316,34 @@ class SPORF {
         n_rows,
         n_cols,
         1.0 / this->rf_params.n_trees,  // scale (accumulate unscaled; normalize later)
-        d_prediction_buffer.data(),
+        out_ptr,
         forest->trees[i]->num_outputs,
-        verbosity);
+        verbosity,
+        pred_stream);
     }
 
-    user_handle.sync_stream(stream);
-    // Copy averaged predictions back to host to select class / return regression value
-    std::vector<T> h_probs(std::size_t(n_rows) * forest->trees[0]->num_outputs);
-    raft::update_host(h_probs.data(), d_prediction_buffer.data(), h_probs.size(), stream);
-    user_handle.sync_stream(stream);
-
-    std::vector<L> h_predictions(n_rows);
-    for (int row_id = 0; row_id < n_rows; row_id++) {
-      if (rf_type == RF_type::CLASSIFICATION) {
-        L best_class = 0;
-        T best_prob  = 0.0;
-        for (int k = 0; k < forest->trees[0]->num_outputs; k++) {
-          T p = h_probs[row_id * forest->trees[0]->num_outputs + k];
-          if (p > best_prob) {
-            best_class = k;
-            best_prob  = p;
-          }
-        }
-        h_predictions[row_id] = best_class;
-      } else {
-        h_predictions[row_id] = h_probs[row_id * forest->trees[0]->num_outputs];
+    if (predict_streams > 1) {
+      user_handle.sync_stream_pool();
+      constexpr int TPB = 256;
+      auto n = d_prediction_buffer.size();
+      dim3 block(TPB);
+      dim3 grid((n + TPB - 1) / TPB);
+      for (int s = 0; s < predict_streams; s++) {
+        add_prediction_buffers_kernel<T><<<grid, block, 0, stream>>>(
+          d_prediction_buffer.data(), stream_prediction_buffers[s].data(), n);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
       }
     }
 
-    raft::update_device(predictions, h_predictions.data(), n_rows, stream);
+    {
+      constexpr int TPB = 256;
+      int num_outputs = forest->trees[0]->num_outputs;
+      dim3 block(TPB);
+      dim3 grid((n_rows + TPB - 1) / TPB);
+      finalize_rf_predictions_kernel<T, L><<<grid, block, 0, stream>>>(
+        d_prediction_buffer.data(), n_rows, num_outputs, rf_type, predictions);
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    }
     user_handle.sync_stream(stream);
     default_logger().set_pattern(default_pattern());
   }
