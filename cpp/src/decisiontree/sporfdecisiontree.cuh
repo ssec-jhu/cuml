@@ -178,7 +178,9 @@ class SPORFPredictNodeQueue {
           block_task->count,                                 // thread_local_begin
           static_cast<IdxT>(projection_matrices.size() - 1), // payload_idx
           0,                                                 // nLeft, to be updated by projection/count kernel
-          0                                                  // nRight, to be updated by projection/count kernel
+          0,                                                 // nRight, to be updated by projection/count kernel
+          0,                                                 // loff, to be updated by offset scan kernel
+          0                                                  // roff, to be updated by offset scan kernel
         });
 
         auto* chunk = &chunks.back();
@@ -433,7 +435,6 @@ __global__ void batched_projection_kernel(
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,           // projected output buffer
@@ -450,7 +451,6 @@ void launch_batched_projection_kernel(
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,
@@ -461,9 +461,10 @@ void launch_batched_projection_kernel(
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
 DI void partition_samples2(
   const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
+  // const SPORFDT::NodeWorkItem* const d_work_items,
+  // IdxT n_work_items,
   DT::Split<DataT, int>* d_out_splits,
+  NodeWorkItemChunk<IdxT>* d_chunks,
   BlockTask<IdxT>* d_block_tasks,
   IdxT n_block_tasks,
   char* smem
@@ -472,9 +473,11 @@ DI void partition_samples2(
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
 void launch_partition_samples2(
   const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
+  // const SPORFDT::NodeWorkItem* const d_work_items,
+  // IdxT n_work_items,
   DT::Split<DataT, int>* d_out_splits,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
   BlockTask<IdxT>* d_block_tasks,
   IdxT n_block_tasks,
   cudaStream_t stream

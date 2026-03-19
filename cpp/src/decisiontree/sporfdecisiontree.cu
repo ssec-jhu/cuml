@@ -2,6 +2,7 @@
 #include "sporfdecisiontree.cuh"               // class/decl
 #include <cub/cub.cuh>
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
+#include <thrust/scan.h>
 #include <raft/linalg/transpose.cuh>                      // for transposing input data
 #include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
 // pull in the device definitions but skip the explicit instantiations to avoid
@@ -22,7 +23,6 @@ __global__ void batched_projection_kernel(const DataT* d_input_col_major,
                                           const ProjectionMatrix<DataT, int>* d_proj_mats,
                                           IdxT n_proj_mats,
                                           NodeWorkItemChunk<IdxT>* d_chunks,
-                                          IdxT n_chunks,
                                           const BlockTask<int>* d_block_tasks,
                                           IdxT n_block_tasks,
                                           DataT* d_out_col_major,
@@ -37,7 +37,6 @@ void launch_batched_projection_kernel(const DataT* d_input_col_major,
                                       const ProjectionMatrix<DataT, int>* d_proj_mats,
                                       IdxT n_proj_mats,
                                       NodeWorkItemChunk<IdxT>* d_chunks,
-                                      IdxT n_chunks,
                                       const BlockTask<int>* d_block_tasks,
                                       IdxT n_block_tasks,
                                       DataT* d_out_col_major,
@@ -53,6 +52,211 @@ __global__ void partition_kernel(const Dataset<DataT, LabelT, IdxT> dataset,
       split_quesval, split_colid, split_best_metric_val, static_cast<IdxT>(work_item.nLeft)};
     extern __shared__ char smem[];
     SPORFDT::partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, smem);
+}
+
+template <typename DataT, typename IdxT>
+__global__ void batched_partition_kernel(const IdxT* d_row_ids_in,
+                                         IdxT* d_row_ids_out,
+                                         const DataT* d_out_col_major,
+                                         IdxT out_ld,
+                                         const SPORFDT::NodeWorkItem* d_work_items,
+                                         const Split<DataT, int>* d_splits,
+                                         const NodeWorkItemChunk<IdxT>* d_chunks,
+                                         const BlockTask<int>* d_block_tasks,
+                                         IdxT n_block_tasks,
+                                         IdxT n_proj_mats)
+{
+  auto block_id = static_cast<IdxT>(blockIdx.x);
+  if (block_id >= n_block_tasks) { return; }
+
+  auto tid = static_cast<IdxT>(threadIdx.x);
+  auto task = d_block_tasks[block_id];
+  bool active = tid < task.count;
+
+  __shared__ int s_is_left[BLOCK_TASK_SIZE];
+  __shared__ IdxT s_chunk_begin[BLOCK_TASK_SIZE];
+  __shared__ IdxT s_local_left_rank[BLOCK_TASK_SIZE];
+
+  NodeWorkItemChunk<IdxT> chunk{};
+  IdxT slot_local = 0;
+  IdxT payload_id = 0;
+  IdxT node_begin = 0;
+  IdxT node_count = 0;
+  IdxT split_nleft = 0;
+  IdxT row_pos = 0;
+  bool lane_valid = false;
+  bool is_left = false;
+  DataT split_quesval = DataT(0);
+
+  if (active) {
+    chunk = d_chunks[task.work_item_chunk_ids[tid]];
+    slot_local = tid - chunk.thread_local_begin;
+    payload_id = chunk.payload_idx;
+    s_chunk_begin[tid] = chunk.thread_local_begin;
+
+    if (slot_local < chunk.instances_count && payload_id < n_proj_mats) {
+      auto work_item = d_work_items[chunk.work_item_idx];
+      node_begin = static_cast<IdxT>(work_item.instances.begin);
+      node_count = static_cast<IdxT>(work_item.instances.count);
+      row_pos = chunk.instances_begin + slot_local;
+
+      if (row_pos < node_begin + node_count && row_pos < out_ld) {
+        auto split = d_splits[payload_id];
+        split_nleft = static_cast<IdxT>(split.nLeft);
+        split_quesval = split.quesval;
+        DataT projected = d_out_col_major[row_pos];
+        is_left = projected <= split_quesval;
+        lane_valid = true;
+      }
+    }
+  }
+
+  if (active) {
+    s_is_left[tid] = (lane_valid && is_left) ? 1 : 0;
+  }
+  __syncthreads();
+
+  // Build per-slot left rank once per block (segments are chunk-contiguous by Pop() contract).
+  if (tid == 0) {
+    IdxT run = 0;
+    for (IdxT j = 0; j < task.count; j++) {
+      if (j == s_chunk_begin[j]) { run = 0; }
+      s_local_left_rank[j] = run;
+      run += static_cast<IdxT>(s_is_left[j]);
+    }
+  }
+  __syncthreads();
+
+  if (!active || !lane_valid) { return; }
+
+  IdxT local_left_rank = s_local_left_rank[tid];
+  IdxT local_right_rank = slot_local - local_left_rank;
+  IdxT dst_pos = is_left ? (node_begin + chunk.loff + local_left_rank)
+                         : (node_begin + split_nleft + chunk.roff + local_right_rank);
+  if (dst_pos >= node_begin + node_count) { return; }
+
+  d_row_ids_out[dst_pos] = d_row_ids_in[row_pos];
+}
+
+template <typename DataT, typename IdxT>
+void launch_batched_partition_kernel(const IdxT* d_row_ids_in,
+                                     IdxT* d_row_ids_out,
+                                     const DataT* d_out_col_major,
+                                     IdxT out_ld,
+                                     const SPORFDT::NodeWorkItem* d_work_items,
+                                     const Split<DataT, int>* d_splits,
+                                     const NodeWorkItemChunk<IdxT>* d_chunks,
+                                     const BlockTask<int>* d_block_tasks,
+                                     IdxT n_block_tasks,
+                                     IdxT n_proj_mats,
+                                     cudaStream_t stream)
+{
+  dim3 block(BLOCK_TASK_SIZE);
+  dim3 grid(n_block_tasks);
+  batched_partition_kernel<DataT, IdxT><<<grid, block, 0, stream>>>(d_row_ids_in,
+                                                                     d_row_ids_out,
+                                                                     d_out_col_major,
+                                                                     out_ld,
+                                                                     d_work_items,
+                                                                     d_splits,
+                                                                     d_chunks,
+                                                                     d_block_tasks,
+                                                                     n_block_tasks,
+                                                                     n_proj_mats);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename IdxT>
+__global__ void batched_copyback_kernel(const IdxT* d_row_ids_src,
+                                        IdxT* d_row_ids_dst,
+                                        const NodeWorkItemChunk<IdxT>* d_chunks,
+                                        const BlockTask<int>* d_block_tasks,
+                                        IdxT n_block_tasks,
+                                        IdxT out_ld)
+{
+  auto block_id = static_cast<IdxT>(blockIdx.x);
+  if (block_id >= n_block_tasks) { return; }
+
+  auto tid = static_cast<IdxT>(threadIdx.x);
+  auto task = d_block_tasks[block_id];
+  if (tid >= task.count) { return; }
+
+  auto chunk = d_chunks[task.work_item_chunk_ids[tid]];
+  auto slot_local = tid - chunk.thread_local_begin;
+  if (slot_local >= chunk.instances_count) { return; }
+
+  auto row_pos = chunk.instances_begin + slot_local;
+  if (row_pos >= out_ld) { return; }
+
+  d_row_ids_dst[row_pos] = d_row_ids_src[row_pos];
+}
+
+template <typename IdxT>
+void launch_batched_copyback_kernel(const IdxT* d_row_ids_src,
+                                    IdxT* d_row_ids_dst,
+                                    const NodeWorkItemChunk<IdxT>* d_chunks,
+                                    const BlockTask<int>* d_block_tasks,
+                                    IdxT n_block_tasks,
+                                    IdxT out_ld,
+                                    cudaStream_t stream)
+{
+  dim3 block(BLOCK_TASK_SIZE);
+  dim3 grid(n_block_tasks);
+  batched_copyback_kernel<IdxT><<<grid, block, 0, stream>>>(d_row_ids_src,
+                                                             d_row_ids_dst,
+                                                             d_chunks,
+                                                             d_block_tasks,
+                                                             n_block_tasks,
+                                                             out_ld);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename DataT, typename IdxT>
+__global__ void accumulate_predictions_by_row_kernel(const IdxT* d_prediction_leaves,
+                                                     const DataT* d_vector_leaf,
+                                                     IdxT n_rows,
+                                                     int num_outputs,
+                                                     double scale,
+                                                     DataT* predictions)
+{
+  auto row = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (row >= n_rows) { return; }
+
+  auto leaf_id = d_prediction_leaves[row];
+  auto pred_base = row * static_cast<IdxT>(num_outputs);
+  auto leaf_base = leaf_id * static_cast<IdxT>(num_outputs);
+  DataT scale_t = static_cast<DataT>(scale);
+
+  for (int j = 0; j < num_outputs; j++) {
+    predictions[pred_base + static_cast<IdxT>(j)] += d_vector_leaf[leaf_base + static_cast<IdxT>(j)] * scale_t;
+  }
+}
+
+template <typename IdxT>
+__global__ void pack_chunk_scan_inputs(const NodeWorkItemChunk<IdxT>* d_chunks,
+                                       IdxT n_chunks,
+                                       IdxT* d_work_item_ids,
+                                       IdxT* d_nleft,
+                                       IdxT* d_nright)
+{
+  auto i = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n_chunks) { return; }
+  auto c = d_chunks[i];
+  d_work_item_ids[i] = c.work_item_idx;
+  d_nleft[i]         = c.nLeft;
+  d_nright[i]        = c.nRight;
+}
+
+template <typename IdxT>
+__global__ void unpack_chunk_scan_outputs(NodeWorkItemChunk<IdxT>* d_chunks,
+                                          IdxT n_chunks,
+                                          const IdxT* d_loff,
+                                          const IdxT* d_roff)
+{
+  auto i = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= n_chunks) { return; }
+  d_chunks[i].loff = d_loff[i];
+  d_chunks[i].roff = d_roff[i];
 }
 
 // Template definition moved from the header
@@ -72,41 +276,33 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     auto stream = handle.get_stream();
 
     IdxT n_classes = 0; // Dummy variable, not used in prediction
-    rmm::device_uvector<IdxT> row_ids(0, stream);
+    rmm::device_uvector<IdxT> d_row_ids(0, stream);
+    rmm::device_uvector<IdxT> d_row_ids_scratch(0, stream);
     rmm::device_uvector<DataT> d_trans(0, stream);
-    rmm::device_uvector<SparseTreeNode<DataT, LabelT>> d_sparsetree(0, stream);
 
     size_t req_bytes     = n_rows * sizeof(IdxT);
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
     size_t aligned_elems = aligned_bytes / sizeof(IdxT);
-    row_ids.resize(aligned_elems, stream);
+    d_row_ids.resize(aligned_elems, stream);
+    d_row_ids_scratch.resize(aligned_elems, stream);
 
     req_bytes     = n_rows * sizeof(DataT);
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(DataT);
     d_trans.resize(aligned_elems, stream);
 
-    req_bytes     = tree.sparsetree.size() * sizeof(SparseTreeNode<DataT, LabelT>);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(SparseTreeNode<DataT, LabelT>);
-    d_sparsetree.resize(aligned_elems, stream);
-    raft::update_device(d_sparsetree.data(), tree.sparsetree.data(), tree.sparsetree.size(), stream);
-
-    // TODO: refactor out d_nodes since d_splits is necessary and sufficient
-    rmm::device_uvector<SparseTreeNode<DataT, LabelT>> d_nodes(0, stream);
     rmm::device_uvector<SPORFDT::NodeWorkItem>         d_work_items(0, stream);
     rmm::device_uvector<ProjectionMatrix<DataT, int>>  d_projection_matrices(0, stream);
     rmm::device_uvector<Split<DataT, int>>             d_splits(0, stream);
-    rmm::device_uvector<NodeWorkItemChunk<IdxT>>        d_chunks(0, stream);
+    rmm::device_uvector<NodeWorkItemChunk<IdxT>>       d_chunks(0, stream);
     rmm::device_uvector<BlockTask<int>>                d_block_tasks(0, stream);
+    rmm::device_uvector<IdxT>                          d_chunk_work_item_ids(0, stream);
+    rmm::device_uvector<IdxT>                          d_chunk_nleft(0, stream);
+    rmm::device_uvector<IdxT>                          d_chunk_nright(0, stream);
+    rmm::device_uvector<IdxT>                          d_chunk_loff(0, stream);
+    rmm::device_uvector<IdxT>                          d_chunk_roff(0, stream);
 
     // TODO: revisit these heuristics
-    req_bytes     = tree.sparsetree.size() * sizeof(SparseTreeNode<DataT, LabelT>);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(SparseTreeNode<DataT, LabelT>);
-    d_nodes.resize(aligned_elems, stream);
-    raft::update_device(d_nodes.data(), tree.sparsetree.data(), tree.sparsetree.size(), stream);
-
     req_bytes     = n_rows * sizeof(SPORFDT::NodeWorkItem); // heuristic for max work items needed at once
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(SPORFDT::NodeWorkItem);
@@ -127,12 +323,21 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(NodeWorkItemChunk<IdxT>);
     d_chunks.resize(aligned_elems, stream);
 
+    req_bytes     = n_rows * sizeof(IdxT); // temp storage for segmented scans over chunks
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(IdxT);
+    d_chunk_work_item_ids.resize(aligned_elems, stream);
+    d_chunk_nleft.resize(aligned_elems, stream);
+    d_chunk_nright.resize(aligned_elems, stream);
+    d_chunk_loff.resize(aligned_elems, stream);
+    d_chunk_roff.resize(aligned_elems, stream);
+
     req_bytes     = (n_rows / 2) * sizeof(BlockTask<int>); // heuristic for max block tasks needed at once
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(BlockTask<int>);
     d_block_tasks.resize(aligned_elems, stream);
 
-    thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
+    thrust::sequence(thrust::cuda::par.on(stream), d_row_ids.begin(), d_row_ids.begin() + n_rows, 0);
     Dataset<DataT, LabelT, IdxT> dataset = {
       d_trans.data(),         // projected data (single column)
       nullptr,                // labels (unused in predict)
@@ -140,7 +345,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       static_cast<IdxT>(1),   // N = number of projected columns
       static_cast<IdxT>(n_rows),
       static_cast<IdxT>(1),
-      row_ids.data(),
+      d_row_ids.data(),
       n_classes
     };
 
@@ -163,12 +368,63 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                                               d_projection_matrices.data(),
                                                               static_cast<IdxT>(projection_matrices.size()),
                                                               d_chunks.data(),
-                                                              static_cast<IdxT>(chunks.size()),
                                                               d_block_tasks.data(),
                                                               static_cast<IdxT>(block_tasks.size()),
                                                               d_trans.data(),
                                                               static_cast<IdxT>(dataset.M),
                                                               stream);
+      }
+
+      if (!chunks.empty()) {
+        constexpr int TPB_SCAN = 256;
+        auto n_chunks = static_cast<IdxT>(chunks.size());
+        dim3 block(TPB_SCAN);
+        dim3 grid((n_chunks + TPB_SCAN - 1) / TPB_SCAN);
+
+        pack_chunk_scan_inputs<IdxT><<<grid, block, 0, stream>>>(d_chunks.data(),
+                                                                  n_chunks,
+                                                                  d_chunk_work_item_ids.data(),
+                                                                  d_chunk_nleft.data(),
+                                                                  d_chunk_nright.data());
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        thrust::exclusive_scan_by_key(thrust::cuda::par.on(stream),
+                                      d_chunk_work_item_ids.begin(),
+                                      d_chunk_work_item_ids.begin() + n_chunks,
+                                      d_chunk_nleft.begin(),
+                                      d_chunk_loff.begin());
+        thrust::exclusive_scan_by_key(thrust::cuda::par.on(stream),
+                                      d_chunk_work_item_ids.begin(),
+                                      d_chunk_work_item_ids.begin() + n_chunks,
+                                      d_chunk_nright.begin(),
+                                      d_chunk_roff.begin());
+
+        unpack_chunk_scan_outputs<IdxT><<<grid, block, 0, stream>>>(d_chunks.data(),
+                                                                     n_chunks,
+                                                                     d_chunk_loff.data(),
+                                                                     d_chunk_roff.data());
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+      }
+
+      if (!block_tasks.empty()) {
+        launch_batched_partition_kernel<DataT, IdxT>(d_row_ids.data(),
+                                                     d_row_ids_scratch.data(),
+                                                     d_trans.data(),
+                                                     static_cast<IdxT>(dataset.M),
+                                                     d_work_items.data(),
+                                                     d_splits.data(),
+                                                     d_chunks.data(),
+                                                     d_block_tasks.data(),
+                                                     static_cast<IdxT>(block_tasks.size()),
+                                                     static_cast<IdxT>(projection_matrices.size()),
+                                                     stream);
+        launch_batched_copyback_kernel<IdxT>(d_row_ids_scratch.data(),
+                                             d_row_ids.data(),
+                                             d_chunks.data(),
+                                             d_block_tasks.data(),
+                                             static_cast<IdxT>(block_tasks.size()),
+                                             static_cast<IdxT>(dataset.M),
+                                             stream);
       }
 
       if (!splits.empty()) {
@@ -178,21 +434,13 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
 
       // Split entries are ordered by the same non-leaf/non-empty visitation order as work_items.
       size_t split_idx = 0;
-      for(unsigned long i = 0; i < work_items.size(); i++) {
+      for (size_t i = 0; i < work_items.size(); i++) {
         auto& work_item = work_items[i];
-        auto& begin = work_item.instances.begin;
-        auto& count = work_item.instances.count;
         auto node = tree.sparsetree[work_item.idx];
-        if (node.IsLeaf() || count == 0) { continue; }
+        if (node.IsLeaf() || work_item.instances.count == 0) { continue; }
 
-        IdxT colid = 0;
         work_item.nLeft = static_cast<decltype(work_item.nLeft)>(splits[split_idx].nLeft);
         split_idx++;
-
-        partition_kernel<DataT, LabelT, IdxT> <<<1, TPB_DEFAULT, 2 * TPB_DEFAULT * sizeof(IdxT), stream>>>(
-          dataset, node.QueryValue(), colid, node.BestMetric(), work_item
-        );
-        RAFT_CUDA_TRY(cudaPeekAtLastError());
       }
 
       queue.Push(work_items);
@@ -215,7 +463,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     auto d_vector_leaf_ptr = d_vector_leaf.data();
     auto d_prediction_leaves_ptr = d_prediction_leaves.data();
 
-    // TODO: change this to iterate over rows instead of leaves
+    // Pass 1: build row -> leaf mapping.
     thrust::for_each(
       thrust::cuda::par.on(stream),
       thrust::make_counting_iterator<IdxT>(0),
@@ -225,11 +473,23 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         for (IdxT i = item.instances.begin; i < item.instances.begin + item.instances.count; i++) {
           IdxT row_id = dataset.row_ids[i];
           d_prediction_leaves_ptr[row_id] = item.idx; // Store the leaf index for each row
-          for (int j = 0; j < num_outputs; j++) {
-            predictions[row_id * num_outputs + j] += d_vector_leaf_ptr[item.idx * num_outputs + j] * scale; // Aggregate predictions (e.g., sum for regression)
-          }
         }
       });
+
+    // Pass 2: row-parallel prediction accumulation for coalesced output writes.
+    {
+      constexpr int TPB = 256;
+      dim3 block(TPB);
+      dim3 grid((static_cast<IdxT>(n_rows) + TPB - 1) / TPB);
+      accumulate_predictions_by_row_kernel<DataT, IdxT><<<grid, block, 0, stream>>>(
+        d_prediction_leaves_ptr,
+        d_vector_leaf_ptr,
+        static_cast<IdxT>(n_rows),
+        num_outputs,
+        scale,
+        predictions);
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    }
 
     // RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
   }
@@ -250,7 +510,6 @@ __global__ void batched_projection_kernel(
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,           // projected output buffer
@@ -332,7 +591,6 @@ void launch_batched_projection_kernel(
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
   NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,
@@ -352,7 +610,6 @@ void launch_batched_projection_kernel(
     d_proj_mats,
     n_proj_mats,
     d_chunks,
-    n_chunks,
     d_block_tasks,
     n_block_tasks,
     d_out_col_major,
@@ -371,9 +628,10 @@ void launch_batched_projection_kernel(
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
 DI void partition_samples2(
   const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
+  // const SPORFDT::NodeWorkItem* const d_work_items,
+  // IdxT n_work_items,
   DT::Split<DataT, int>* d_out_splits,
+  NodeWorkItemChunk<IdxT>* d_chunks,
   BlockTask<IdxT>* d_block_tasks,
   IdxT n_block_tasks,
   char* smem
@@ -428,22 +686,25 @@ DI void partition_samples2(
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
 void launch_partition_samples2(
   const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
+  // const SPORFDT::NodeWorkItem* const d_work_items,
+  // IdxT n_work_items,
   DT::Split<DataT, int>* d_out_splits,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
   BlockTask<IdxT>* d_block_tasks,
   IdxT n_block_tasks,
   cudaStream_t stream
 )
 {
-  dim3 block(TPB);
-  dim3 grid(1); // for first version, one block does the partition
-  size_t smem_size = 2 * TPB * sizeof(IdxT);
+  dim3 block(BLOCK_TASK_SIZE);  // or 128
+  dim3 grid(n_chunks); // for first version, one block does the partition
+  size_t smem_size = 2 * BLOCK_TASK_SIZE * sizeof(IdxT);
   partition_samples2<DataT, LabelT, IdxT, TPB><<<grid, block, smem_size, stream>>>(
     dataset,
-    d_work_items,
-    n_work_items,
+    // d_work_items,
+    // n_work_items,
     d_out_splits,
+    d_chunks,
     d_block_tasks,
     n_block_tasks,
     nullptr

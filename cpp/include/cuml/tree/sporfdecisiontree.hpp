@@ -56,6 +56,8 @@ struct NodeWorkItemChunk {
   IdxT payload_idx;        // index into array of chunk-specific task info (i.e. projection matrices, partition splits, etc) loaded for this batch
   IdxT nLeft;              // number of left child instances for this work item in this block
   IdxT nRight;             // number of right child instances for this work item in this block
+  IdxT loff;               // offset into the left child partition of the output row_id array for this block and node
+  IdxT roff;               // offset into the right child partition of the output row_id array for this block and node
 };
 
 template <typename IdxT = int>
