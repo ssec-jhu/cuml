@@ -1,5 +1,6 @@
 // sporfdecisiontree.cu
 #include "sporfdecisiontree.cuh"               // class/decl
+#include <cub/cub.cuh>
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
 #include <raft/linalg/transpose.cuh>                      // for transposing input data
 #include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
@@ -17,13 +18,12 @@ __global__ void batched_projection_kernel(const DataT* d_input_col_major,
                                           IdxT n_rows,
                                           IdxT n_cols,
                                           const IdxT* d_row_ids,
-                                          const SparseTreeNode<DataT, LabelT>* const d_nodes,
-                                          const NodeWorkItem* const d_work_items,
-                                          IdxT n_work_items,
                                           Split<DataT, int>* d_out_splits,
                                           const ProjectionMatrix<DataT, int>* d_proj_mats,
                                           IdxT n_proj_mats,
-                                          const BlockTask<IdxT>* d_block_tasks,
+                                          NodeWorkItemChunk<IdxT>* d_chunks,
+                                          IdxT n_chunks,
+                                          const BlockTask<int>* d_block_tasks,
                                           IdxT n_block_tasks,
                                           DataT* d_out_col_major,
                                           IdxT out_ld);
@@ -33,13 +33,12 @@ void launch_batched_projection_kernel(const DataT* d_input_col_major,
                                       IdxT n_rows,
                                       IdxT n_cols,
                                       const IdxT* d_row_ids,
-                                      const SparseTreeNode<DataT, LabelT>* const d_nodes,
-                                      const NodeWorkItem* const d_work_items,
-                                      IdxT n_work_items,
                                       Split<DataT, int>* d_out_splits,
                                       const ProjectionMatrix<DataT, int>* d_proj_mats,
                                       IdxT n_proj_mats,
-                                      const BlockTask<IdxT>* d_block_tasks,
+                                      NodeWorkItemChunk<IdxT>* d_chunks,
+                                      IdxT n_chunks,
+                                      const BlockTask<int>* d_block_tasks,
                                       IdxT n_block_tasks,
                                       DataT* d_out_col_major,
                                       IdxT out_ld,
@@ -50,15 +49,14 @@ __global__ void partition_kernel(const Dataset<DataT, LabelT, IdxT> dataset,
                                  DataT split_quesval, IdxT split_colid, DataT split_best_metric_val,
                                  const SPORFDT::NodeWorkItem work_item)
 {
-    Split<DataT, IdxT> split{split_quesval, split_colid, split_best_metric_val, work_item.nLeft};
-    // DT::InstanceRange instances{work_item.instances.begin, work_item.instances.count};
-    // DT::NodeWorkItem local_work_item{work_item.idx, work_item.depth, instances};
+    Split<DataT, IdxT> split{
+      split_quesval, split_colid, split_best_metric_val, static_cast<IdxT>(work_item.nLeft)};
     extern __shared__ char smem[];
     SPORFDT::partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, smem);
 }
 
 // Template definition moved from the header
-template <class DataT, class LabelT>
+template <typename DataT, typename LabelT, typename IdxT>
 void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 const TreeMetaDataNode<DataT, LabelT>& tree,
                                 std::size_t max_batch_size,
@@ -99,6 +97,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     rmm::device_uvector<SPORFDT::NodeWorkItem>         d_work_items(0, stream);
     rmm::device_uvector<ProjectionMatrix<DataT, int>>  d_projection_matrices(0, stream);
     rmm::device_uvector<Split<DataT, int>>             d_splits(0, stream);
+    rmm::device_uvector<NodeWorkItemChunk<IdxT>>        d_chunks(0, stream);
     rmm::device_uvector<BlockTask<int>>                d_block_tasks(0, stream);
 
     // TODO: revisit these heuristics
@@ -123,9 +122,14 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(Split<DataT, int>);
     d_splits.resize(aligned_elems, stream);
 
-    req_bytes     = (n_rows / 2) * sizeof(BlockTask<IdxT>); // heuristic for max block tasks needed at once
+    req_bytes     = n_rows * sizeof(NodeWorkItemChunk<IdxT>); // heuristic for max chunks needed at once
     aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(BlockTask<IdxT>);
+    aligned_elems = aligned_bytes / sizeof(NodeWorkItemChunk<IdxT>);
+    d_chunks.resize(aligned_elems, stream);
+
+    req_bytes     = (n_rows / 2) * sizeof(BlockTask<int>); // heuristic for max block tasks needed at once
+    aligned_bytes = calculateAlignedBytes(req_bytes);
+    aligned_elems = aligned_bytes / sizeof(BlockTask<int>);
     d_block_tasks.resize(aligned_elems, stream);
 
     thrust::sequence(thrust::cuda::par.on(stream), row_ids.begin(), row_ids.begin() + n_rows, 0);
@@ -143,10 +147,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     MLCommon::TimerCPU timer;
     SPORFPredictNodeQueue<DataT, int, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
-      auto [work_items, projection_matrices, splits, block_tasks] = queue.Pop();
+      auto [work_items, projection_matrices, splits, chunks, block_tasks] = queue.Pop();
       raft::update_device(d_work_items.data(), work_items.data(), work_items.size(), stream);
       raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
       raft::update_device(d_splits.data(), splits.data(), splits.size(), stream);
+      raft::update_device(d_chunks.data(), chunks.data(), chunks.size(), stream);
       raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
 
       if (!block_tasks.empty()) {
@@ -154,12 +159,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                                               static_cast<IdxT>(n_rows),
                                                               static_cast<IdxT>(n_cols),
                                                               dataset.row_ids,
-                                                              d_nodes.data(),
-                                                              d_work_items.data(),
-                                                              static_cast<IdxT>(work_items.size()),
                                                               d_splits.data(),
                                                               d_projection_matrices.data(),
                                                               static_cast<IdxT>(projection_matrices.size()),
+                                                              d_chunks.data(),
+                                                              static_cast<IdxT>(chunks.size()),
                                                               d_block_tasks.data(),
                                                               static_cast<IdxT>(block_tasks.size()),
                                                               d_trans.data(),
@@ -231,10 +235,10 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
   }
 
 // Explicit instantiations (match the combos you need)
-template void SPORFDecisionTree::predict<float, int>(const raft::handle_t&, const TreeMetaDataNode<float,int>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<double, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<float, float>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
-template void SPORFDecisionTree::predict<double, double>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<float, int, int>(const raft::handle_t&, const TreeMetaDataNode<float,int>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<double, int, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<float, float, int>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum);
+template void SPORFDecisionTree::predict<double, double, int>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum);
 
 template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_projection_kernel(
@@ -242,12 +246,11 @@ __global__ void batched_projection_kernel(
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,            // collated row-id map
-  const SparseTreeNode<DataT, LabelT>* const d_nodes,       // global tree nodes
-  const SPORFDT::NodeWorkItem* const d_work_items,       // work items for this batch
-  IdxT n_work_items,
   Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,           // projected output buffer
@@ -261,14 +264,15 @@ __global__ void batched_projection_kernel(
   auto task = d_block_tasks[block_id];
   if (tid >= task.count) { return; }
 
-  auto row_pos = task.row_ids_ids[tid];
-  auto proj_id = task.payload_ids[tid];
-  if (row_pos >= out_ld || proj_id >= n_proj_mats) { return; }
+  auto chunk = d_chunks[task.work_item_chunk_ids[tid]];
+  auto row_pos = chunk.instances_begin + (tid - chunk.thread_local_begin);
+  auto payload_id = chunk.payload_idx;
+  if (row_pos >= out_ld || payload_id >= n_proj_mats) { return; }
 
   auto row_id = d_row_ids[row_pos];
   if (row_id >= n_rows) { return; }
 
-  auto pm = d_proj_mats[proj_id];
+  auto pm = d_proj_mats[payload_id];
   for (IdxT comp = 0; comp < pm.n_proj_components; comp++) {
     int start = pm.d_proj_indptr[comp];
     int end = pm.d_proj_indptr[comp + 1];
@@ -285,41 +289,36 @@ __global__ void batched_projection_kernel(
 
   __syncthreads(); // ensure all threads in block have finished writing to output buffer before any thread in block can be reused for next task
 
-  if (tid == 0) {
+  if (tid == chunk.thread_local_begin) { // single thread per chunk to do the counting for that chunk's payload/split
     // Assumes SPORFPredictNodeQueue::Pop() guarantees:
     // 1) payload_ids are batch-local ids aligned with projection_matrices and splits,
     // 2) rows for each payload_id are appended contiguously in block-task order,
     // 3) row_ids_ids are collated positions into row_ids/output buffers.
     // See the Pop() contract comment in sporfdecisiontree.cuh.
     // With those guarantees, run-length counting here is linear in task.count.
-    IdxT curr_payload = static_cast<IdxT>(-1);
-    DataT curr_split = DataT(0);
+    IdxT curr_payload = chunk.payload_idx;
     IdxT curr_left_count = 0;
 
-    for (IdxT j = 0; j < task.count; j++) {
-      IdxT payload_id = static_cast<IdxT>(task.payload_ids[j]);
-      if (payload_id >= n_proj_mats) { continue; }
+    if(curr_payload < n_proj_mats) {
+      DataT curr_split = d_out_splits[curr_payload].quesval;
 
-      if (payload_id != curr_payload) {
-        if (curr_payload != static_cast<IdxT>(-1) && curr_left_count > 0) {
-          atomicAdd(&d_out_splits[curr_payload].nLeft, curr_left_count);
-        }
-        curr_payload = payload_id;
-        curr_left_count = 0;
-        curr_split = d_out_splits[curr_payload].quesval;
+      for (IdxT j = 0; j < chunk.instances_count; j++) {
+        IdxT row_pos_j = chunk.instances_begin + j;
+        if (row_pos_j >= out_ld) { continue; }
+
+        // Predict currently projects one component per work item (column 0).
+        DataT projected = d_out_col_major[row_pos_j];
+        if (projected <= curr_split) { curr_left_count++; }
       }
 
-      IdxT row_pos_j = static_cast<IdxT>(task.row_ids_ids[j]);
-      if (row_pos_j >= out_ld) { continue; }
-
-      // Predict currently projects one component per work item (column 0).
-      DataT projected = d_out_col_major[row_pos_j];
-      if (projected <= curr_split) { curr_left_count++; }
+      if (curr_left_count > 0) {
+        atomicAdd(&d_out_splits[curr_payload].nLeft, curr_left_count);
+      }
     }
 
-    if (curr_payload != static_cast<IdxT>(-1) && curr_left_count > 0) {
-      atomicAdd(&d_out_splits[curr_payload].nLeft, curr_left_count);
-    }
+    auto* p_chunk = &d_chunks[task.work_item_chunk_ids[tid]];
+    p_chunk->nLeft = curr_left_count; // also update chunk metadata for use in partitioning
+    p_chunk->nRight = chunk.instances_count - curr_left_count;
   }
 }
 
@@ -329,12 +328,11 @@ void launch_batched_projection_kernel(
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,
-  const SparseTreeNode<DataT, LabelT>* const d_nodes,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
   Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
   const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,
@@ -350,16 +348,105 @@ void launch_batched_projection_kernel(
     n_rows,
     n_cols,
     d_row_ids,
-    d_nodes,
-    d_work_items,
-    n_work_items,
     d_out_splits,
     d_proj_mats,
     n_proj_mats,
+    d_chunks,
+    n_chunks,
     d_block_tasks,
     n_block_tasks,
     d_out_col_major,
     out_ld
+  );
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+/**
+ * @brief Partition the samples to left/right nodes based on the best split
+ * @return the position of the left child node in the nodes list. However, this
+ *         value is valid only for threadIdx.x == 0.
+ * @note this should be called by only one block from all participating blocks
+ *       'smem' should be at least of size `sizeof(IdxT) * TPB * 2`
+ */
+template <typename DataT, typename LabelT, typename IdxT, int TPB>
+DI void partition_samples2(
+  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+  const SPORFDT::NodeWorkItem* const d_work_items,
+  IdxT n_work_items,
+  DT::Split<DataT, int>* d_out_splits,
+  BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  char* smem
+)
+{
+  typedef cub::BlockScan<int, TPB> BlockScanT;
+  __shared__ typename BlockScanT::TempStorage temp1, temp2;
+  volatile auto* row_ids = reinterpret_cast<volatile IdxT*>(dataset.row_ids);
+  // for compaction
+  // size_t smemSize  = sizeof(IdxT) * TPB;
+  // auto* lcomp      = reinterpret_cast<IdxT*>(smem);
+  // auto* rcomp      = reinterpret_cast<IdxT*>(smem + smemSize);
+  // auto range_start = work_item.instances.begin;
+  // auto range_len   = work_item.instances.count;
+  // auto* col        = dataset.data + split.colid * std::size_t(dataset.M);
+  // auto loffset = range_start, part = loffset + split.nLeft, roffset = part;
+  // auto end  = range_start + range_len;
+  // int lflag = 0, rflag = 0, llen = 0, rlen = 0, minlen = 0;
+  // auto tid = threadIdx.x;
+  // while (loffset < part && roffset < end) {
+  //   // find the samples in the left that belong to right and vice-versa
+  //   auto loff = loffset + tid, roff = roffset + tid;
+  //   // d_trans (dataset.data) is aligned with the current row ordering,
+  //   // so index by position within row_ids, not the raw row_id value.
+  //   if (llen == minlen) lflag = loff < part ? col[loff] > split.quesval : 0;
+  //   if (rlen == minlen) rflag = roff < end ? col[roff] <= split.quesval : 0;
+  //   // scan to compute the locations for each 'misfit' in the two partitions
+  //   int lidx, ridx;
+  //   BlockScanT(temp1).ExclusiveSum(lflag, lidx, llen);
+  //   BlockScanT(temp2).ExclusiveSum(rflag, ridx, rlen);
+  //   __syncthreads();
+  //   minlen = llen < rlen ? llen : rlen;
+  //   // compaction to figure out the right locations to swap
+  //   if (lflag) lcomp[lidx] = loff;
+  //   if (rflag) rcomp[ridx] = roff;
+  //   __syncthreads();
+  //   // reset the appropriate flags for the longer of the two
+  //   if (lidx < minlen) lflag = 0;
+  //   if (ridx < minlen) rflag = 0;
+  //   if (llen == minlen) loffset += TPB;
+  //   if (rlen == minlen) roffset += TPB;
+  //   // swap the 'misfit's
+  //   if (tid < minlen) {
+  //     auto a              = row_ids[lcomp[tid]];
+  //     auto b              = row_ids[rcomp[tid]];
+  //     row_ids[lcomp[tid]] = b;
+  //     row_ids[rcomp[tid]] = a;
+  //   }
+  // }
+}
+
+template <typename DataT, typename LabelT, typename IdxT, int TPB>
+void launch_partition_samples2(
+  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+  const SPORFDT::NodeWorkItem* const d_work_items,
+  IdxT n_work_items,
+  DT::Split<DataT, int>* d_out_splits,
+  BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  cudaStream_t stream
+)
+{
+  dim3 block(TPB);
+  dim3 grid(1); // for first version, one block does the partition
+  size_t smem_size = 2 * TPB * sizeof(IdxT);
+  partition_samples2<DataT, LabelT, IdxT, TPB><<<grid, block, smem_size, stream>>>(
+    dataset,
+    d_work_items,
+    n_work_items,
+    d_out_splits,
+    d_block_tasks,
+    n_block_tasks,
+    nullptr
   );
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }

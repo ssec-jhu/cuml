@@ -102,8 +102,8 @@ class SPORFPredictNodeQueue {
    *
    * Returns:
    * 1) `popped`: all dequeued work items (including leaves/empty nodes so queue semantics stay intact).
-   * 2) `projection_matrices`: one entry per non-leaf/non-empty work item in this batch.
-   * 3) `splits`: one entry per non-leaf/non-empty work item in this batch.
+   * 2) `projection_matrices`: payload-indexed projection metadata for non-leaf/non-empty work items.
+   * 3) `splits`: payload-indexed split metadata.
    * 4) `block_tasks`: fixed-size row chunks for batched projection/count kernels.
    *
    * Guarantees:
@@ -112,7 +112,11 @@ class SPORFPredictNodeQueue {
    * - `row_ids_ids` are collated positions (`instances.begin + local_row`) into dataset.row_ids
    *   and projected output buffers.
    * - `payload_ids` are batch-local ids into `projection_matrices` and `splits`.
+   * - When indexing into `projection_matrices`, `payload_ids` identifies projection payload (matrix), while projection dimension is `comp`
+   *   within that payload (`comp` in `[0, n_proj_components)`).
    * - `splits` are batch-local and initialized with `nLeft = 0`.
+   * - When indexing into `splits`, `split_id = payload_id * k + comp`, where `k` is projection output dimensionality.
+   * - Predict currently uses `k = 1`, assuming that at predict time the chosen projection dimension is known, so `split_id == payload_id`.
    */
   auto Pop()
   {
@@ -121,10 +125,12 @@ class SPORFPredictNodeQueue {
     std::vector<ProjectionMatrix<DataT, int>> projection_matrices;
     std::vector<Split<DataT, IdxT>> splits;
     std::vector<BlockTask<IdxT>> block_tasks;
+    std::vector<NodeWorkItemChunk<IdxT>> chunks;
     popped.reserve(std::min(max_batch_size, work_items_.size()));
     projection_matrices.reserve(std::min(max_batch_size, work_items_.size()));
     splits.reserve(std::min(max_batch_size, work_items_.size()));
     block_tasks.reserve(std::min(max_batch_size, work_items_.size()));
+    chunks.reserve(std::min(max_batch_size, work_items_.size()));
 
     while (work_items_.size() > 0 && total_rows < MIN_ROWS_PER_BATCH && popped.size() < max_batch_size) {
       // inline block so we can reuse the `work_item` identifier
@@ -155,20 +161,38 @@ class SPORFPredictNodeQueue {
         0
       });
 
-      for(size_t i = 0; i < work_item->instances.count; i++) {
+      for(IdxT threads_left = work_item->instances.count, instances_begin = work_item->instances.begin; threads_left > 0; ) {
         if(block_tasks.empty() || block_tasks.back().count == BLOCK_TASK_SIZE) {
           block_tasks.emplace_back(BlockTask{});
           block_tasks.back().count = 0;
         }
+
         auto* block_task = &block_tasks.back();
-        block_task->work_item_ids[block_task->count] = static_cast<IdxT>(popped.size() - 1);
-        block_task->row_ids_ids[block_task->count] = work_item->instances.begin + i;
-        block_task->payload_ids[block_task->count] = projection_matrices.size() - 1;
-        block_task->count++;
+        IdxT thread_count = std::min<IdxT>(BLOCK_TASK_SIZE - block_task->count, threads_left); // remaining thread capacity in current block task
+
+        chunks.emplace_back(NodeWorkItemChunk<IdxT>{
+          static_cast<IdxT>(popped.size() - 1),              // work_item_idx
+          instances_begin,                                   // instances_begin
+          thread_count,                                      // instances_count
+          static_cast<IdxT>(block_tasks.size() - 1),         // block_task_idx
+          block_task->count,                                 // thread_local_begin
+          static_cast<IdxT>(projection_matrices.size() - 1), // payload_idx
+          0,                                                 // nLeft, to be updated by projection/count kernel
+          0                                                  // nRight, to be updated by projection/count kernel
+        });
+
+        auto* chunk = &chunks.back();
+        for(IdxT i = chunk->thread_local_begin; i < chunk->thread_local_begin + chunk->instances_count; i++) {
+          block_task->work_item_chunk_ids[i] = chunks.size() - 1;
+        }
+
+        block_task->count += thread_count;
+        instances_begin += thread_count;
+        threads_left -= thread_count;
       }
     }
 
-    return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(splits), std::move(block_tasks));
+    return std::make_tuple(std::move(popped), std::move(projection_matrices), std::move(splits), std::move(chunks), std::move(block_tasks));
   }
 
   void Push(const std::vector<NodeWorkItem>& work_items)
@@ -327,7 +351,7 @@ class SPORFDecisionTree {
     return raft::alignTo(actual_size, align);
   }
 
-  template <class DataT, class LabelT>
+  template <typename DataT, typename LabelT, typename IdxT = int>
   static void predict(const raft::handle_t& handle,
                       const TreeMetaDataNode<DataT, LabelT>& tree,
                       size_t max_batch_size,
@@ -405,13 +429,12 @@ __global__ void batched_projection_kernel(
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,            // collated row-id map
-  const SparseTreeNode<DataT, LabelT>* const d_nodes,       // global tree nodes
-  const SPORFDT::NodeWorkItem* const d_work_items,       // work items for this batch
-  IdxT n_work_items,
   Split<DataT, int>* d_out_splits,              // output buffer for left child instance counts (used for partitioning), index-aligned with work items for this batch, strided by ProjectionMatrix.n_proj_components
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
-  const BlockTask<IdxT>* d_block_tasks,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
+  const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,           // projected output buffer
   IdxT out_ld                        // usually n_rows
@@ -423,19 +446,39 @@ void launch_batched_projection_kernel(
   IdxT n_rows,
   IdxT n_cols,
   const IdxT* d_row_ids,
-  const SparseTreeNode<DataT, LabelT>* const d_nodes,
-  const SPORFDT::NodeWorkItem* const d_work_items,
-  IdxT n_work_items,
   Split<DataT, int>* d_out_splits,
   const ProjectionMatrix<DataT, int>* d_proj_mats,
   IdxT n_proj_mats,
-  const BlockTask<IdxT>* d_block_tasks,
+  NodeWorkItemChunk<IdxT>* d_chunks,
+  IdxT n_chunks,
+  const BlockTask<int>* d_block_tasks,
   IdxT n_block_tasks,
   DataT* d_out_col_major,
   IdxT out_ld,
   cudaStream_t stream
 );
 
+template <typename DataT, typename LabelT, typename IdxT, int TPB>
+DI void partition_samples2(
+  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+  const SPORFDT::NodeWorkItem* const d_work_items,
+  IdxT n_work_items,
+  DT::Split<DataT, int>* d_out_splits,
+  BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  char* smem
+);
+
+template <typename DataT, typename LabelT, typename IdxT, int TPB>
+void launch_partition_samples2(
+  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+  const SPORFDT::NodeWorkItem* const d_work_items,
+  IdxT n_work_items,
+  DT::Split<DataT, int>* d_out_splits,
+  BlockTask<IdxT>* d_block_tasks,
+  IdxT n_block_tasks,
+  cudaStream_t stream
+);
 // Class specializations
 /*template tl::Tree<float, float> build_treelite_tree<float, int>(
   const DT::TreeMetaDataNode<float, int>& rf_tree, unsigned int num_class);

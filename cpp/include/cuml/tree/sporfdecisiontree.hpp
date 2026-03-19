@@ -45,12 +45,23 @@ struct ProjectionMatrix {
 };
 
 static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads per block for GPU kernels
+
+template <typename IdxT = int>
+struct NodeWorkItemChunk {
+  IdxT work_item_idx;      // index into the batch of work items for this level of the tree
+  IdxT instances_begin;    // start of indices into dataset.row_ids for this block and node
+  IdxT instances_count;    // number of indices into dataset.row_ids for this block and node
+  IdxT block_task_idx;     // index into the batch of block tasks for this level of the tree
+  IdxT thread_local_begin; // starting thread index within this block doing work on this node
+  IdxT payload_idx;        // index into array of chunk-specific task info (i.e. projection matrices, partition splits, etc) loaded for this batch
+  IdxT nLeft;              // number of left child instances for this work item in this block
+  IdxT nRight;             // number of right child instances for this work item in this block
+};
+
 template <typename IdxT = int>
 struct BlockTask {
-  IdxT work_item_ids[BLOCK_TASK_SIZE]; // index into batch of work items (node splits) assigned to this block
-  IdxT row_ids_ids[BLOCK_TASK_SIZE]; // raw position in row_ids (equivalent to node.instances.begin + i, where i is in [0...node.instances.count])
-  IdxT count;                        // number of rows in this block, in [0...BLOCK_TASK_SIZE]
-  IdxT payload_ids[BLOCK_TASK_SIZE];    // index into array of thread-specific task info (i.e. projection matrices, partition splits, etc) loaded for this batch
+  IdxT work_item_chunk_ids[BLOCK_TASK_SIZE]; // index into the batch of work item chunks for this level of the tree
+  IdxT count;                                // number of rows in this block, in [0...BLOCK_TASK_SIZE]
 };
 
 
