@@ -2,6 +2,8 @@
 #include "sporfdecisiontree.cuh"               // class/decl
 #include <cub/cub.cuh>
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
+#include <chrono>
+#include <tuple>
 #include <thrust/scan.h>
 #include <raft/linalg/transpose.cuh>                      // for transposing input data
 #include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
@@ -259,6 +261,32 @@ __global__ void unpack_chunk_scan_outputs(NodeWorkItemChunk<IdxT>* d_chunks,
   d_chunks[i].roff = d_roff[i];
 }
 
+template <typename IdxT>
+__global__ void compute_chunk_offsets_kernel(NodeWorkItemChunk<IdxT>* d_chunks, IdxT n_chunks)
+{
+  // Predict batches typically have modest chunk counts; one-thread linear pass avoids
+  // multi-kernel + scan-by-key launch overhead and writes offsets directly in-place.
+  if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+  if (n_chunks <= 0) { return; }
+
+  IdxT curr_work_item = d_chunks[0].work_item_idx;
+  IdxT loff = 0;
+  IdxT roff = 0;
+
+  for (IdxT i = 0; i < n_chunks; i++) {
+    auto c = d_chunks[i];
+    if (i == 0 || c.work_item_idx != curr_work_item) {
+      curr_work_item = c.work_item_idx;
+      loff = 0;
+      roff = 0;
+    }
+    d_chunks[i].loff = loff;
+    d_chunks[i].roff = roff;
+    loff += c.nLeft;
+    roff += c.nRight;
+  }
+}
+
 // Template definition moved from the header
 template <typename DataT, typename LabelT, typename IdxT>
 void SPORFDecisionTree::predict(const raft::handle_t& handle,
@@ -300,6 +328,44 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 cudaStream_t stream)
   {
     RAFT_CUDA_TRY(cudaSetDevice(handle.get_device()));
+    const bool do_timing = ML::default_logger().should_log(rapids_logger::level_enum::debug);
+    using clock_t = std::chrono::steady_clock;
+    auto to_ms = [](clock_t::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
+
+    cudaEvent_t ev_stage_start{}, ev_stage_stop{};
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_stage_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_stage_stop));
+    }
+
+    double ms_setup = 0.0;
+    double ms_pop = 0.0;
+    double ms_h2d_meta = 0.0;
+    double ms_projection = 0.0;
+    double ms_scan = 0.0;
+    double ms_partition = 0.0;
+    double ms_splits_d2h = 0.0;
+    double ms_push = 0.0;
+    double ms_leaf_finalize = 0.0;
+    size_t n_batches = 0;
+
+    auto measure_gpu = [&](double& accum_ms, const auto& fn) {
+      if (!do_timing) {
+        fn();
+        return;
+      }
+      RAFT_CUDA_TRY(cudaEventRecord(ev_stage_start, stream));
+      fn();
+      RAFT_CUDA_TRY(cudaEventRecord(ev_stage_stop, stream));
+      RAFT_CUDA_TRY(cudaEventSynchronize(ev_stage_stop));
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_stage_start, ev_stage_stop));
+      accum_ms += stage_ms;
+    };
+
+    auto t_setup_start = clock_t::now();
 
     IdxT n_classes = 0; // Dummy variable, not used in prediction
     rmm::device_uvector<IdxT> d_row_ids(0, stream);
@@ -322,11 +388,6 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     rmm::device_uvector<Split<DataT, int>>             d_splits(0, stream);
     rmm::device_uvector<NodeWorkItemChunk<IdxT>>       d_chunks(0, stream);
     rmm::device_uvector<BlockTask<int>>                d_block_tasks(0, stream);
-    rmm::device_uvector<IdxT>                          d_chunk_work_item_ids(0, stream);
-    rmm::device_uvector<IdxT>                          d_chunk_nleft(0, stream);
-    rmm::device_uvector<IdxT>                          d_chunk_nright(0, stream);
-    rmm::device_uvector<IdxT>                          d_chunk_loff(0, stream);
-    rmm::device_uvector<IdxT>                          d_chunk_roff(0, stream);
 
     // TODO: revisit these heuristics
     req_bytes     = n_rows * sizeof(SPORFDT::NodeWorkItem); // heuristic for max work items needed at once
@@ -349,15 +410,6 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     aligned_elems = aligned_bytes / sizeof(NodeWorkItemChunk<IdxT>);
     d_chunks.resize(aligned_elems, stream);
 
-    req_bytes     = n_rows * sizeof(IdxT); // temp storage for segmented scans over chunks
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(IdxT);
-    d_chunk_work_item_ids.resize(aligned_elems, stream);
-    d_chunk_nleft.resize(aligned_elems, stream);
-    d_chunk_nright.resize(aligned_elems, stream);
-    d_chunk_loff.resize(aligned_elems, stream);
-    d_chunk_roff.resize(aligned_elems, stream);
-
     req_bytes     = (n_rows / 2) * sizeof(BlockTask<int>); // heuristic for max block tasks needed at once
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(BlockTask<int>);
@@ -374,88 +426,82 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       d_row_ids.data(),
       n_classes
     };
+    if (do_timing) { ms_setup += to_ms(clock_t::now() - t_setup_start); }
 
-    MLCommon::TimerCPU timer;
     SPORFPredictNodeQueue<DataT, int, LabelT> queue(tree, n_rows, max_batch_size);
     while (queue.HasWork()) {
-      auto [work_items, projection_matrices, splits, chunks, block_tasks] = queue.Pop();
-      raft::update_device(d_work_items.data(), work_items.data(), work_items.size(), stream);
-      raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
-      raft::update_device(d_splits.data(), splits.data(), splits.size(), stream);
-      raft::update_device(d_chunks.data(), chunks.data(), chunks.size(), stream);
-      raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
+      n_batches++;
+      auto t_pop_start = clock_t::now();
+      auto popped_batch = queue.Pop();
+      auto& work_items = std::get<0>(popped_batch);
+      auto& projection_matrices = std::get<1>(popped_batch);
+      auto& splits = std::get<2>(popped_batch);
+      auto& chunks = std::get<3>(popped_batch);
+      auto& block_tasks = std::get<4>(popped_batch);
+      if (do_timing) { ms_pop += to_ms(clock_t::now() - t_pop_start); }
+
+      measure_gpu(ms_h2d_meta, [&]() {
+        raft::update_device(d_work_items.data(), work_items.data(), work_items.size(), stream);
+        raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
+        raft::update_device(d_splits.data(), splits.data(), splits.size(), stream);
+        raft::update_device(d_chunks.data(), chunks.data(), chunks.size(), stream);
+        raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
+      });
 
       if (!block_tasks.empty()) {
-        launch_batched_projection_kernel<DataT, LabelT, IdxT>(rows,
-                                                              static_cast<IdxT>(n_rows),
-                                                              static_cast<IdxT>(n_cols),
-                                                              dataset.row_ids,
-                                                              d_splits.data(),
-                                                              d_projection_matrices.data(),
-                                                              static_cast<IdxT>(projection_matrices.size()),
-                                                              d_chunks.data(),
-                                                              d_block_tasks.data(),
-                                                              static_cast<IdxT>(block_tasks.size()),
-                                                              d_trans.data(),
-                                                              static_cast<IdxT>(dataset.M),
-                                                              stream);
+        measure_gpu(ms_projection, [&]() {
+          launch_batched_projection_kernel<DataT, LabelT, IdxT>(rows,
+                                                                static_cast<IdxT>(n_rows),
+                                                                static_cast<IdxT>(n_cols),
+                                                                dataset.row_ids,
+                                                                d_splits.data(),
+                                                                d_projection_matrices.data(),
+                                                                static_cast<IdxT>(projection_matrices.size()),
+                                                                d_chunks.data(),
+                                                                d_block_tasks.data(),
+                                                                static_cast<IdxT>(block_tasks.size()),
+                                                                d_trans.data(),
+                                                                static_cast<IdxT>(dataset.M),
+                                                                stream);
+        });
       }
 
       if (!chunks.empty()) {
-        constexpr int TPB_SCAN = 256;
-        auto n_chunks = static_cast<IdxT>(chunks.size());
-        dim3 block(TPB_SCAN);
-        dim3 grid((n_chunks + TPB_SCAN - 1) / TPB_SCAN);
-
-        pack_chunk_scan_inputs<IdxT><<<grid, block, 0, stream>>>(d_chunks.data(),
-                                                                  n_chunks,
-                                                                  d_chunk_work_item_ids.data(),
-                                                                  d_chunk_nleft.data(),
-                                                                  d_chunk_nright.data());
-        RAFT_CUDA_TRY(cudaPeekAtLastError());
-
-        thrust::exclusive_scan_by_key(thrust::cuda::par.on(stream),
-                                      d_chunk_work_item_ids.begin(),
-                                      d_chunk_work_item_ids.begin() + n_chunks,
-                                      d_chunk_nleft.begin(),
-                                      d_chunk_loff.begin());
-        thrust::exclusive_scan_by_key(thrust::cuda::par.on(stream),
-                                      d_chunk_work_item_ids.begin(),
-                                      d_chunk_work_item_ids.begin() + n_chunks,
-                                      d_chunk_nright.begin(),
-                                      d_chunk_roff.begin());
-
-        unpack_chunk_scan_outputs<IdxT><<<grid, block, 0, stream>>>(d_chunks.data(),
-                                                                     n_chunks,
-                                                                     d_chunk_loff.data(),
-                                                                     d_chunk_roff.data());
-        RAFT_CUDA_TRY(cudaPeekAtLastError());
+        measure_gpu(ms_scan, [&]() {
+          auto n_chunks = static_cast<IdxT>(chunks.size());
+          compute_chunk_offsets_kernel<IdxT><<<1, 1, 0, stream>>>(d_chunks.data(), n_chunks);
+          RAFT_CUDA_TRY(cudaPeekAtLastError());
+        });
       }
 
       if (!block_tasks.empty()) {
-        launch_batched_partition_kernel<DataT, IdxT>(d_row_ids.data(),
-                                                     d_row_ids_scratch.data(),
-                                                     d_trans.data(),
-                                                     static_cast<IdxT>(dataset.M),
-                                                     d_work_items.data(),
-                                                     d_splits.data(),
-                                                     d_chunks.data(),
-                                                     d_block_tasks.data(),
-                                                     static_cast<IdxT>(block_tasks.size()),
-                                                     static_cast<IdxT>(projection_matrices.size()),
-                                                     stream);
-        launch_batched_copyback_kernel<IdxT>(d_row_ids_scratch.data(),
-                                             d_row_ids.data(),
-                                             d_chunks.data(),
-                                             d_block_tasks.data(),
-                                             static_cast<IdxT>(block_tasks.size()),
-                                             static_cast<IdxT>(dataset.M),
-                                             stream);
+        measure_gpu(ms_partition, [&]() {
+          launch_batched_partition_kernel<DataT, IdxT>(d_row_ids.data(),
+                                                       d_row_ids_scratch.data(),
+                                                       d_trans.data(),
+                                                       static_cast<IdxT>(dataset.M),
+                                                       d_work_items.data(),
+                                                       d_splits.data(),
+                                                       d_chunks.data(),
+                                                       d_block_tasks.data(),
+                                                       static_cast<IdxT>(block_tasks.size()),
+                                                       static_cast<IdxT>(projection_matrices.size()),
+                                                       stream);
+          launch_batched_copyback_kernel<IdxT>(d_row_ids_scratch.data(),
+                                               d_row_ids.data(),
+                                               d_chunks.data(),
+                                               d_block_tasks.data(),
+                                               static_cast<IdxT>(block_tasks.size()),
+                                               static_cast<IdxT>(dataset.M),
+                                               stream);
+        });
       }
 
       if (!splits.empty()) {
+        auto t_d2h_start = clock_t::now();
         raft::update_host(splits.data(), d_splits.data(), splits.size(), stream);
         RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        if (do_timing) { ms_splits_d2h += to_ms(clock_t::now() - t_d2h_start); }
       }
 
       // Split entries are ordered by the same non-leaf/non-empty visitation order as work_items.
@@ -469,9 +515,12 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         split_idx++;
       }
 
+      auto t_push_start = clock_t::now();
       queue.Push(work_items);
+      if (do_timing) { ms_push += to_ms(clock_t::now() - t_push_start); }
     }
 
+    auto t_leaf_start = clock_t::now();
     const auto& leaves = queue.GetLeaves();
     auto leaves_size = static_cast<IdxT>(leaves.size());
 
@@ -515,6 +564,24 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
         scale,
         predictions);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
+    }
+    if (do_timing) { ms_leaf_finalize += to_ms(clock_t::now() - t_leaf_start); }
+
+    if (do_timing) {
+      CUML_LOG_DEBUG(
+        "SPORFDecisionTree::predict timings (ms): setup=%f batches=%zu pop=%f h2d_meta=%f proj=%f scan=%f partition=%f splits_d2h=%f push=%f leaf_finalize=%f",
+        ms_setup,
+        n_batches,
+        ms_pop,
+        ms_h2d_meta,
+        ms_projection,
+        ms_scan,
+        ms_partition,
+        ms_splits_d2h,
+        ms_push,
+        ms_leaf_finalize);
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_stage_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_stage_stop));
     }
 
     // RAFT_CUDA_TRY(cudaStreamSynchronize(stream));

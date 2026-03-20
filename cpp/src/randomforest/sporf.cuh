@@ -219,6 +219,7 @@ class SPORF {
     for (int i = 0; i < this->rf_params.n_trees; i++) {
       int stream_id = omp_get_thread_num();
       auto s        = handle.get_stream_from_stream_pool(stream_id);
+      RAFT_CUDA_TRY(cudaSetDevice(handle.get_device()));
 
       this->get_row_sample(i, n_rows, &selected_rows[stream_id], s);
 
@@ -270,6 +271,21 @@ class SPORF {
     ML::default_logger().set_level(verbosity);
     this->error_checking(input, predictions, n_rows, n_cols, true);
     cudaStream_t stream = user_handle.get_stream();
+    bool do_timing = ML::default_logger().should_log(rapids_logger::level_enum::debug);
+
+    cudaEvent_t ev_total_start{}, ev_total_stop{}, ev_tree_start{}, ev_tree_stop{}, ev_reduce_start{},
+      ev_reduce_stop{}, ev_finalize_start{}, ev_finalize_stop{};
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_total_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_tree_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_reduce_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_reduce_stop));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_finalize_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_finalize_stop));
+      RAFT_CUDA_TRY(cudaEventRecord(ev_total_start, stream));
+    }
 
     rmm::device_uvector<T> d_prediction_buffer(n_rows * forest->trees[0]->num_outputs, stream);
     RAFT_CUDA_TRY(cudaMemsetAsync(
@@ -305,6 +321,7 @@ class SPORF {
     // user_handle.sync_stream(stream);
 
     default_logger().set_pattern("%v");
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_tree_start, stream)); }
     for (int i = 0; i < this->rf_params.n_trees; i++) {
       int sid = (predict_streams > 1) ? (i % predict_streams) : 0;
       auto out_ptr = (predict_streams > 1) ? stream_prediction_buffers[sid].data() : d_prediction_buffer.data();
@@ -321,7 +338,16 @@ class SPORF {
         verbosity,
         pred_stream);
     }
+    if (do_timing) {
+      if (predict_streams > 1) {
+        user_handle.sync_stream_pool();
+        RAFT_CUDA_TRY(cudaEventRecord(ev_tree_stop, stream));
+      } else {
+        RAFT_CUDA_TRY(cudaEventRecord(ev_tree_stop, stream));
+      }
+    }
 
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_reduce_start, stream)); }
     if (predict_streams > 1) {
       user_handle.sync_stream_pool();
       constexpr int TPB = 256;
@@ -334,7 +360,9 @@ class SPORF {
         RAFT_CUDA_TRY(cudaPeekAtLastError());
       }
     }
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_reduce_stop, stream)); }
 
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_finalize_start, stream)); }
     {
       constexpr int TPB = 256;
       int num_outputs = forest->trees[0]->num_outputs;
@@ -344,7 +372,37 @@ class SPORF {
         d_prediction_buffer.data(), n_rows, num_outputs, rf_type, predictions);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventRecord(ev_finalize_stop, stream));
+      RAFT_CUDA_TRY(cudaEventRecord(ev_total_stop, stream));
+    }
     user_handle.sync_stream(stream);
+
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventSynchronize(ev_total_stop));
+      float ms_total = 0.0f, ms_tree = 0.0f, ms_reduce = 0.0f, ms_finalize = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_total, ev_total_start, ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_tree, ev_tree_start, ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_reduce, ev_reduce_start, ev_reduce_stop));
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_finalize, ev_finalize_start, ev_finalize_stop));
+      CUML_LOG_DEBUG(
+        "SPORF::predict timings (ms): total=%f tree_loop=%f reduce=%f finalize=%f (n_trees=%d streams=%d)",
+        ms_total,
+        ms_tree,
+        ms_reduce,
+        ms_finalize,
+        this->rf_params.n_trees,
+        predict_streams);
+
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_total_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_tree_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_reduce_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_reduce_stop));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_finalize_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_finalize_stop));
+    }
     default_logger().set_pattern(default_pattern());
   }
 

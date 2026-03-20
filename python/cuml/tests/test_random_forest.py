@@ -310,6 +310,7 @@ def test_tweedie_convergence(max_depth, split_criterion):
 )
 def test_rf_classification(small_clf, datatype, max_samples, max_features):
     use_handle = True
+    n_streams = 4
 
     X, y = small_clf
     X = X.astype(datatype)
@@ -318,7 +319,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         X, y, train_size=0.8, random_state=0
     )
     # Create a handle for the cuml model
-    handle, stream = get_handle(use_handle, n_streams=1)
+    handle, stream = get_handle(use_handle, n_streams=n_streams)
 
     import time
     # Initialize, fit and predict using cuML's
@@ -331,7 +332,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         split_criterion=0,
         min_samples_leaf=2,
         random_state=123,
-        n_streams=1,
+        n_streams=n_streams,
         n_estimators=40,
         handle=handle,
         max_leaves=-1,
@@ -340,6 +341,8 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     cuml_model.fit(X_train, y_train)
     cuml_train_time = time.perf_counter() - t_start
 
+    # import cuml.internals.logger as logger
+    # logger.set_level(logger.level_enum.debug)
     t_start = time.perf_counter()
     sporf_model = sporfc(
         max_features=max_features,
@@ -348,11 +351,12 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         split_criterion=0,
         min_samples_leaf=2,
         random_state=123,
-        n_streams=1,
+        n_streams=n_streams,
         n_estimators=40,
         handle=handle,
         max_leaves=-1,
         max_depth=16,
+        # verbose=True,
     )
     sporf_model.fit(X_train, y_train)
     sporf_train_time = time.perf_counter() - t_start
