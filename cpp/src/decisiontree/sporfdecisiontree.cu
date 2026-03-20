@@ -288,7 +288,7 @@ __global__ void compute_chunk_offsets_kernel(NodeWorkItemChunk<IdxT>* d_chunks, 
 }
 
 // Template definition moved from the header
-template <typename DataT, typename LabelT, typename IdxT>
+template <typename DataT, typename LabelT, typename IndexT>
 void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 const TreeMetaDataNode<DataT, LabelT>& tree,
                                 std::size_t max_batch_size,
@@ -300,21 +300,21 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 int num_outputs,
                                 rapids_logger::level_enum verbosity)
 {
-  predict<DataT, LabelT, IdxT>(handle,
-                               tree,
-                               max_batch_size,
-                               rows,
-                               n_rows,
-                               n_cols,
-                               scale,
-                               predictions,
-                               num_outputs,
-                               verbosity,
-                               handle.get_stream());
+  predict(handle,
+          tree,
+          max_batch_size,
+          rows,
+          n_rows,
+          n_cols,
+          scale,
+          predictions,
+          num_outputs,
+          verbosity,
+          handle.get_stream());
 }
 
 // Template definition moved from the header
-template <typename DataT, typename LabelT, typename IdxT>
+template <typename DataT, typename LabelT, typename IndexT>
 void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 const TreeMetaDataNode<DataT, LabelT>& tree,
                                 std::size_t max_batch_size,
@@ -326,8 +326,39 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                 int num_outputs,
                                 rapids_logger::level_enum verbosity,
                                 cudaStream_t stream)
+{
+  SPORFDecisionTreeWorkspace<DataT, LabelT, IndexT> ws(n_rows, max_batch_size, stream);
+  predict(handle,
+          tree,
+          max_batch_size,
+          rows,
+          n_rows,
+          n_cols,
+          scale,
+          predictions,
+          num_outputs,
+          verbosity,
+          ws,
+          stream);
+}
+
+// Template definition moved from the header
+template <typename DataT, typename LabelT, typename IndexT>
+void SPORFDecisionTree::predict(const raft::handle_t& handle,
+                                const TreeMetaDataNode<DataT, LabelT>& tree,
+                                std::size_t max_batch_size,
+                                const DataT* rows, // input data in column-major format, device pointer
+                                std::size_t n_rows,
+                                std::size_t n_cols,
+                                double scale,
+                                DataT* predictions,
+                                int num_outputs,
+                                rapids_logger::level_enum verbosity,
+                                SPORFDecisionTreeWorkspace<DataT, LabelT, IndexT>& ws,
+                                cudaStream_t stream)
   {
     RAFT_CUDA_TRY(cudaSetDevice(handle.get_device()));
+    using IdxT = IndexT;
     const bool do_timing = ML::default_logger().should_log(rapids_logger::level_enum::debug);
     using clock_t = std::chrono::steady_clock;
     auto to_ms = [](clock_t::duration d) {
@@ -367,63 +398,20 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
 
     auto t_setup_start = clock_t::now();
 
-    IdxT n_classes = 0; // Dummy variable, not used in prediction
-    rmm::device_uvector<IdxT> d_row_ids(0, stream);
-    rmm::device_uvector<IdxT> d_row_ids_scratch(0, stream);
-    rmm::device_uvector<DataT> d_trans(0, stream);
-
-    size_t req_bytes     = n_rows * sizeof(IdxT);
-    size_t aligned_bytes = calculateAlignedBytes(req_bytes);
-    size_t aligned_elems = aligned_bytes / sizeof(IdxT);
-    d_row_ids.resize(aligned_elems, stream);
-    d_row_ids_scratch.resize(aligned_elems, stream);
-
-    req_bytes     = n_rows * sizeof(DataT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(DataT);
-    d_trans.resize(aligned_elems, stream);
-
-    rmm::device_uvector<SPORFDT::NodeWorkItem>         d_work_items(0, stream);
-    rmm::device_uvector<ProjectionMatrix<DataT, int>>  d_projection_matrices(0, stream);
-    rmm::device_uvector<Split<DataT, int>>             d_splits(0, stream);
-    rmm::device_uvector<NodeWorkItemChunk<IdxT>>       d_chunks(0, stream);
-    rmm::device_uvector<BlockTask<int>>                d_block_tasks(0, stream);
-
-    // TODO: revisit these heuristics
-    req_bytes     = n_rows * sizeof(SPORFDT::NodeWorkItem); // heuristic for max work items needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(SPORFDT::NodeWorkItem);
-    d_work_items.resize(aligned_elems, stream);
-
-    req_bytes     = (n_rows / 2) * sizeof(ProjectionMatrix<DataT, int>); // heuristic for max projection matrices needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(ProjectionMatrix<DataT, int>);
-    d_projection_matrices.resize(aligned_elems, stream);
-
-    req_bytes     = (n_rows / 2) * sizeof(Split<DataT, int>); // heuristic for max splits needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(Split<DataT, int>);
-    d_splits.resize(aligned_elems, stream);
-
-    req_bytes     = n_rows * sizeof(NodeWorkItemChunk<IdxT>); // heuristic for max chunks needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(NodeWorkItemChunk<IdxT>);
-    d_chunks.resize(aligned_elems, stream);
-
-    req_bytes     = (n_rows / 2) * sizeof(BlockTask<int>); // heuristic for max block tasks needed at once
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(BlockTask<int>);
-    d_block_tasks.resize(aligned_elems, stream);
-
-    thrust::sequence(thrust::cuda::par.on(stream), d_row_ids.begin(), d_row_ids.begin() + n_rows, 0);
+    IndexT n_classes = 0; // Dummy variable, not used in prediction
+    ASSERT(static_cast<IndexT>(n_rows) <= ws.n_rows, "Predict workspace insufficient n_rows");
+    ASSERT(static_cast<IndexT>(max_batch_size) <= ws.max_batch_size,
+           "Predict workspace insufficient max_batch_size");
+    ws.reset(tree, stream);
+    thrust::sequence(thrust::cuda::par.on(stream), ws.d_row_ids, ws.d_row_ids + n_rows, 0);
     Dataset<DataT, LabelT, IdxT> dataset = {
-      d_trans.data(),         // projected data (single column)
+      ws.d_trans,             // projected data (single column)
       nullptr,                // labels (unused in predict)
-      static_cast<IdxT>(n_rows),
-      static_cast<IdxT>(1),   // N = number of projected columns
-      static_cast<IdxT>(n_rows),
-      static_cast<IdxT>(1),
-      d_row_ids.data(),
+      static_cast<IndexT>(n_rows),
+      static_cast<IndexT>(1),   // N = number of projected columns
+      static_cast<IndexT>(n_rows),
+      static_cast<IndexT>(1),
+      ws.d_row_ids,
       n_classes
     };
     if (do_timing) { ms_setup += to_ms(clock_t::now() - t_setup_start); }
@@ -438,14 +426,22 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       auto& splits = std::get<2>(popped_batch);
       auto& chunks = std::get<3>(popped_batch);
       auto& block_tasks = std::get<4>(popped_batch);
+      ws.n_work_items = static_cast<IdxT>(work_items.size());
+      ws.n_payloads = static_cast<IdxT>(projection_matrices.size());
+      ws.n_chunks = static_cast<IdxT>(chunks.size());
+      ws.n_block_tasks = static_cast<IdxT>(block_tasks.size());
       if (do_timing) { ms_pop += to_ms(clock_t::now() - t_pop_start); }
 
       measure_gpu(ms_h2d_meta, [&]() {
-        raft::update_device(d_work_items.data(), work_items.data(), work_items.size(), stream);
-        raft::update_device(d_projection_matrices.data(), projection_matrices.data(), projection_matrices.size(), stream);
-        raft::update_device(d_splits.data(), splits.data(), splits.size(), stream);
-        raft::update_device(d_chunks.data(), chunks.data(), chunks.size(), stream);
-        raft::update_device(d_block_tasks.data(), block_tasks.data(), block_tasks.size(), stream);
+        ASSERT(ws.n_work_items <= ws.cap_work_items, "Predict workspace overflow: work_items");
+        ASSERT(ws.n_payloads <= ws.cap_payloads, "Predict workspace overflow: payloads");
+        ASSERT(ws.n_chunks <= ws.cap_chunks, "Predict workspace overflow: chunks");
+        ASSERT(ws.n_block_tasks <= ws.cap_block_tasks, "Predict workspace overflow: block_tasks");
+        raft::update_device(ws.d_work_items, work_items.data(), ws.n_work_items, stream);
+        raft::update_device(ws.d_projection_matrices, projection_matrices.data(), ws.n_payloads, stream);
+        raft::update_device(ws.d_splits, splits.data(), ws.n_payloads, stream);
+        raft::update_device(ws.d_chunks, chunks.data(), ws.n_chunks, stream);
+        raft::update_device(ws.d_block_tasks, block_tasks.data(), ws.n_block_tasks, stream);
       });
 
       if (!block_tasks.empty()) {
@@ -454,13 +450,13 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
                                                                 static_cast<IdxT>(n_rows),
                                                                 static_cast<IdxT>(n_cols),
                                                                 dataset.row_ids,
-                                                                d_splits.data(),
-                                                                d_projection_matrices.data(),
+                                                                ws.d_splits,
+                                                                ws.d_projection_matrices,
                                                                 static_cast<IdxT>(projection_matrices.size()),
-                                                                d_chunks.data(),
-                                                                d_block_tasks.data(),
+                                                                ws.d_chunks,
+                                                                ws.d_block_tasks,
                                                                 static_cast<IdxT>(block_tasks.size()),
-                                                                d_trans.data(),
+                                                                ws.d_trans,
                                                                 static_cast<IdxT>(dataset.M),
                                                                 stream);
         });
@@ -469,28 +465,28 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       if (!chunks.empty()) {
         measure_gpu(ms_scan, [&]() {
           auto n_chunks = static_cast<IdxT>(chunks.size());
-          compute_chunk_offsets_kernel<IdxT><<<1, 1, 0, stream>>>(d_chunks.data(), n_chunks);
+          compute_chunk_offsets_kernel<IdxT><<<1, 1, 0, stream>>>(ws.d_chunks, n_chunks);
           RAFT_CUDA_TRY(cudaPeekAtLastError());
         });
       }
 
       if (!block_tasks.empty()) {
         measure_gpu(ms_partition, [&]() {
-          launch_batched_partition_kernel<DataT, IdxT>(d_row_ids.data(),
-                                                       d_row_ids_scratch.data(),
-                                                       d_trans.data(),
+          launch_batched_partition_kernel<DataT, IdxT>(ws.d_row_ids,
+                                                       ws.d_row_ids_scratch,
+                                                       ws.d_trans,
                                                        static_cast<IdxT>(dataset.M),
-                                                       d_work_items.data(),
-                                                       d_splits.data(),
-                                                       d_chunks.data(),
-                                                       d_block_tasks.data(),
+                                                       ws.d_work_items,
+                                                       ws.d_splits,
+                                                       ws.d_chunks,
+                                                       ws.d_block_tasks,
                                                        static_cast<IdxT>(block_tasks.size()),
                                                        static_cast<IdxT>(projection_matrices.size()),
                                                        stream);
-          launch_batched_copyback_kernel<IdxT>(d_row_ids_scratch.data(),
-                                               d_row_ids.data(),
-                                               d_chunks.data(),
-                                               d_block_tasks.data(),
+          launch_batched_copyback_kernel<IdxT>(ws.d_row_ids_scratch,
+                                               ws.d_row_ids,
+                                               ws.d_chunks,
+                                               ws.d_block_tasks,
                                                static_cast<IdxT>(block_tasks.size()),
                                                static_cast<IdxT>(dataset.M),
                                                stream);
@@ -499,7 +495,7 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
 
       if (!splits.empty()) {
         auto t_d2h_start = clock_t::now();
-        raft::update_host(splits.data(), d_splits.data(), splits.size(), stream);
+        raft::update_host(splits.data(), ws.d_splits, splits.size(), stream);
         RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
         if (do_timing) { ms_splits_d2h += to_ms(clock_t::now() - t_d2h_start); }
       }
@@ -524,19 +520,18 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
     const auto& leaves = queue.GetLeaves();
     auto leaves_size = static_cast<IdxT>(leaves.size());
 
-    rmm::device_uvector<NodeWorkItem> d_leaves(leaves_size, stream);
-    raft::update_device(d_leaves.data(), leaves.data(), leaves_size, stream);
-
-    rmm::device_uvector<DataT> d_vector_leaf(tree.vector_leaf.size(), stream);
-    raft::update_device(d_vector_leaf.data(), tree.vector_leaf.data(), tree.vector_leaf.size(), stream);
+    ASSERT(leaves_size <= static_cast<IdxT>(ws.d_leaves.size()), "Predict workspace overflow: leaves");
+    ASSERT(static_cast<IdxT>(tree.vector_leaf.size()) <= static_cast<IdxT>(ws.d_vector_leaf.size()),
+           "Predict workspace overflow: vector_leaf");
+    raft::update_device(ws.d_leaves.data(), leaves.data(), leaves_size, stream);
+    raft::update_device(
+      ws.d_vector_leaf.data(), tree.vector_leaf.data(), tree.vector_leaf.size(), stream);
 
     // RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
-    rmm::device_uvector<IdxT> d_prediction_leaves(n_rows, stream);
-
-    auto d_leaves_ptr = d_leaves.data();
-    auto d_vector_leaf_ptr = d_vector_leaf.data();
-    auto d_prediction_leaves_ptr = d_prediction_leaves.data();
+    auto d_leaves_ptr = ws.d_leaves.data();
+    auto d_vector_leaf_ptr = ws.d_vector_leaf.data();
+    auto d_prediction_leaves_ptr = ws.d_prediction_leaves;
 
     // Pass 1: build row -> leaf mapping.
     thrust::for_each(
@@ -596,6 +591,10 @@ template void SPORFDecisionTree::predict<float, int, int>(const raft::handle_t&,
 template void SPORFDecisionTree::predict<double, int, int>(const raft::handle_t&, const TreeMetaDataNode<double,int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, cudaStream_t);
 template void SPORFDecisionTree::predict<float, float, int>(const raft::handle_t&, const TreeMetaDataNode<float,float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum, cudaStream_t);
 template void SPORFDecisionTree::predict<double, double, int>(const raft::handle_t&, const TreeMetaDataNode<double,double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, cudaStream_t);
+template void SPORFDecisionTree::predict<float, int, int>(const raft::handle_t&, const TreeMetaDataNode<float, int>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum, SPORFDecisionTreeWorkspace<float, int, int>&, cudaStream_t);
+template void SPORFDecisionTree::predict<double, int, int>(const raft::handle_t&, const TreeMetaDataNode<double, int>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, SPORFDecisionTreeWorkspace<double, int, int>&, cudaStream_t);
+template void SPORFDecisionTree::predict<float, float, int>(const raft::handle_t&, const TreeMetaDataNode<float, float>&, std::size_t, const float*, std::size_t, std::size_t, double, float*, int, rapids_logger::level_enum, SPORFDecisionTreeWorkspace<float, float, int>&, cudaStream_t);
+template void SPORFDecisionTree::predict<double, double, int>(const raft::handle_t&, const TreeMetaDataNode<double, double>&, std::size_t, const double*, std::size_t, std::size_t, double, double*, int, rapids_logger::level_enum, SPORFDecisionTreeWorkspace<double, double, int>&, cudaStream_t);
 
 template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_projection_kernel(

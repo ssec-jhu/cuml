@@ -42,6 +42,7 @@
 #include <decisiontree/treelite_util.h>
 #include <algorithm>
 #include <deque>
+#include <memory>
 #include <vector>
 
 #ifdef _OPENMP
@@ -299,8 +300,11 @@ class SPORF {
 
     std::vector<cudaStream_t> tree_streams;
     std::deque<rmm::device_uvector<T>> stream_prediction_buffers;
+    using PredictWs = DT::SPORFDecisionTreeWorkspace<T, L, int>;
+    std::vector<std::unique_ptr<PredictWs>> stream_workspaces;
     if (predict_streams > 1) {
       tree_streams.reserve(predict_streams);
+      stream_workspaces.reserve(predict_streams);
       for (int s = 0; s < predict_streams; s++) {
         auto tree_stream = user_handle.get_stream_from_stream_pool(s);
         tree_streams.push_back(tree_stream);
@@ -309,7 +313,16 @@ class SPORF {
                                       0,
                                       sizeof(T) * stream_prediction_buffers.back().size(),
                                       tree_stream));
+        stream_workspaces.emplace_back(
+          std::make_unique<PredictWs>(static_cast<size_t>(n_rows),
+                                      static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
+                                      tree_stream));
       }
+    } else {
+      stream_workspaces.emplace_back(
+        std::make_unique<PredictWs>(static_cast<size_t>(n_rows),
+                                    static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
+                                    stream));
     }
 
     // TODO(sporf): Predict now expects column-major GPU input for classifier path.
@@ -326,6 +339,7 @@ class SPORF {
       int sid = (predict_streams > 1) ? (i % predict_streams) : 0;
       auto out_ptr = (predict_streams > 1) ? stream_prediction_buffers[sid].data() : d_prediction_buffer.data();
       auto pred_stream = (predict_streams > 1) ? tree_streams[sid] : stream;
+      auto& ws = *stream_workspaces[sid];
       DT::SPORFDecisionTree::predict(user_handle,
         *forest->trees[i],
         this->rf_params.tree_params.max_batch_size,
@@ -336,6 +350,7 @@ class SPORF {
         out_ptr,
         forest->trees[i]->num_outputs,
         verbosity,
+        ws,
         pred_stream);
     }
     if (do_timing) {

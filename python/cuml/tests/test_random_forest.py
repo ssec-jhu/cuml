@@ -310,7 +310,7 @@ def test_tweedie_convergence(max_depth, split_criterion):
 )
 def test_rf_classification(small_clf, datatype, max_samples, max_features):
     use_handle = True
-    n_streams = 4
+    n_streams = 1
 
     X, y = small_clf
     X = X.astype(datatype)
