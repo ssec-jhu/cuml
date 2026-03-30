@@ -175,53 +175,26 @@ __global__ void accumulate_predictions_by_row_kernel(const IdxT* d_prediction_le
 }
 
 template <typename IdxT>
-__global__ void pack_chunk_scan_inputs(const NodeWorkItemChunk<IdxT>* d_chunks,
-                                       IdxT n_chunks,
-                                       IdxT* d_work_item_ids,
-                                       IdxT* d_nleft,
-                                       IdxT* d_nright)
+__global__ void compute_chunk_offsets_kernel(NodeWorkItemChunk<IdxT>* d_chunks,
+                                             IdxT n_chunks,
+                                             IdxT n_work_items)
 {
   auto i = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= n_chunks) { return; }
-  auto c = d_chunks[i];
-  d_work_item_ids[i] = c.work_item_idx;
-  d_nleft[i]         = c.nLeft;
-  d_nright[i]        = c.nRight;
-}
 
-template <typename IdxT>
-__global__ void unpack_chunk_scan_outputs(NodeWorkItemChunk<IdxT>* d_chunks,
-                                          IdxT n_chunks,
-                                          const IdxT* d_loff,
-                                          const IdxT* d_roff)
-{
-  auto i = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (i >= n_chunks) { return; }
-  d_chunks[i].loff = d_loff[i];
-  d_chunks[i].roff = d_roff[i];
-}
+  auto wid = d_chunks[i].work_item_idx;
+  if (wid >= n_work_items) { return; }
 
-template <typename IdxT>
-__global__ void compute_chunk_offsets_kernel(NodeWorkItemChunk<IdxT>* d_chunks, IdxT n_chunks)
-{
-  // Predict batches typically have modest chunk counts; one-thread linear pass avoids
-  // multi-kernel + scan-by-key launch overhead and writes offsets directly in-place.
-  if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
-  if (n_chunks <= 0) { return; }
+  // One thread (segment start) handles each contiguous work-item chunk segment.
+  if (i > 0 && d_chunks[i - 1].work_item_idx == wid) { return; }
 
-  IdxT curr_work_item = d_chunks[0].work_item_idx;
   IdxT loff = 0;
   IdxT roff = 0;
-
-  for (IdxT i = 0; i < n_chunks; i++) {
-    auto c = d_chunks[i];
-    if (i == 0 || c.work_item_idx != curr_work_item) {
-      curr_work_item = c.work_item_idx;
-      loff = 0;
-      roff = 0;
-    }
-    d_chunks[i].loff = loff;
-    d_chunks[i].roff = roff;
+  for (IdxT j = i; j < n_chunks; j++) {
+    auto c = d_chunks[j];
+    if (c.work_item_idx != wid) { break; }
+    d_chunks[j].loff = loff;
+    d_chunks[j].roff = roff;
     loff += c.nLeft;
     roff += c.nRight;
   }
@@ -392,7 +365,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       if (!chunks.empty()) {
         measure_gpu(ms_scan, [&]() {
           auto n_chunks = static_cast<IdxT>(chunks.size());
-          compute_chunk_offsets_kernel<IdxT><<<1, 1, 0, stream>>>(ws.pointers.d_chunks, n_chunks);
+          constexpr int TPB = 256;
+          dim3 block(TPB);
+          dim3 grid((n_chunks + TPB - 1) / TPB);
+          compute_chunk_offsets_kernel<IdxT><<<grid, block, 0, stream>>>(
+            ws.pointers.d_chunks, n_chunks, ws.meta.n_work_items);
           RAFT_CUDA_TRY(cudaPeekAtLastError());
         });
       }
