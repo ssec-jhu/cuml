@@ -49,11 +49,11 @@ static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads p
 template <typename IdxT = int>
 struct NodeWorkItemChunk {
   IdxT work_item_idx;      // index into the batch of work items for this level of the tree
+  IdxT node_id;            // global tree node id for this chunk/work item
   IdxT instances_begin;    // start of indices into dataset.row_ids for this block and node
   IdxT instances_count;    // number of indices into dataset.row_ids for this block and node
   IdxT block_task_idx;     // index into the batch of block tasks for this level of the tree
   IdxT thread_local_begin; // starting thread index within this block doing work on this node
-  IdxT payload_idx;        // index into array of chunk-specific task info (i.e. projection matrices, partition splits, etc) loaded for this batch
   IdxT nLeft;              // number of left child instances for this work item in this block
   IdxT nRight;             // number of right child instances for this work item in this block
   IdxT loff;               // offset into the left child partition of the output row_id array for this block and node
