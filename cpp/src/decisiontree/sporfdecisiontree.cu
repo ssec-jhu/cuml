@@ -489,53 +489,66 @@ __global__ void batched_projection_kernel(
 
   auto tid = static_cast<IdxT>(threadIdx.x);
   auto task = pointers.d_block_tasks[block_id];
-  if (tid >= task.count) { return; }
+  bool active = tid < task.count;
+  NodeWorkItemChunk<IdxT> chunk{};
+  IdxT chunk_id = 0;
+  bool lane_valid = false;
+  bool is_left = false;
 
-  auto chunk = pointers.d_chunks[task.work_item_chunk_ids[tid]];
-  auto row_pos = chunk.instances_begin + (tid - chunk.thread_local_begin);
-  if (row_pos >= meta.n_rows || chunk.work_item_idx >= meta.n_work_items || chunk.node_id >= meta.n_nodes) {
-    return;
-  }
+  __shared__ int s_left_flags[BLOCK_TASK_SIZE];
 
-  auto row_id = pointers.d_row_ids[row_pos];
-  if (row_id >= meta.n_rows) { return; }
+  if (active) {
+    chunk_id = task.work_item_chunk_ids[tid];
+    chunk = pointers.d_chunks[chunk_id];
 
-  auto node = pointers.d_nodes[chunk.node_id];
-  auto pm = node.projection;
-  for (IdxT comp = 0; comp < pm.n_proj_components; comp++) {
-    int start = pm.d_proj_indptr[comp];
-    int end = pm.d_proj_indptr[comp + 1];
-    DataT acc = DataT(0);
+    auto row_pos = chunk.instances_begin + (tid - chunk.thread_local_begin);
+    if (row_pos < meta.n_rows && chunk.work_item_idx < meta.n_work_items && chunk.node_id < meta.n_nodes) {
+      auto row_id = pointers.d_row_ids[row_pos];
+      if (row_id < meta.n_rows) {
+        auto node = pointers.d_nodes[chunk.node_id];
+        auto pm = node.projection;
+        DataT projected0 = DataT(0);
+        for (IdxT comp = 0; comp < pm.n_proj_components; comp++) {
+          int start = pm.d_proj_indptr[comp];
+          int end = pm.d_proj_indptr[comp + 1];
+          DataT acc = DataT(0);
 
-    for (int nz = start; nz < end; nz++) {
-      auto feat = static_cast<IdxT>(pm.d_proj_indices[nz]);
-      if (feat >= meta.n_cols) { continue; }
-      auto coeff = pm.d_proj_coeffs[nz];
-      acc += pointers.d_input_col_major[feat * meta.n_rows + row_id] * coeff;
+          for (int nz = start; nz < end; nz++) {
+            auto feat = static_cast<IdxT>(pm.d_proj_indices[nz]);
+            if (feat >= meta.n_cols) { continue; }
+            auto coeff = pm.d_proj_coeffs[nz];
+            acc += pointers.d_input_col_major[feat * meta.n_rows + row_id] * coeff;
+          }
+          pointers.d_trans[comp * meta.n_rows + row_pos] = acc;
+          if (comp == 0) { projected0 = acc; }  // Predict currently uses component 0 for split.
+        }
+
+        lane_valid = true;
+        is_left = projected0 <= node.quesval;
+      }
     }
-    pointers.d_trans[comp * meta.n_rows + row_pos] = acc;
   }
 
-  __syncthreads(); // ensure all threads in block have finished writing to output buffer before any thread in block can be reused for next task
+  s_left_flags[tid] = (active && lane_valid && is_left) ? 1 : 0;
+  __syncthreads();
 
-  if (tid == chunk.thread_local_begin) { // single thread per chunk to do the counting for that chunk's payload/split
+  if (!active || !lane_valid) { return; }
+
+  if (tid == chunk.thread_local_begin) {
     IdxT curr_left_count = 0;
-
-    DataT curr_split = node.quesval;
-    for (IdxT j = 0; j < chunk.instances_count; j++) {
-      IdxT row_pos_j = chunk.instances_begin + j;
-      if (row_pos_j >= meta.n_rows) { continue; }
-      // Predict currently projects one component per work item (column 0).
-      DataT projected = pointers.d_trans[row_pos_j];
-      if (projected <= curr_split) { curr_left_count++; }
+    IdxT seg_begin = chunk.thread_local_begin;
+    IdxT seg_end = seg_begin + chunk.instances_count;
+    if (seg_end > task.count) { seg_end = task.count; }
+    for (IdxT j = seg_begin; j < seg_end; j++) {
+      curr_left_count += static_cast<IdxT>(s_left_flags[j]);
     }
 
     if (curr_left_count > 0) {
       atomicAdd(&pointers.d_work_item_nleft[chunk.work_item_idx], curr_left_count);
     }
 
-    auto* p_chunk = &pointers.d_chunks[task.work_item_chunk_ids[tid]];
-    p_chunk->nLeft = curr_left_count; // also update chunk metadata for use in partitioning
+    auto* p_chunk = &pointers.d_chunks[chunk_id];
+    p_chunk->nLeft = curr_left_count;
     p_chunk->nRight = chunk.instances_count - curr_left_count;
   }
 }
