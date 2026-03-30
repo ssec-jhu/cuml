@@ -50,6 +50,18 @@ __global__ void batched_partition_kernel(PredictWorkspacePointers<DataT, LabelT,
   __shared__ int s_is_left[BLOCK_TASK_SIZE];
   __shared__ IdxT s_chunk_begin[BLOCK_TASK_SIZE];
   __shared__ IdxT s_local_left_rank[BLOCK_TASK_SIZE];
+  struct SegPair {
+    IdxT val;
+    int head;
+  };
+  struct SegScanOp {
+    __device__ SegPair operator()(SegPair const& a, SegPair const& b) const
+    {
+      return SegPair{b.head ? b.val : (a.val + b.val), a.head | b.head};
+    }
+  };
+  using SegBlockScan = cub::BlockScan<SegPair, BLOCK_TASK_SIZE>;
+  __shared__ typename SegBlockScan::TempStorage seg_scan_storage;
 
   NodeWorkItemChunk<IdxT> chunk{};
   IdxT slot_local = 0;
@@ -83,21 +95,23 @@ __global__ void batched_partition_kernel(PredictWorkspacePointers<DataT, LabelT,
     }
   }
 
-  if (active) {
-    s_is_left[tid] = (lane_valid && is_left) ? 1 : 0;
-  }
-  __syncthreads();
+  s_is_left[tid] = (active && lane_valid && is_left) ? 1 : 0;
 
-  // Build per-slot left rank once per block (segments are chunk-contiguous by Pop() contract).
-  if (tid == 0) {
-    IdxT run = 0;
-    for (IdxT j = 0; j < task.count; j++) {
-      if (j == s_chunk_begin[j]) { run = 0; }
-      s_local_left_rank[j] = run;
-      run += static_cast<IdxT>(s_is_left[j]);
-    }
+  SegPair in_pair{
+    static_cast<IdxT>(s_is_left[tid]),
+    static_cast<int>(active && (tid == s_chunk_begin[tid]))
+  };
+  if (!active) {
+    // Inactive lanes terminate any carry and don't contribute values.
+    in_pair.head = 1;
+    in_pair.val = 0;
   }
-  __syncthreads();
+  SegPair out_pair;
+  SegBlockScan(seg_scan_storage).InclusiveScan(in_pair, out_pair, SegScanOp{});
+  if (active) {
+    // Convert inclusive segmented prefix to exclusive rank.
+    s_local_left_rank[tid] = out_pair.val - static_cast<IdxT>(s_is_left[tid]);
+  }
 
   if (!active || !lane_valid) { return; }
 
