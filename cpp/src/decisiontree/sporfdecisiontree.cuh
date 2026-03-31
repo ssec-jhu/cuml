@@ -104,6 +104,7 @@ class SPORFPredictNodeQueue {
    * 1) `popped`: all dequeued work items (including leaves/empty nodes so queue semantics stay intact).
    * 2) `chunks`: per-(work item segment) metadata for batched projection/count/partition kernels.
    * 3) `block_tasks`: fixed-size row chunks for batched projection/count/partition kernels.
+   * 4) `max_n_proj_components`: maximum projection output dimensionality among active work items.
    *
    * Guarantees:
    * - `block_tasks[*].work_item_ids` are batch-local ids into `popped` (`popped_idx`).
@@ -115,6 +116,7 @@ class SPORFPredictNodeQueue {
   auto Pop()
   {
     size_t total_rows = 0;
+    IdxT max_n_proj_components = 0;
     std::vector<NodeWorkItem> popped;
     std::vector<BlockTask<IdxT>> block_tasks;
     std::vector<NodeWorkItemChunk<IdxT>> chunks;
@@ -136,6 +138,11 @@ class SPORFPredictNodeQueue {
       auto* work_item = &popped.back();
 
       total_rows += work_item->instances.count;
+      auto* random_matrix = tree.projection_vectors[work_item->idx].get();
+      if (random_matrix != nullptr) {
+        max_n_proj_components = std::max<IdxT>(
+          max_n_proj_components, static_cast<IdxT>(random_matrix->indptr.size() - 1));
+      }
 
       for(IdxT threads_left = work_item->instances.count, instances_begin = work_item->instances.begin; threads_left > 0; ) {
         if(block_tasks.empty() || block_tasks.back().count == BLOCK_TASK_SIZE) {
@@ -170,7 +177,8 @@ class SPORFPredictNodeQueue {
       }
     }
 
-    return std::make_tuple(std::move(popped), std::move(chunks), std::move(block_tasks));
+    return std::make_tuple(
+      std::move(popped), std::move(chunks), std::move(block_tasks), max_n_proj_components);
   }
 
   void Push(const std::vector<NodeWorkItem>& work_items)
@@ -217,6 +225,7 @@ struct PredictWorkspaceMeta {
   IdxT cap_block_tasks;
   IdxT cap_prediction_leaves;
   IdxT n_nodes;
+  IdxT n_proj_components;
   IdxT n_work_items;
   IdxT n_chunks;
   IdxT n_block_tasks;
@@ -265,6 +274,7 @@ struct SPORFDecisionTreeWorkspace {
       static_cast<IdxT>(std::max<size_t>(1, ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE))));
     meta.cap_prediction_leaves = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
     meta.n_nodes = 0;
+    meta.n_proj_components = 0;
     meta.n_work_items = 0;
     meta.n_chunks = 0;
     meta.n_block_tasks = 0;
@@ -316,6 +326,7 @@ struct SPORFDecisionTreeWorkspace {
     meta.n_chunks = 0;
     meta.n_block_tasks = 0;
     meta.n_nodes = static_cast<IdxT>(tree.sparsetree.size());
+    meta.n_proj_components = 0;
     meta.n_leaves = static_cast<IdxT>(tree.sparsetree.size());
     meta.n_vector_leaf = static_cast<IdxT>(tree.vector_leaf.size());
 

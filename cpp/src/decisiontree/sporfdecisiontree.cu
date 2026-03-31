@@ -42,6 +42,8 @@ __global__ void batched_partition_kernel(PredictWorkspacePointers<DataT, LabelT,
 {
   auto block_id = static_cast<IdxT>(blockIdx.x);
   if (block_id >= meta.n_block_tasks) { return; }
+  auto comp = static_cast<IdxT>(blockIdx.y);
+  if (comp >= meta.n_proj_components) { return; }
 
   auto tid = static_cast<IdxT>(threadIdx.x);
   auto task = pointers.d_block_tasks[block_id];
@@ -141,6 +143,8 @@ __global__ void batched_copyback_kernel(PredictWorkspacePointers<DataT, LabelT, 
 {
   auto block_id = static_cast<IdxT>(blockIdx.x);
   if (block_id >= meta.n_block_tasks) { return; }
+  auto comp = static_cast<IdxT>(blockIdx.y);
+  if (comp >= meta.n_proj_components) { return; }
 
   auto tid = static_cast<IdxT>(threadIdx.x);
   auto task = pointers.d_block_tasks[block_id];
@@ -354,9 +358,11 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       auto& work_items = std::get<0>(popped_batch);
       auto& chunks = std::get<1>(popped_batch);
       auto& block_tasks = std::get<2>(popped_batch);
+      auto max_n_proj_components = std::get<3>(popped_batch);
       ws.meta.n_work_items = static_cast<IdxT>(work_items.size());
       ws.meta.n_chunks = static_cast<IdxT>(chunks.size());
       ws.meta.n_block_tasks = static_cast<IdxT>(block_tasks.size());
+      ws.meta.n_proj_components = max_n_proj_components;
       if (do_timing) { ms_pop += to_ms(clock_t::now() - t_pop_start); }
 
       measure_gpu(ms_h2d_meta, [&]() {
@@ -500,6 +506,8 @@ __global__ void batched_projection_kernel(
 {
   auto block_id = static_cast<IdxT>(blockIdx.x);
   if (block_id >= meta.n_block_tasks) { return; }
+  auto comp = static_cast<IdxT>(blockIdx.y);
+  if (comp >= meta.n_proj_components) { return; }
 
   auto tid = static_cast<IdxT>(threadIdx.x);
   auto task = pointers.d_block_tasks[block_id];
@@ -521,8 +529,7 @@ __global__ void batched_projection_kernel(
       if (row_id < meta.n_rows) {
         auto node = pointers.d_nodes[chunk.node_id];
         auto pm = node.projection;
-        DataT projected0 = DataT(0);
-        for (IdxT comp = 0; comp < pm.n_proj_components; comp++) {
+        if (comp < pm.n_proj_components) {
           int start = pm.d_proj_indptr[comp];
           int end = pm.d_proj_indptr[comp + 1];
           DataT acc = DataT(0);
@@ -534,19 +541,19 @@ __global__ void batched_projection_kernel(
             acc += pointers.d_input_col_major[feat * meta.n_rows + row_id] * coeff;
           }
           pointers.d_trans[comp * meta.n_rows + row_pos] = acc;
-          if (comp == 0) { projected0 = acc; }  // Predict currently uses component 0 for split.
+          if (comp == 0) {
+            lane_valid = true;
+            is_left = acc <= node.quesval;
+          }
         }
-
-        lane_valid = true;
-        is_left = projected0 <= node.quesval;
       }
     }
   }
 
-  s_left_flags[tid] = (active && lane_valid && is_left) ? 1 : 0;
+  s_left_flags[tid] = (comp == 0 && active && lane_valid && is_left) ? 1 : 0;
   __syncthreads();
 
-  if (!active || !lane_valid) { return; }
+  if (comp != 0 || !active || !lane_valid) { return; }
 
   if (tid == chunk.thread_local_begin) {
     IdxT curr_left_count = 0;
@@ -576,7 +583,7 @@ void launch_batched_projection_kernel(
 {
   constexpr int TPB = BLOCK_TASK_SIZE;  // or 128
   dim3 block(TPB);
-  dim3 grid(meta.n_block_tasks);             // one block per BlockTask for first version
+  dim3 grid(meta.n_block_tasks, meta.n_proj_components);
   batched_projection_kernel<DataT, LabelT, IdxT><<<grid, block, 0, stream>>>(pointers, meta);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
