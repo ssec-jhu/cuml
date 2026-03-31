@@ -216,35 +216,134 @@ struct ObliqueNode {
 
 
 template <typename DataT, typename LabelT, typename IdxT>
-struct PredictWorkspaceMeta {
+struct BatchedProjectionWorkspaceMeta {
   IdxT n_rows;
   IdxT n_cols;
   IdxT max_batch_size;
   IdxT cap_work_items;
   IdxT cap_chunks;
   IdxT cap_block_tasks;
-  IdxT cap_prediction_leaves;
-  IdxT n_nodes;
   IdxT n_proj_components;
   IdxT n_work_items;
   IdxT n_chunks;
   IdxT n_block_tasks;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct PredictWorkspaceMeta {
+  BatchedProjectionWorkspaceMeta<DataT, LabelT, IdxT> projection;
+  IdxT cap_prediction_leaves;
+  IdxT n_nodes;
   IdxT n_leaves;
   IdxT n_vector_leaf;
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
-struct PredictWorkspacePointers {
-  const DataT*                    d_input_col_major;
-  IdxT*                           d_row_ids;
-  IdxT*                           d_row_ids_scratch;
+struct BatchedProjectionWorkspacePointers {
   DataT*                          d_trans;
-  IdxT*                           d_work_item_nleft;
-  ObliqueNode<DataT, IdxT>*       d_nodes;
   SPORFDT::NodeWorkItem*          d_work_items;
   NodeWorkItemChunk<IdxT>*        d_chunks;
   BlockTask<IdxT>*                d_block_tasks;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct PredictWorkspacePointers {
+  BatchedProjectionWorkspacePointers<DataT, LabelT, IdxT> projection;
+  const DataT*                    d_input_col_major;
+  IdxT*                           d_row_ids;
+  IdxT*                           d_row_ids_scratch;
+  IdxT*                           d_work_item_nleft;
+  ObliqueNode<DataT, IdxT>*       d_nodes;
   IdxT*                           d_prediction_leaves;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct TrainingProjectionWorkspaceMeta {
+  BatchedProjectionWorkspaceMeta<DataT, LabelT, IdxT> projection;
+  IdxT input_n_rows;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct TrainingProjectionWorkspacePointers {
+  BatchedProjectionWorkspacePointers<DataT, LabelT, IdxT> projection;
+  const DataT*                         d_input_col_major;
+  const IdxT*                          d_row_ids;
+  ProjectionMatrix<DataT, IdxT>*       d_projection_matrices;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct SPORFTrainingProjectionWorkspace {
+  rmm::device_uvector<char> d_workspace;
+  rmm::device_uvector<ProjectionMatrix<DataT, IdxT>> d_projection_matrices_storage;
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers{};
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta{};
+
+  SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
+    : d_workspace(0, stream), d_projection_matrices_storage(0, stream)
+  {
+    auto align_bytes = [](size_t actual_size) {
+      constexpr size_t align = 256;
+      return raft::alignTo(actual_size, align);
+    };
+    auto ceil_div = [](size_t a, size_t b) { return (a + b - 1) / b; };
+
+    meta.projection.n_rows = static_cast<IdxT>(n_rows_);
+    meta.projection.n_cols = 0;
+    meta.projection.max_batch_size = static_cast<IdxT>(max_batch_size_);
+    meta.projection.cap_work_items = static_cast<IdxT>(max_batch_size_);
+    meta.projection.cap_chunks = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
+    meta.projection.cap_block_tasks =
+      static_cast<IdxT>(std::max<size_t>(1, ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE))));
+    meta.projection.n_proj_components = 0;
+    meta.projection.n_work_items = 0;
+    meta.projection.n_chunks = 0;
+    meta.projection.n_block_tasks = 0;
+    meta.input_n_rows = static_cast<IdxT>(n_rows_);
+
+    size_t workspace_bytes = 0;
+    workspace_bytes += align_bytes(n_rows_ * sizeof(DataT));  // projected values
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
+
+    d_workspace.resize(workspace_bytes, stream);
+    d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
+
+    auto* base = d_workspace.data();
+    size_t off = 0;
+    auto carve = [&](size_t bytes) {
+      auto* p = base + off;
+      off += align_bytes(bytes);
+      return p;
+    };
+
+    pointers.projection.d_trans = reinterpret_cast<DataT*>(carve(n_rows_ * sizeof(DataT)));
+    pointers.projection.d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(
+      carve(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem)));
+    pointers.projection.d_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
+    pointers.projection.d_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
+    pointers.d_input_col_major = nullptr;
+    pointers.d_row_ids = nullptr;
+    pointers.d_projection_matrices = d_projection_matrices_storage.data();
+  }
+
+  void reset(cudaStream_t stream)
+  {
+    meta.projection.n_cols = 0;
+    meta.projection.n_proj_components = 0;
+    meta.projection.n_work_items = 0;
+    meta.projection.n_chunks = 0;
+    meta.projection.n_block_tasks = 0;
+    if (d_projection_matrices_storage.size() < static_cast<size_t>(meta.projection.cap_work_items)) {
+      d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
+    }
+    pointers.d_projection_matrices = d_projection_matrices_storage.data();
+  }
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
@@ -265,19 +364,19 @@ struct SPORFDecisionTreeWorkspace {
     };
     auto ceil_div = [](size_t a, size_t b) { return (a + b - 1) / b; };
 
-    meta.n_rows = static_cast<IdxT>(n_rows_);
-    meta.n_cols = 0;
-    meta.max_batch_size = static_cast<IdxT>(max_batch_size_);
-    meta.cap_work_items = static_cast<IdxT>(max_batch_size_);
-    meta.cap_chunks = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
-    meta.cap_block_tasks =
+    meta.projection.n_rows = static_cast<IdxT>(n_rows_);
+    meta.projection.n_cols = 0;
+    meta.projection.max_batch_size = static_cast<IdxT>(max_batch_size_);
+    meta.projection.cap_work_items = static_cast<IdxT>(max_batch_size_);
+    meta.projection.cap_chunks = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
+    meta.projection.cap_block_tasks =
       static_cast<IdxT>(std::max<size_t>(1, ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE))));
     meta.cap_prediction_leaves = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
     meta.n_nodes = 0;
-    meta.n_proj_components = 0;
-    meta.n_work_items = 0;
-    meta.n_chunks = 0;
-    meta.n_block_tasks = 0;
+    meta.projection.n_proj_components = 0;
+    meta.projection.n_work_items = 0;
+    meta.projection.n_chunks = 0;
+    meta.projection.n_block_tasks = 0;
     meta.n_leaves = 0;
     meta.n_vector_leaf = 0;
 
@@ -285,11 +384,11 @@ struct SPORFDecisionTreeWorkspace {
     workspace_bytes += align_bytes(n_rows_ * sizeof(IdxT));                         // row_ids
     workspace_bytes += align_bytes(n_rows_ * sizeof(IdxT));                         // row_ids_scratch
     workspace_bytes += align_bytes(n_rows_ * sizeof(DataT));                        // projected values
-    workspace_bytes += align_bytes(static_cast<size_t>(meta.cap_work_items) * sizeof(IdxT)); // nLeft per work item
+    workspace_bytes += align_bytes(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(IdxT)); // nLeft per work item
     workspace_bytes +=
-      align_bytes(static_cast<size_t>(meta.cap_work_items) * sizeof(SPORFDT::NodeWorkItem));
-    workspace_bytes += align_bytes(static_cast<size_t>(meta.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
-    workspace_bytes += align_bytes(static_cast<size_t>(meta.cap_block_tasks) * sizeof(BlockTask<IdxT>));
+      align_bytes(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem));
+    workspace_bytes += align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
+    workspace_bytes += align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
     workspace_bytes += align_bytes(static_cast<size_t>(meta.cap_prediction_leaves) * sizeof(IdxT));
 
     d_workspace.resize(workspace_bytes, stream);
@@ -302,19 +401,19 @@ struct SPORFDecisionTreeWorkspace {
       return p;
     };
 
+    pointers.projection.d_trans = reinterpret_cast<DataT*>(carve(n_rows_ * sizeof(DataT)));
+    pointers.projection.d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(
+      carve(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem)));
+    pointers.projection.d_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
+    pointers.projection.d_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
     pointers.d_input_col_major = nullptr;
     pointers.d_row_ids = reinterpret_cast<IdxT*>(carve(n_rows_ * sizeof(IdxT)));
     pointers.d_row_ids_scratch = reinterpret_cast<IdxT*>(carve(n_rows_ * sizeof(IdxT)));
-    pointers.d_trans = reinterpret_cast<DataT*>(carve(n_rows_ * sizeof(DataT)));
     pointers.d_work_item_nleft =
-      reinterpret_cast<IdxT*>(carve(static_cast<size_t>(meta.cap_work_items) * sizeof(IdxT)));
+      reinterpret_cast<IdxT*>(carve(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(IdxT)));
     pointers.d_nodes = nullptr;
-    pointers.d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(
-      carve(static_cast<size_t>(meta.cap_work_items) * sizeof(SPORFDT::NodeWorkItem)));
-    pointers.d_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
-      carve(static_cast<size_t>(meta.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
-    pointers.d_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
-      carve(static_cast<size_t>(meta.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
     pointers.d_prediction_leaves =
       reinterpret_cast<IdxT*>(carve(static_cast<size_t>(meta.cap_prediction_leaves) * sizeof(IdxT)));
   }
@@ -322,11 +421,11 @@ struct SPORFDecisionTreeWorkspace {
   template <typename TreeMetaDataNodeT>
   void reset(const TreeMetaDataNodeT& tree, cudaStream_t stream)
   {
-    meta.n_work_items = 0;
-    meta.n_chunks = 0;
-    meta.n_block_tasks = 0;
+    meta.projection.n_work_items = 0;
+    meta.projection.n_chunks = 0;
+    meta.projection.n_block_tasks = 0;
     meta.n_nodes = static_cast<IdxT>(tree.sparsetree.size());
-    meta.n_proj_components = 0;
+    meta.projection.n_proj_components = 0;
     meta.n_leaves = static_cast<IdxT>(tree.sparsetree.size());
     meta.n_vector_leaf = static_cast<IdxT>(tree.vector_leaf.size());
 
@@ -384,6 +483,40 @@ class SPORFDecisionTree {
     const Quantiles<DataT, int>& quantiles,
     int treeid)
   {
+    using IdxT = int;
+    SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT> projection_ws(
+      static_cast<size_t>(nrows), static_cast<size_t>(params.max_batch_size), s);
+    return fit(handle,
+               s,
+               data,
+               ncols,
+               nrows,
+               labels,
+               row_ids,
+               unique_labels,
+               params,
+               seed,
+               quantiles,
+               treeid,
+               projection_ws);
+  }
+
+  template <class DataT, class LabelT>
+  static std::shared_ptr<TreeMetaDataNode<DataT, LabelT>> fit(
+    const raft::handle_t& handle,
+    const cudaStream_t s,
+    const DataT* data,
+    const int ncols,
+    const int nrows,
+    const LabelT* labels,
+    rmm::device_uvector<int>* row_ids,
+    int unique_labels,
+    SPORFDecisionTreeParams params,
+    uint64_t seed,
+    const Quantiles<DataT, int>& quantiles,
+    int treeid,
+    SPORFTrainingProjectionWorkspace<DataT, LabelT, int>& projection_ws)
+  {
     if (params.split_criterion ==
         CRITERION::CRITERION_END) {  // Set default to GINI (classification) or MSE (regression)
       CRITERION default_criterion =
@@ -404,7 +537,8 @@ class SPORFDecisionTree {
                                                                       ncols,
                                                                       row_ids,
                                                                       unique_labels,
-                                                                      quantiles)
+                                                                      quantiles,
+                                                                      projection_ws)
         .train();
     } else if (not std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::ENTROPY) {
@@ -419,7 +553,8 @@ class SPORFDecisionTree {
                                                                          ncols,
                                                                          row_ids,
                                                                          unique_labels,
-                                                                         quantiles)
+                                                                         quantiles,
+                                                                         projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
       return SPORFBuilder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
@@ -433,7 +568,8 @@ class SPORFDecisionTree {
                                                                      ncols,
                                                                      row_ids,
                                                                      unique_labels,
-                                                                     quantiles)
+                                                                     quantiles,
+                                                                     projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::POISSON) {
@@ -448,7 +584,8 @@ class SPORFDecisionTree {
                                                                          ncols,
                                                                          row_ids,
                                                                          unique_labels,
-                                                                         quantiles)
+                                                                         quantiles,
+                                                                         projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
       return SPORFBuilder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
@@ -462,7 +599,8 @@ class SPORFDecisionTree {
                                                                        ncols,
                                                                        row_ids,
                                                                        unique_labels,
-                                                                       quantiles)
+                                                                       quantiles,
+                                                                       projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::INVERSE_GAUSSIAN) {
@@ -477,7 +615,8 @@ class SPORFDecisionTree {
                                                                                  ncols,
                                                                                  row_ids,
                                                                                  unique_labels,
-                                                                                 quantiles)
+                                                                                 quantiles,
+                                                                                 projection_ws)
         .train();
     } else {
       ASSERT(false, "Unknown split criterion.");
@@ -598,6 +737,19 @@ template <typename DataT, typename LabelT, typename IdxT>
 void launch_batched_projection_kernel(
   const PredictWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const PredictWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void batched_training_projection_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream
 );
 

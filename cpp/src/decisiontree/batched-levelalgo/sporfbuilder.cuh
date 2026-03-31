@@ -46,6 +46,18 @@
 namespace ML {
 namespace DT {
 
+template <typename DataT, typename LabelT, typename IdxT>
+struct SPORFTrainingProjectionWorkspace;
+template <typename DataT, typename LabelT, typename IdxT>
+struct TrainingProjectionWorkspacePointers;
+template <typename DataT, typename LabelT, typename IdxT>
+struct TrainingProjectionWorkspaceMeta;
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream);
+
 
 /**
  * Structure that manages the iterative batched-level training and building of nodes
@@ -53,6 +65,7 @@ namespace DT {
  */
 template <typename DataT, typename LabelT>
 class SPORFNodeQueue {
+  using IdxT = int;
   using NodeT = SparseTreeNode<DataT, LabelT>;
   using TreeMetaDataNodeT = DT::ObliqueTreeMetaDataNode<DataT, LabelT>;
   const SPORFDecisionTreeParams params;
@@ -87,14 +100,61 @@ class SPORFNodeQueue {
   auto Pop()
   {
     size_t total_rows = 0;
-    std::vector<SPORFDT::NodeWorkItem> result;
-    result.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    while (work_items_.size() > 0 && result.size() < std::size_t(params.max_batch_size)) {
-      result.emplace_back(work_items_.front());
+    std::vector<SPORFDT::NodeWorkItem> popped;
+    std::vector<DT::BlockTask<IdxT>> block_tasks;
+    std::vector<DT::NodeWorkItemChunk<IdxT>> chunks;
+    popped.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
+    block_tasks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
+    chunks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
+
+    while (work_items_.size() > 0 && popped.size() < std::size_t(params.max_batch_size)) {
+      popped.emplace_back(work_items_.front());
       work_items_.pop_front();
-      total_rows += result.back().instances.count;
+      total_rows += popped.back().instances.count;
+
+      auto* work_item = &popped.back();
+      auto count = static_cast<IdxT>(work_item->instances.count);
+      if (count < static_cast<IdxT>(params.min_samples_split)) { continue; }
+
+      for (IdxT threads_left = count,
+                instances_begin = static_cast<IdxT>(work_item->instances.begin);
+           threads_left > 0;) {
+        if (block_tasks.empty() || block_tasks.back().count == DT::BLOCK_TASK_SIZE) {
+          block_tasks.emplace_back(DT::BlockTask<IdxT>{});
+          block_tasks.back().count = 0;
+        }
+
+        auto* block_task = &block_tasks.back();
+        IdxT thread_count =
+          std::min<IdxT>(DT::BLOCK_TASK_SIZE - block_task->count, threads_left);
+
+        chunks.emplace_back(DT::NodeWorkItemChunk<IdxT>{
+          static_cast<IdxT>(popped.size() - 1),       // work_item_idx (batch-local)
+          static_cast<IdxT>(work_item->idx),          // node_id (global tree node id)
+          instances_begin,                            // instances_begin
+          thread_count,                               // instances_count
+          static_cast<IdxT>(block_tasks.size() - 1),  // block_task_idx
+          block_task->count,                          // thread_local_begin
+          0,                                          // nLeft
+          0,                                          // nRight
+          0,                                          // loff
+          0                                           // roff
+        });
+
+        auto chunk_idx = static_cast<IdxT>(chunks.size() - 1);
+        auto* chunk = &chunks.back();
+        for (IdxT i = chunk->thread_local_begin;
+             i < chunk->thread_local_begin + chunk->instances_count;
+             i++) {
+          block_task->work_item_chunk_ids[i] = chunk_idx;
+        }
+
+        block_task->count += thread_count;
+        instances_begin += thread_count;
+        threads_left -= thread_count;
+      }
     }
-    return result;
+    return std::make_tuple(std::move(popped), std::move(chunks), std::move(block_tasks));
   }
 
   // This node is allowed to be expanded further (if its split gain is high enough)
@@ -232,6 +292,7 @@ struct SPORFBuilder {
   IdxT* h_colids;
   /** rmm device workspace buffer */
   rmm::device_uvector<char> d_buff;
+  SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws;
   /** pinned host buffer to store the trained nodes */
   ML::pinned_host_vector<char> h_buff;
   /**
@@ -274,7 +335,8 @@ struct SPORFBuilder {
           IdxT n_cols,
           rmm::device_uvector<IdxT>* row_ids,
           IdxT n_classes,
-          const QuantilesT& q)
+          const QuantilesT& q,
+          SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws_)
     : handle(handle),
       builder_stream(s),
       treeid(treeid),
@@ -289,6 +351,7 @@ struct SPORFBuilder {
               row_ids->data(),
               n_classes
       },
+      projection_ws(projection_ws_),
       quantiles(q),
       d_quantile_indices(0, builder_stream),
       d_quantiles(0, builder_stream),
@@ -482,8 +545,12 @@ struct SPORFBuilder {
     SPORFNodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs);
     while (queue.HasWork()) {
-      auto work_items                      = queue.Pop();
-      auto [splits_host_ptr, splits_count] = doSplit(work_items);
+      auto popped_batch                    = queue.Pop();
+      auto& work_items                     = std::get<0>(popped_batch);
+      auto& chunks                         = std::get<1>(popped_batch);
+      auto& block_tasks                    = std::get<2>(popped_batch);
+      auto [splits_host_ptr, splits_count] =
+        doSplit(work_items, chunks, block_tasks, projection_ws);
       queue.Push(work_items, splits_host_ptr, h_sparse_matrices, dataset.n_sampled_cols);
     }
     auto tree = queue.GetTree();
@@ -525,7 +592,10 @@ struct SPORFBuilder {
     return std::make_pair(n_blocks_dimx, n_large_nodes);
   }
 
-  auto doSplit(const std::vector<SPORFDT::NodeWorkItem>& work_items)
+  auto doSplit(const std::vector<SPORFDT::NodeWorkItem>& work_items,
+               const std::vector<DT::NodeWorkItemChunk<IdxT>>& chunks,
+               const std::vector<DT::BlockTask<IdxT>>& block_tasks,
+               SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws)
   {
     raft::common::nvtx::range fun_scope("SPORFBuilder::doSplit @sporfbuilder.cuh [batched-levelalgo]");
     // start fresh on the number of *new* nodes created in this batch
@@ -544,28 +614,14 @@ struct SPORFBuilder {
     }
     raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
 
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<DT::ProjectionMatrix<DataT, IdxT>> projection_matrices(
+      work_items.size(), DT::ProjectionMatrix<DataT, IdxT>{0, nullptr, nullptr, nullptr});
+    IdxT max_n_proj_components = 0;
 
-      auto t0 = std::chrono::steady_clock::now();
-    // TODO: parallelize this over work_items
     for (size_t i = 0; i < work_items.size(); i++) {
-      auto& begin = work_items[i].instances.begin;
-      auto& count = work_items[i].instances.count;
-
+      auto count = work_items[i].instances.count;
       if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-
-      t0 = std::chrono::steady_clock::now();
-      raft::matrix::copyRows<DataT, IdxT, size_t>(
-        dataset.data,                     // in
-        dataset.M,                        // total rows in input matrix (col-major)
-        dataset.N,                        // number of columns of output matrix
-        d_contiguous.data() + begin,      // out (contiguous block for this node)
-        dataset.row_ids + begin,          // row indices to copy
-        count,                            // rows to copy for this node
-        builder_stream,
-        false                             // do-row-major (false, i.e. do column-major)
-      );
-      RAFT_CUDA_TRY(cudaPeekAtLastError());
-stats.t_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
       // TODO: fix rproj to use better types than int for everything
       paramsRPROJ rproj_params{
@@ -585,50 +641,78 @@ stats.t_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_cl
       auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i) & 0x7fffffffULL);
       rproj_params.random_state = random_state;
       RPROJfit(handle, &random_matrix, &rproj_params);
-stats.t_rproj_fit += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        t0 = std::chrono::steady_clock::now();
+      projection_matrices[i] = DT::ProjectionMatrix<DataT, IdxT>{
+        static_cast<int>(random_matrix.indptr.size()) - 1,
+        random_matrix.indptr.data(),
+        random_matrix.indices.data(),
+        random_matrix.sparse_data.data()
+      };
+      max_n_proj_components =
+        std::max(max_n_proj_components, static_cast<IdxT>(projection_matrices[i].n_proj_components));
+      stats.t_rproj_fit +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
 
-        {
-    auto cusparse_handle = handle.get_cusparse_handle();
+    projection_ws.reset(builder_stream);
+    projection_ws.meta.input_n_rows = dataset.M;
+    projection_ws.meta.projection.n_rows = dataset.n_sampled_rows;
+    projection_ws.meta.projection.n_cols = dataset.N;
+    projection_ws.meta.projection.n_work_items = static_cast<IdxT>(work_items.size());
+    projection_ws.meta.projection.n_chunks = static_cast<IdxT>(chunks.size());
+    projection_ws.meta.projection.n_block_tasks = static_cast<IdxT>(block_tasks.size());
+    projection_ws.meta.projection.n_proj_components = max_n_proj_components;
+    projection_ws.pointers.d_input_col_major = dataset.data;
+    projection_ws.pointers.d_row_ids = dataset.row_ids;
+    // Keep training projection output aligned with the existing builder-side d_trans buffer.
+    projection_ws.pointers.projection.d_trans = d_trans.data();
 
-    const DataT alfa = 1;
-    const DataT beta = 0;
+    ASSERT(projection_ws.meta.projection.n_work_items <= projection_ws.meta.projection.cap_work_items,
+           "Training projection workspace overflow: work_items");
+    ASSERT(projection_ws.meta.projection.n_chunks <= projection_ws.meta.projection.cap_chunks,
+           "Training projection workspace overflow: chunks");
+    ASSERT(projection_ws.meta.projection.n_block_tasks <= projection_ws.meta.projection.cap_block_tasks,
+           "Training projection workspace overflow: block_tasks");
 
-    auto& m         = rproj_params.n_samples;
-    auto& n         = rproj_params.n_components;
-    auto& k         = rproj_params.n_features;
-    std::size_t nnz = random_matrix.sparse_data.size();
+    if (!work_items.empty()) {
+      raft::update_device(projection_ws.pointers.projection.d_work_items,
+                          work_items.data(),
+                          projection_ws.meta.projection.n_work_items,
+                          builder_stream);
+      raft::update_device(projection_ws.pointers.d_projection_matrices,
+                          projection_matrices.data(),
+                          projection_ws.meta.projection.n_work_items,
+                          builder_stream);
+    }
+    if (!chunks.empty()) {
+      raft::update_device(projection_ws.pointers.projection.d_chunks,
+                          chunks.data(),
+                          projection_ws.meta.projection.n_chunks,
+                          builder_stream);
+    }
+    if (!block_tasks.empty()) {
+      raft::update_device(projection_ws.pointers.projection.d_block_tasks,
+                          block_tasks.data(),
+                          projection_ws.meta.projection.n_block_tasks,
+                          builder_stream);
+    }
 
-    auto& lda = m;
-    auto& ldc = dataset.n_sampled_rows;
-stats.t_pre_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_copy += 0.0;
+    stats.t_pre_transform += 0.0;
+    t0 = std::chrono::steady_clock::now();
+    launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
+      projection_ws.pointers, projection_ws.meta, builder_stream);
+    stats.t_rproj_transform +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-t0 = std::chrono::steady_clock::now();
-    // TODO: Need to wrap this in a RAFT public API.
-    RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsegemmi(cusparse_handle,
-                                                          m,
-                                                          n,
-                                                          k,
-                                                          nnz,
-                                                          &alfa,
-                                                          d_contiguous.data() + begin,
-                                                          lda,
-                                                          random_matrix.sparse_data.data(),
-                                                          random_matrix.indptr.data(),
-                                                          random_matrix.indices.data(),
-                                                          &beta,
-                                                          d_trans.data() + begin,
-                                                          ldc,
-                                                          builder_stream));
+    t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < work_items.size(); i++) {
+      auto count = work_items[i].instances.count;
+      if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
 
-        }
-stats.t_rproj_transform += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-
-      t0 = std::chrono::steady_clock::now();
-      std::vector<IdxT> universe(work_items[i].instances.count);
+      std::vector<IdxT> universe(count);
       std::iota(universe.begin(), universe.end(), 0);
 
-for(int c = 0; c < dataset.n_sampled_cols; c++) {
+      for (int c = 0; c < dataset.n_sampled_cols; c++) {
         std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
         // TODO: randomize the order here!
         std::sample(
@@ -638,7 +722,7 @@ for(int c = 0; c < dataset.n_sampled_cols; c++) {
     }
 
     raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
-        stats.t_sampling += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_sampling += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     dataset_proj.data = d_trans.data();
 t0 = std::chrono::steady_clock::now();
