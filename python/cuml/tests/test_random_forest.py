@@ -300,7 +300,7 @@ def test_tweedie_convergence(max_depth, split_criterion):
     "max_samples", [unit_param(1.0), quality_param(0.90), stress_param(0.95)]
 )
 #@pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
-@pytest.mark.parametrize("max_features", [1.0])
+@pytest.mark.parametrize("max_features", [0.25])
 @pytest.mark.parametrize("datatype", [np.float32, np.float64])
 #@pytest.mark.parametrize("small_clf", [{"n_samples": 10, "n_features": 8, "n_informative": 4}], indirect=True)
 @pytest.mark.skipif(

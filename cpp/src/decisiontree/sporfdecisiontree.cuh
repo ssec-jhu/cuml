@@ -138,10 +138,10 @@ class SPORFPredictNodeQueue {
       auto* work_item = &popped.back();
 
       total_rows += work_item->instances.count;
-      auto* random_matrix = tree.projection_vectors[work_item->idx].get();
-      if (random_matrix != nullptr) {
+      auto* projection_matrix = tree.projection_vectors[work_item->idx].get();
+      if (projection_matrix != nullptr) {
         max_n_proj_components = std::max<IdxT>(
-          max_n_proj_components, static_cast<IdxT>(random_matrix->indptr.size() - 1));
+          max_n_proj_components, static_cast<IdxT>(projection_matrix->indptr.size() - 1));
       }
 
       for(IdxT threads_left = work_item->instances.count, instances_begin = work_item->instances.begin; threads_left > 0; ) {
@@ -261,6 +261,12 @@ template <typename DataT, typename LabelT, typename IdxT>
 struct TrainingProjectionWorkspaceMeta {
   BatchedProjectionWorkspaceMeta<DataT, LabelT, IdxT> projection;
   IdxT input_n_rows;
+  IdxT n_generation_chunks;
+  IdxT n_generation_block_tasks;
+  IdxT generation_n_features;
+  IdxT generation_min_samples_split;
+  DataT generation_density;
+  int generation_random_state;
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
@@ -269,17 +275,38 @@ struct TrainingProjectionWorkspacePointers {
   const DataT*                         d_input_col_major;
   const IdxT*                          d_row_ids;
   ProjectionMatrix<DataT, IdxT>*       d_projection_matrices;
+  NodeWorkItemChunk<IdxT>*             d_generation_chunks;
+  BlockTask<IdxT>*                     d_generation_block_tasks;
+  int*                                 d_generation_keep_mask;
+  DataT*                               d_generation_dense_values;
+  int*                                 d_generation_indptr;
+  int*                                 d_generation_indices;
+  DataT*                               d_generation_sparse_data;
+  int*                                 d_generation_nnz_counter;
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
 struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<char> d_workspace;
   rmm::device_uvector<ProjectionMatrix<DataT, IdxT>> d_projection_matrices_storage;
+  rmm::device_uvector<int> d_generation_keep_mask_storage;
+  rmm::device_uvector<DataT> d_generation_dense_values_storage;
+  rmm::device_uvector<int> d_generation_indptr_storage;
+  rmm::device_uvector<int> d_generation_indices_storage;
+  rmm::device_uvector<DataT> d_generation_sparse_data_storage;
+  rmm::device_uvector<int> d_generation_nnz_counter_storage;
   TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers{};
   TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta{};
 
   SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
-    : d_workspace(0, stream), d_projection_matrices_storage(0, stream)
+    : d_workspace(0, stream),
+      d_projection_matrices_storage(0, stream),
+      d_generation_keep_mask_storage(0, stream),
+      d_generation_dense_values_storage(0, stream),
+      d_generation_indptr_storage(0, stream),
+      d_generation_indices_storage(0, stream),
+      d_generation_sparse_data_storage(0, stream),
+      d_generation_nnz_counter_storage(0, stream)
   {
     auto align_bytes = [](size_t actual_size) {
       constexpr size_t align = 256;
@@ -299,11 +326,21 @@ struct SPORFTrainingProjectionWorkspace {
     meta.projection.n_chunks = 0;
     meta.projection.n_block_tasks = 0;
     meta.input_n_rows = static_cast<IdxT>(n_rows_);
+    meta.n_generation_chunks = 0;
+    meta.n_generation_block_tasks = 0;
+    meta.generation_n_features = 0;
+    meta.generation_min_samples_split = 0;
+    meta.generation_density = DataT(0);
+    meta.generation_random_state = 0;
 
     size_t workspace_bytes = 0;
     workspace_bytes += align_bytes(n_rows_ * sizeof(DataT));  // projected values
     workspace_bytes +=
       align_bytes(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
     workspace_bytes +=
       align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
     workspace_bytes +=
@@ -327,9 +364,20 @@ struct SPORFTrainingProjectionWorkspace {
       carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
     pointers.projection.d_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
       carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
+    pointers.d_generation_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
+    pointers.d_generation_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
     pointers.d_input_col_major = nullptr;
     pointers.d_row_ids = nullptr;
     pointers.d_projection_matrices = d_projection_matrices_storage.data();
+    d_generation_nnz_counter_storage.resize(1, stream);
+    pointers.d_generation_keep_mask = nullptr;
+    pointers.d_generation_dense_values = nullptr;
+    pointers.d_generation_indptr = nullptr;
+    pointers.d_generation_indices = nullptr;
+    pointers.d_generation_sparse_data = nullptr;
+    pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
   }
 
   void reset(cudaStream_t stream)
@@ -339,10 +387,89 @@ struct SPORFTrainingProjectionWorkspace {
     meta.projection.n_work_items = 0;
     meta.projection.n_chunks = 0;
     meta.projection.n_block_tasks = 0;
+    meta.n_generation_chunks = 0;
+    meta.n_generation_block_tasks = 0;
+    meta.generation_n_features = 0;
+    meta.generation_density = DataT(0);
+    meta.generation_random_state = 0;
     if (d_projection_matrices_storage.size() < static_cast<size_t>(meta.projection.cap_work_items)) {
       d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
     }
     pointers.d_projection_matrices = d_projection_matrices_storage.data();
+    if (d_generation_nnz_counter_storage.size() < 1) { d_generation_nnz_counter_storage.resize(1, stream); }
+  }
+
+  void ensure_generation_metadata_capacity(IdxT n_generation_chunks_req,
+                                           IdxT n_generation_block_tasks_req,
+                                           cudaStream_t stream)
+  {
+    if (n_generation_chunks_req <= meta.projection.cap_chunks &&
+        n_generation_block_tasks_req <= meta.projection.cap_block_tasks) {
+      return;
+    }
+
+    meta.projection.cap_chunks =
+      std::max(meta.projection.cap_chunks, std::max<IdxT>(n_generation_chunks_req, 1));
+    meta.projection.cap_block_tasks =
+      std::max(meta.projection.cap_block_tasks, std::max<IdxT>(n_generation_block_tasks_req, 1));
+
+    auto align_bytes = [](size_t actual_size) {
+      constexpr size_t align = 256;
+      return raft::alignTo(actual_size, align);
+    };
+
+    size_t workspace_bytes = 0;
+    workspace_bytes += align_bytes(static_cast<size_t>(meta.projection.n_rows) * sizeof(DataT));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>));
+    workspace_bytes +=
+      align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
+
+    d_workspace.resize(workspace_bytes, stream);
+
+    auto* base = d_workspace.data();
+    size_t off = 0;
+    auto carve = [&](size_t bytes) {
+      auto* p = base + off;
+      off += align_bytes(bytes);
+      return p;
+    };
+
+    pointers.projection.d_trans = reinterpret_cast<DataT*>(
+      carve(static_cast<size_t>(meta.projection.n_rows) * sizeof(DataT)));
+    pointers.projection.d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(
+      carve(static_cast<size_t>(meta.projection.cap_work_items) * sizeof(SPORFDT::NodeWorkItem)));
+    pointers.projection.d_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
+    pointers.projection.d_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
+    pointers.d_generation_chunks = reinterpret_cast<NodeWorkItemChunk<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_chunks) * sizeof(NodeWorkItemChunk<IdxT>)));
+    pointers.d_generation_block_tasks = reinterpret_cast<BlockTask<IdxT>*>(
+      carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
+  }
+
+  void resize_generation_storage(size_t dense_len, size_t indptr_len, cudaStream_t stream)
+  {
+    d_generation_keep_mask_storage.resize(dense_len, stream);
+    d_generation_dense_values_storage.resize(dense_len, stream);
+    d_generation_indptr_storage.resize(indptr_len, stream);
+    d_generation_indices_storage.resize(dense_len, stream);
+    d_generation_sparse_data_storage.resize(dense_len, stream);
+    if (d_generation_nnz_counter_storage.size() < 1) { d_generation_nnz_counter_storage.resize(1, stream); }
+
+    pointers.d_generation_keep_mask = d_generation_keep_mask_storage.data();
+    pointers.d_generation_dense_values = d_generation_dense_values_storage.data();
+    pointers.d_generation_indptr = d_generation_indptr_storage.data();
+    pointers.d_generation_indices = d_generation_indices_storage.data();
+    pointers.d_generation_sparse_data = d_generation_sparse_data_storage.data();
+    pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
   }
 };
 
@@ -442,13 +569,10 @@ struct SPORFDecisionTreeWorkspace {
     std::vector<ObliqueNode<DataT, IdxT>> nodes_host;
     nodes_host.reserve(tree.sparsetree.size());
     for (size_t i = 0; i < tree.sparsetree.size(); i++) {
-      auto* random_matrix = tree.projection_vectors[i].get();
+      auto* projection_matrix = tree.projection_vectors[i].get();
       ProjectionMatrix<DataT, IdxT> proj{0, nullptr, nullptr, nullptr};
-      if (random_matrix) {
-        proj.n_proj_components = static_cast<IdxT>(random_matrix->indptr.size()) - 1;
-        proj.d_proj_indptr = random_matrix->indptr.data();
-        proj.d_proj_indices = random_matrix->indices.data();
-        proj.d_proj_coeffs = random_matrix->sparse_data.data();
+      if (projection_matrix) {
+        proj = projection_matrix->view();
       }
       nodes_host.push_back(ObliqueNode<DataT, IdxT>{proj, tree.sparsetree[i].QueryValue()});
     }
@@ -748,6 +872,13 @@ __global__ void batched_training_projection_kernel(
 
 template <typename DataT, typename LabelT, typename IdxT>
 void launch_batched_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_random_matrix_bernoulli_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream

@@ -44,6 +44,29 @@ struct ProjectionMatrix {
   const DataT* d_proj_coeffs; // projection matrix component non-zero coefficients
 };
 
+template <typename DataT, typename IdxT = int>
+struct OwnedProjectionMatrix {
+  explicit OwnedProjectionMatrix(cudaStream_t stream)
+    : indptr(0, stream), indices(0, stream), coeffs(0, stream), stream(stream)
+  {
+  }
+
+  rmm::device_uvector<IdxT> indptr;
+  rmm::device_uvector<IdxT> indices;
+  rmm::device_uvector<DataT> coeffs;
+  cudaStream_t stream;
+
+  ProjectionMatrix<DataT, IdxT> view() const
+  {
+    return ProjectionMatrix<DataT, IdxT>{
+      static_cast<IdxT>(indptr.size() > 0 ? indptr.size() - 1 : 0),
+      indptr.data(),
+      indices.data(),
+      coeffs.data()
+    };
+  }
+};
+
 static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads per block for GPU kernels
 
 template <typename IdxT = int>
@@ -77,39 +100,13 @@ struct SPORFDecisionTreeParams : DecisionTreeParams {
 
 template <class T, class L>
 struct ObliqueTreeMetaDataNode : public TreeMetaDataNode<T, L> {
-  std::vector<std::unique_ptr<ML::rand_mat<T>>> projection_vectors;
+  std::vector<std::unique_ptr<OwnedProjectionMatrix<T>>> projection_vectors;
 };
 
-template <typename DataT>
-void clone_rand_mat(const ML::rand_mat<DataT>& src, ML::rand_mat<DataT>& dst) {
-  dst.type = src.type;
-  switch (src.type) {
-    case ML::dense:
-      dst.dense_data = rmm::device_uvector<DataT>(src.dense_data.size(), dst.stream);
-      raft::copy(dst.dense_data.data(), src.dense_data.data(), src.dense_data.size(), dst.stream);
-      break;
-    case ML::sparse:
-      dst.indices     = rmm::device_uvector<int>(src.indices.size(), dst.stream);
-      dst.indptr      = rmm::device_uvector<int>(src.indptr.size(), dst.stream);
-      dst.sparse_data = rmm::device_uvector<DataT>(src.sparse_data.size(), dst.stream);
-      raft::copy(dst.indices.data(), src.indices.data(), src.indices.size(), dst.stream);
-      raft::copy(dst.indptr.data(), src.indptr.data(), src.indptr.size(), dst.stream);
-      raft::copy(dst.sparse_data.data(), src.sparse_data.data(), src.sparse_data.size(), dst.stream);
-      break;
-    case ML::unset:
-    default: break;
-  }
-}
-
-template <typename DataT>
-ML::rand_mat<DataT> clone_rand_mat(const ML::rand_mat<DataT>& src) {
-  ML::rand_mat<DataT> dst(src.stream);
-  clone_rand_mat(src, dst);
-  return dst;  // move/NRVO, no copy
-}
-
-template <typename DataT>
-void clone_column_to_column_vector(const ML::rand_mat<DataT>& src, int src_col_id, ML::rand_mat<DataT>& dst) {
+template <typename DataT, typename IdxT = int>
+void clone_column_to_column_vector(const ML::rand_mat<DataT>& src,
+                                   int src_col_id,
+                                   OwnedProjectionMatrix<DataT, IdxT>& dst) {
   if (src.type != ML::sparse) {
     throw std::runtime_error("clone_column_to_column_vector expects a sparse source matrix");
   }
@@ -128,42 +125,73 @@ void clone_column_to_column_vector(const ML::rand_mat<DataT>& src, int src_col_i
   int n_nonzero = end - start;
   if (n_nonzero < 0) { throw std::runtime_error("clone_column_to_column_vector: invalid CSC indptr"); }
 
-  dst.type        = ML::sparse;
-  dst.indptr      = rmm::device_uvector<int>(2, dst.stream);
-  dst.indices     = rmm::device_uvector<int>(n_nonzero, dst.stream);
-  dst.sparse_data = rmm::device_uvector<DataT>(n_nonzero, dst.stream);
+  dst.indptr  = rmm::device_uvector<IdxT>(2, dst.stream);
+  dst.indices = rmm::device_uvector<IdxT>(n_nonzero, dst.stream);
+  dst.coeffs  = rmm::device_uvector<DataT>(n_nonzero, dst.stream);
 
-  int dst_col_ptrs[2]{0, n_nonzero};
+  IdxT dst_col_ptrs[2]{0, static_cast<IdxT>(n_nonzero)};
   raft::update_device(dst.indptr.data(), dst_col_ptrs, std::size_t(2), dst.stream);
 
   if (n_nonzero > 0) {
     raft::copy(dst.indices.data(), src.indices.data() + start, n_nonzero, dst.stream);
-    raft::copy(dst.sparse_data.data(), src.sparse_data.data() + start, n_nonzero, dst.stream);
+    raft::copy(dst.coeffs.data(), src.sparse_data.data() + start, n_nonzero, dst.stream);
   }
 }
 
-template <typename DataT>
-void print_rand_mat(const ML::rand_mat<DataT>& mat, cudaStream_t stream) {
-  switch (mat.type) {
-    case ML::dense:
-      printf("Dense matrix:\n");
-      raft::print_device_vector("data",
-                                mat.dense_data.data(),
-                                mat.dense_data.size(),
-                                std::cout);
-      break;
-    case ML::sparse:
-      printf("Sparse matrix in CSC format:\n");
-      raft::print_device_vector(
-        "indices", mat.indices.data(), mat.indices.size(), std::cout);
-      raft::print_device_vector(
-        "indptr", mat.indptr.data(), mat.indptr.size(), std::cout);
-      raft::print_device_vector(
-        "data", mat.sparse_data.data(), mat.sparse_data.size(), std::cout);
-      break;
-    case ML::unset:
-    default:
-      printf("Empty matrix\n");
+template <typename DataT, typename IdxT = int>
+void clone_column_to_column_vector(const OwnedProjectionMatrix<DataT, IdxT>& src,
+                                   int src_col_id,
+                                   OwnedProjectionMatrix<DataT, IdxT>& dst) {
+  if (src_col_id < 0 || src_col_id + 1 >= static_cast<int>(src.indptr.size())) {
+    throw std::runtime_error("clone_column_to_column_vector: source column index out of range");
+  }
+
+  IdxT col_ptrs[2]{0, 0};
+  raft::update_host(col_ptrs, src.indptr.data() + src_col_id, std::size_t(2), dst.stream);
+  if (cudaStreamSynchronize(dst.stream) != cudaSuccess) {
+    throw std::runtime_error("clone_column_to_column_vector: failed to synchronize stream");
+  }
+
+  IdxT start = col_ptrs[0];
+  IdxT end = col_ptrs[1];
+  IdxT n_nonzero = end - start;
+  if (n_nonzero < 0) { throw std::runtime_error("clone_column_to_column_vector: invalid CSC indptr"); }
+
+  dst.indptr = rmm::device_uvector<IdxT>(2, dst.stream);
+  dst.indices = rmm::device_uvector<IdxT>(n_nonzero, dst.stream);
+  dst.coeffs = rmm::device_uvector<DataT>(n_nonzero, dst.stream);
+
+  IdxT dst_col_ptrs[2]{0, n_nonzero};
+  raft::update_device(dst.indptr.data(), dst_col_ptrs, std::size_t(2), dst.stream);
+
+  if (n_nonzero > 0) {
+    raft::copy(dst.indices.data(), src.indices.data() + start, n_nonzero, dst.stream);
+    raft::copy(dst.coeffs.data(), src.coeffs.data() + start, n_nonzero, dst.stream);
+  }
+}
+
+template <typename DataT, typename IdxT = int>
+void copy_projection_matrix_to_owned(const ProjectionMatrix<DataT, IdxT>& src,
+                                     OwnedProjectionMatrix<DataT, IdxT>& dst) {
+  auto n_proj_components = src.n_proj_components;
+  auto indptr_len = static_cast<size_t>(n_proj_components + 1);
+  std::vector<IdxT> h_indptr(indptr_len, 0);
+  if (indptr_len > 0) {
+    raft::update_host(h_indptr.data(), src.d_proj_indptr, indptr_len, dst.stream);
+    if (cudaStreamSynchronize(dst.stream) != cudaSuccess) {
+      throw std::runtime_error("copy_projection_matrix_to_owned: failed to synchronize stream");
+    }
+  }
+  auto nnz = indptr_len > 0 ? static_cast<size_t>(h_indptr.back()) : 0;
+
+  dst.indptr = rmm::device_uvector<IdxT>(indptr_len, dst.stream);
+  dst.indices = rmm::device_uvector<IdxT>(nnz, dst.stream);
+  dst.coeffs = rmm::device_uvector<DataT>(nnz, dst.stream);
+
+  if (indptr_len > 0) { raft::copy(dst.indptr.data(), src.d_proj_indptr, indptr_len, dst.stream); }
+  if (nnz > 0) {
+    raft::copy(dst.indices.data(), src.d_proj_indices, nnz, dst.stream);
+    raft::copy(dst.coeffs.data(), src.d_proj_coeffs, nnz, dst.stream);
   }
 }
 

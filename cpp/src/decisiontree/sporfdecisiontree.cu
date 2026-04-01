@@ -1,6 +1,7 @@
 // sporfdecisiontree.cu
 #include "sporfdecisiontree.cuh"               // class/decl
 #include <cub/cub.cuh>
+#include <curand_kernel.h>
 #include <cuml/tree/sporfdecisiontree.hpp>     // public API
 #include <chrono>
 #include <tuple>
@@ -659,6 +660,160 @@ template void launch_batched_training_projection_kernel<float, float, int>(
   const TrainingProjectionWorkspaceMeta<float, float, int>&,
   cudaStream_t);
 template void launch_batched_training_projection_kernel<double, double, int>(
+  const TrainingProjectionWorkspacePointers<double, double, int>&,
+  const TrainingProjectionWorkspaceMeta<double, double, int>&,
+  cudaStream_t);
+
+template <typename T>
+__device__ inline uint32_t sporf_mix32(T v)
+{
+  uint32_t x = static_cast<uint32_t>(v);
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void batched_training_random_matrix_generate_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta)
+{
+  auto block_id = static_cast<IdxT>(blockIdx.x);
+  if (block_id >= meta.n_generation_block_tasks) { return; }
+  auto comp = static_cast<IdxT>(blockIdx.y);
+  if (comp >= meta.projection.n_proj_components) { return; }
+
+  auto tid = static_cast<IdxT>(threadIdx.x);
+  auto task = pointers.d_generation_block_tasks[block_id];
+  if (tid >= task.count) { return; }
+
+  auto chunk = pointers.d_generation_chunks[task.work_item_chunk_ids[tid]];
+  auto slot_local = tid - chunk.thread_local_begin;
+  if (slot_local >= chunk.instances_count || chunk.work_item_idx >= meta.projection.n_work_items) {
+    return;
+  }
+
+  auto feat = chunk.instances_begin + slot_local;
+  if (feat >= meta.generation_n_features) { return; }
+
+  size_t dense_idx = (static_cast<size_t>(chunk.work_item_idx) * meta.projection.n_proj_components +
+                      static_cast<size_t>(comp)) *
+                       static_cast<size_t>(meta.generation_n_features) +
+                     static_cast<size_t>(feat);
+
+  auto node_id = pointers.projection.d_work_items[chunk.work_item_idx].idx;
+  auto logical_idx =
+    (static_cast<unsigned long long>(static_cast<unsigned int>(node_id)) *
+       static_cast<unsigned long long>(meta.projection.n_proj_components) +
+     static_cast<unsigned long long>(static_cast<unsigned int>(comp))) *
+      static_cast<unsigned long long>(meta.generation_n_features) +
+    static_cast<unsigned long long>(static_cast<unsigned int>(feat));
+
+  curandStatePhilox4_32_10_t state;
+  curand_init(static_cast<unsigned long long>(meta.generation_random_state), logical_idx, 0, &state);
+
+  double u = static_cast<double>(curand_uniform(&state));
+  int keep = u < static_cast<double>(meta.generation_density) ? 1 : 0;
+  pointers.d_generation_keep_mask[dense_idx] = keep;
+
+  DataT scale = sqrt(DataT(1.0) / meta.generation_density) /
+                sqrt(static_cast<DataT>(meta.projection.n_proj_components));
+  DataT sign = curand_uniform(&state) < DataT(0.5) ? -scale : scale;
+  pointers.d_generation_dense_values[dense_idx] = keep ? sign : DataT(0);
+}
+
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void batched_training_random_matrix_compact_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta)
+{
+  auto work_item_idx = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (work_item_idx >= meta.projection.n_work_items) { return; }
+
+  auto work_item = pointers.projection.d_work_items[work_item_idx];
+  if (static_cast<IdxT>(work_item.instances.count) < meta.generation_min_samples_split) { return; }
+
+  auto* indptr = pointers.d_generation_indptr +
+                 static_cast<size_t>(work_item_idx) * (meta.projection.n_proj_components + 1);
+  indptr[0] = 0;
+
+  int local_nnz = 0;
+  for (IdxT comp = 0; comp < meta.projection.n_proj_components; ++comp) {
+    for (IdxT feat = 0; feat < meta.generation_n_features; ++feat) {
+      size_t dense_idx =
+        (static_cast<size_t>(work_item_idx) * meta.projection.n_proj_components + static_cast<size_t>(comp)) *
+          static_cast<size_t>(meta.generation_n_features) +
+        static_cast<size_t>(feat);
+      local_nnz += pointers.d_generation_keep_mask[dense_idx];
+    }
+  }
+
+  int base = atomicAdd(pointers.d_generation_nnz_counter, local_nnz);
+
+  int running = 0;
+  for (IdxT comp = 0; comp < meta.projection.n_proj_components; ++comp) {
+    for (IdxT feat = 0; feat < meta.generation_n_features; ++feat) {
+      size_t dense_idx =
+        (static_cast<size_t>(work_item_idx) * meta.projection.n_proj_components + static_cast<size_t>(comp)) *
+          static_cast<size_t>(meta.generation_n_features) +
+        static_cast<size_t>(feat);
+      if (pointers.d_generation_keep_mask[dense_idx]) {
+        pointers.d_generation_indices[base + running] = static_cast<int>(feat);
+        pointers.d_generation_sparse_data[base + running] =
+          pointers.d_generation_dense_values[dense_idx];
+        running++;
+      }
+    }
+    indptr[comp + 1] = running;
+  }
+
+  auto* pm = &pointers.d_projection_matrices[work_item_idx];
+  pm->n_proj_components = meta.projection.n_proj_components;
+  pm->d_proj_indptr = indptr;
+  pm->d_proj_indices = pointers.d_generation_indices + base;
+  pm->d_proj_coeffs = pointers.d_generation_sparse_data + base;
+}
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_random_matrix_bernoulli_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream)
+{
+  if (meta.n_generation_block_tasks <= 0 || meta.projection.n_proj_components <= 0) { return; }
+
+  RAFT_CUDA_TRY(cudaMemsetAsync(pointers.d_generation_nnz_counter, 0, sizeof(int), stream));
+
+  dim3 block(BLOCK_TASK_SIZE);
+  dim3 grid(meta.n_generation_block_tasks, meta.projection.n_proj_components);
+  batched_training_random_matrix_generate_kernel<DataT, LabelT, IdxT>
+    <<<grid, block, 0, stream>>>(pointers, meta);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  constexpr int TPB = 256;
+  dim3 block2(TPB);
+  dim3 grid2((meta.projection.n_work_items + TPB - 1) / TPB);
+  batched_training_random_matrix_compact_kernel<DataT, LabelT, IdxT>
+    <<<grid2, block2, 0, stream>>>(pointers, meta);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template void launch_batched_training_random_matrix_bernoulli_kernel<float, int, int>(
+  const TrainingProjectionWorkspacePointers<float, int, int>&,
+  const TrainingProjectionWorkspaceMeta<float, int, int>&,
+  cudaStream_t);
+template void launch_batched_training_random_matrix_bernoulli_kernel<double, int, int>(
+  const TrainingProjectionWorkspacePointers<double, int, int>&,
+  const TrainingProjectionWorkspaceMeta<double, int, int>&,
+  cudaStream_t);
+template void launch_batched_training_random_matrix_bernoulli_kernel<float, float, int>(
+  const TrainingProjectionWorkspacePointers<float, float, int>&,
+  const TrainingProjectionWorkspaceMeta<float, float, int>&,
+  cudaStream_t);
+template void launch_batched_training_random_matrix_bernoulli_kernel<double, double, int>(
   const TrainingProjectionWorkspacePointers<double, double, int>&,
   const TrainingProjectionWorkspaceMeta<double, double, int>&,
   cudaStream_t);
