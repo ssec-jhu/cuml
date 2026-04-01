@@ -36,7 +36,6 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
 
-#include <decisiontree/batched-levelalgo/quantiles.cuh>
 #include <decisiontree/decisiontree.cuh>
 #include <decisiontree/sporfdecisiontree.cuh>
 #include <decisiontree/treelite_util.h>
@@ -197,11 +196,6 @@ class SPORF {
            n_streams,
            handle.get_stream_pool_size());
 
-    // computing the quantiles: last two return values are shared pointers to device memory
-    // encapsulated by quantiles struct
-    auto [quantiles, quantiles_array, n_bins_array] =
-      DT::computeQuantiles(handle, input, this->rf_params.tree_params.max_n_bins, n_rows, n_cols);
-
     // n_streams should not be less than n_trees
     if (this->rf_params.n_trees < n_streams) n_streams = this->rf_params.n_trees;
 
@@ -243,7 +237,6 @@ class SPORF {
                                                     n_unique_labels,
                                                     this->rf_params.tree_params,
                                                     this->rf_params.seed,
-                                                    quantiles,
                                                     i);
     }
     // Cleanup

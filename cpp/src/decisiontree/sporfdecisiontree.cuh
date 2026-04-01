@@ -22,7 +22,6 @@
 #include "batched-levelalgo/objectives.cuh"
 #include "batched-levelalgo/sporfbuilder.cuh"
 #include "batched-levelalgo/kernels/sporf_builder_kernels.cuh"
-#include "batched-levelalgo/quantiles.cuh"
 #include "treelite_util.h"
 
 #include <cublas_v2.h>
@@ -604,7 +603,6 @@ class SPORFDecisionTree {
     int unique_labels,
     SPORFDecisionTreeParams params,
     uint64_t seed,
-    const Quantiles<DataT, int>& quantiles,
     int treeid)
   {
     using IdxT = int;
@@ -620,7 +618,6 @@ class SPORFDecisionTree {
                unique_labels,
                params,
                seed,
-               quantiles,
                treeid,
                projection_ws);
   }
@@ -637,7 +634,6 @@ class SPORFDecisionTree {
     int unique_labels,
     SPORFDecisionTreeParams params,
     uint64_t seed,
-    const Quantiles<DataT, int>& quantiles,
     int treeid,
     SPORFTrainingProjectionWorkspace<DataT, LabelT, int>& projection_ws)
   {
@@ -661,7 +657,6 @@ class SPORFDecisionTree {
                                                                       ncols,
                                                                       row_ids,
                                                                       unique_labels,
-                                                                      quantiles,
                                                                       projection_ws)
         .train();
     } else if (not std::is_same<DataT, LabelT>::value and
@@ -677,7 +672,6 @@ class SPORFDecisionTree {
                                                                          ncols,
                                                                          row_ids,
                                                                          unique_labels,
-                                                                         quantiles,
                                                                          projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
@@ -692,7 +686,6 @@ class SPORFDecisionTree {
                                                                      ncols,
                                                                      row_ids,
                                                                      unique_labels,
-                                                                     quantiles,
                                                                      projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
@@ -708,7 +701,6 @@ class SPORFDecisionTree {
                                                                          ncols,
                                                                          row_ids,
                                                                          unique_labels,
-                                                                         quantiles,
                                                                          projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
@@ -723,7 +715,6 @@ class SPORFDecisionTree {
                                                                        ncols,
                                                                        row_ids,
                                                                        unique_labels,
-                                                                       quantiles,
                                                                        projection_ws)
         .train();
     } else if (std::is_same<DataT, LabelT>::value and
@@ -739,7 +730,6 @@ class SPORFDecisionTree {
                                                                                  ncols,
                                                                                  row_ids,
                                                                                  unique_labels,
-                                                                                 quantiles,
                                                                                  projection_ws)
         .train();
     } else {

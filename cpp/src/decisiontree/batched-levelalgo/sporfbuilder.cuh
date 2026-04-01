@@ -26,7 +26,6 @@
 #include <cublas_v2.h>
 
 #include <cuml/common/pinned_host_vector.hpp>
-#include <cuml/random_projection/rproj_c.h>
 #include <cuml/tree/decisiontree.hpp>
 #include <cuml/tree/sporfdecisiontree.hpp>
 #include <cuml/tree/flatnode.h>
@@ -248,10 +247,6 @@ class SPORFNodeQueue {
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
 
-      // auto winner_idx = i * n_sampled_cols + split.colid;
-      // tree->projection_vectors.at(item.idx) =
-      //   std::make_unique<rand_mat<DataT>>(h_sparse_matrices[winner_idx]->stream);
-      // clone_rand_mat(*h_sparse_matrices[winner_idx], *tree->projection_vectors.at(item.idx));
       tree->projection_vectors.at(item.idx) =
         std::make_unique<OwnedProjectionMatrix<DataT>>(h_sparse_matrices[i]->stream);
       ASSERT(h_sparse_matrices[i] != nullptr, "Expected generated projection matrix for split");
@@ -301,9 +296,6 @@ struct SPORFBuilder {
   typedef ObliqueTreeMetaDataNode<DataT, LabelT> TreeMetaDataNodeT;
   typedef Split<DataT, IdxT> SplitT;
   typedef Dataset<DataT, LabelT, IdxT> DatasetT;
-  typedef Quantiles<DataT, IdxT> QuantilesT;
-
-
   /** default threads per block for most kernels in here */
   static constexpr int TPB_DEFAULT = 128;
   // When n_bins <= TPB, using >1 item per thread makes sorted quantiles
@@ -318,8 +310,6 @@ struct SPORFBuilder {
   /** input dataset */
   DatasetT dataset;
   DatasetT dataset_proj;
-  /** quantiles */
-  QuantilesT quantiles;
   /** Tree index */
   IdxT treeid;
   /** Seed used for randomization */
@@ -355,34 +345,26 @@ struct SPORFBuilder {
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws;
   /** pinned host buffer to store the trained nodes */
   ML::pinned_host_vector<char> h_buff;
-  /**
-  device buffer for contiguous input data
-
-  dataset.row_ids is n_sampled_rows long.
-  each node gets its own extent within dataset.row_ids, disjoint from other nodes.
-  d_contiguous indices correspond to dataset.row_ids indices,
-  so that we may copy from dataset.data[dataset.row_ids[i]] into d_contiguous[i],
-  and node row_id extents map directly to d_contiguous extents.
-  */
   std::vector<IdxT> h_quantile_indices;
   rmm::device_uvector<IdxT> d_quantile_indices;
-  rmm::device_uvector<DataT> d_quantiles;
-  rmm::device_uvector<DataT> d_contiguous;
   rmm::device_uvector<DataT> d_trans;
   std::vector<std::unique_ptr<OwnedProjectionMatrix<DataT>>> h_sparse_matrices;
-  std::vector<std::unique_ptr<rand_mat<DataT>>> h_rand_matrices;
-  DatasetT dataset_trans;
 
   struct Stats {
     double t_sampling;
-    double t_copy;
-    double t_rproj_fit;
-    double t_pre_transform;
-    double t_rproj_transform;
+    double t_projection_matrix_generate;
+    double t_projection_apply;
     double t_histogram;
     double t_split;
 
-    Stats() : t_sampling(0), t_copy(0), t_rproj_fit(0), t_pre_transform(0), t_rproj_transform(0), t_histogram(0), t_split(0) {}
+    Stats()
+      : t_sampling(0),
+        t_projection_matrix_generate(0),
+        t_projection_apply(0),
+        t_histogram(0),
+        t_split(0)
+    {
+    }
   } stats;
 
   SPORFBuilder(const raft::handle_t& handle,
@@ -396,7 +378,6 @@ struct SPORFBuilder {
           IdxT n_cols,
           rmm::device_uvector<IdxT>* row_ids,
           IdxT n_classes,
-          const QuantilesT& q,
           SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws_)
     : handle(handle),
       builder_stream(s),
@@ -413,22 +394,9 @@ struct SPORFBuilder {
               n_classes
       },
       projection_ws(projection_ws_),
-      quantiles(q),
       d_quantile_indices(0, builder_stream),
-      d_quantiles(0, builder_stream),
       d_buff(0, builder_stream),
-      d_contiguous(0, builder_stream),
       d_trans(0, builder_stream),
-      dataset_trans{
-        0,
-        labels,
-        n_rows,
-        max(1, IdxT(params.max_features * n_cols)),
-        int(row_ids->size()),
-        max(1, IdxT(params.max_features * n_cols)),
-        row_ids->data(),
-        n_classes
-      },
       dataset_proj{
         0,
         labels,
@@ -441,8 +409,6 @@ struct SPORFBuilder {
       }
   {
     max_blocks_dimx = 1 + params.max_batch_size + dataset.n_sampled_rows / TPB_DEFAULT;
-    // ASSERT(q.quantiles_array != nullptr && q.n_bins_array != nullptr,
-    //        "Currently quantiles need to be computed before this call!");
     ASSERT(n_classes >= 1, "n_classes should be at least 1");
     ASSERT(TPB_DEFAULT * ITEMS_PER_THREAD >= params.max_n_bins,
       "max_n_bins must be <= 2048 for proper functioning of quantile sorting.");
@@ -454,28 +420,14 @@ struct SPORFBuilder {
     size_t aligned_elems = aligned_bytes / sizeof(IdxT);
     d_quantile_indices.resize(aligned_elems, builder_stream);
 
-    req_bytes     = size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * params.max_n_bins * sizeof(DataT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(DataT);
-    d_quantiles.resize(aligned_elems, builder_stream);
-
-    // allocate d_contiguous with byte-alignment: calculateAlignedBytes works in bytes
-    req_bytes     = size_t(dataset.n_sampled_rows) * size_t(n_cols) * sizeof(DataT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(DataT);
-    d_contiguous.resize(aligned_elems, builder_stream);
-
     req_bytes     = size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols) * sizeof(DataT);
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(DataT);
     d_trans.resize(aligned_elems, builder_stream);
-    dataset_trans.data = d_trans.data();
 
-    h_rand_matrices.reserve(params.max_batch_size);
     h_sparse_matrices.reserve(params.max_batch_size);
     for (int i = 0; i < params.max_batch_size; ++i) {
       h_sparse_matrices.emplace_back(std::make_unique<OwnedProjectionMatrix<DataT>>(builder_stream));
-      h_rand_matrices.emplace_back(std::make_unique<rand_mat<DataT>>(builder_stream));
     }
 
     auto [device_workspace_size, host_workspace_size] = workspaceSize();
@@ -626,10 +578,8 @@ struct SPORFBuilder {
     tree->train_time = timer.getElapsedMilliseconds();
 
     std::cout << "SPORFBuilder::train: sampling: " << stats.t_sampling <<
-      " ms, copy: " << stats.t_copy <<
-      " ms, rproj fit: " << stats.t_rproj_fit <<
-      " ms, pre-transform: " << stats.t_pre_transform <<
-      " ms, rproj transform: " << stats.t_rproj_transform <<
+      " ms, projection matrix generate: " << stats.t_projection_matrix_generate <<
+      " ms, projection apply: " << stats.t_projection_apply <<
       " ms, histogram: " << stats.t_histogram <<
       " ms, split: " << stats.t_split <<
       " ms" << std::endl;
@@ -685,41 +635,8 @@ struct SPORFBuilder {
     raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
 
     auto t0 = std::chrono::steady_clock::now();
-    constexpr bool use_kernel_generated_projection_matrices = true;
-    std::vector<DT::ProjectionMatrix<DataT, IdxT>> projection_matrices(
+    std::vector<DT::ProjectionMatrix<DataT, IdxT>> generated_projection_matrices(
       work_items.size(), DT::ProjectionMatrix<DataT, IdxT>{0, nullptr, nullptr, nullptr});
-    // for (size_t i = 0; i < work_items.size(); i++) {
-    //   auto count = work_items[i].instances.count;
-    //   if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-    //   paramsRPROJ rproj_params{
-    //     static_cast<int>(count),
-    //     dataset.N,
-    //     dataset.n_sampled_cols,
-    //     -1.0f,
-    //     false,
-    //     params.density,
-    //     false,
-    //     0
-    //   };
-
-    //   rand_mat<DataT>& random_matrix = *(h_rand_matrices[i]);
-    //   random_matrix.reset();
-    //   auto random_state = static_cast<int>((seed + static_cast<uint64_t>(treeid) + i) & 0x7fffffffULL);
-    //   rproj_params.random_state = random_state;
-    //   RPROJfit(handle, &random_matrix, &rproj_params);
-    //   projection_matrices[i] = DT::ProjectionMatrix<DataT, IdxT>{
-    //     static_cast<int>(random_matrix.indptr.size()) - 1,
-    //     random_matrix.indptr.data(),
-    //     random_matrix.indices.data(),
-    //     random_matrix.sparse_data.data()
-    //   };
-    //   // std::printf("SPORF rprojfit: work_item=%zu n_features=%d n_components=%d nnz=%zu\n",
-    //   //             i,
-    //   //             static_cast<int>(dataset.N),
-    //   //             static_cast<int>(projection_matrices[i].n_proj_components),
-    //   //             random_matrix.sparse_data.size());
-    //   copy_projection_matrix_to_owned(projection_matrices[i], *h_sparse_matrices[i]);
-    // }
 
     projection_ws.reset(builder_stream);
     projection_ws.meta.input_n_rows = dataset.M;
@@ -728,6 +645,8 @@ struct SPORFBuilder {
     projection_ws.meta.projection.n_work_items = static_cast<IdxT>(work_items.size());
     projection_ws.meta.projection.n_chunks = static_cast<IdxT>(projection_chunks.size());
     projection_ws.meta.projection.n_block_tasks = static_cast<IdxT>(projection_block_tasks.size());
+    // In the SPORF builder, `n_sampled_cols` is reused as the random-projection
+    // output dimensionality, i.e. the number of projection components per node.
     projection_ws.meta.projection.n_proj_components = dataset.n_sampled_cols;
     projection_ws.meta.n_generation_chunks = static_cast<IdxT>(projection_matrix_chunks.size());
     projection_ws.meta.n_generation_block_tasks =
@@ -739,7 +658,6 @@ struct SPORFBuilder {
       static_cast<int>((seed + static_cast<uint64_t>(treeid)) & 0x7fffffffULL);
     projection_ws.pointers.d_input_col_major = dataset.data;
     projection_ws.pointers.d_row_ids = dataset.row_ids;
-    // Keep training projection output aligned with the existing builder-side d_trans buffer.
     projection_ws.pointers.projection.d_trans = d_trans.data();
     projection_ws.ensure_generation_metadata_capacity(projection_ws.meta.n_generation_chunks,
                                                       projection_ws.meta.n_generation_block_tasks,
@@ -762,10 +680,6 @@ struct SPORFBuilder {
     if (!work_items.empty()) {
       raft::update_device(projection_ws.pointers.projection.d_work_items,
                           work_items.data(),
-                          projection_ws.meta.projection.n_work_items,
-                          builder_stream);
-      raft::update_device(projection_ws.pointers.d_projection_matrices,
-                          projection_matrices.data(),
                           projection_ws.meta.projection.n_work_items,
                           builder_stream);
     }
@@ -794,50 +708,32 @@ struct SPORFBuilder {
                           builder_stream);
     }
 
-    if (true) {
-      launch_batched_training_random_matrix_bernoulli_kernel<DataT, LabelT, IdxT>(
-        projection_ws.pointers, projection_ws.meta, builder_stream);
-    }
+    launch_batched_training_random_matrix_bernoulli_kernel<DataT, LabelT, IdxT>(
+      projection_ws.pointers, projection_ws.meta, builder_stream);
 
     if (!work_items.empty()) {
-      if (use_kernel_generated_projection_matrices) {
-        std::vector<DT::ProjectionMatrix<DataT, IdxT>> generated_projection_matrices(
-          work_items.size(), DT::ProjectionMatrix<DataT, IdxT>{0, nullptr, nullptr, nullptr});
-        raft::update_host(generated_projection_matrices.data(),
-                          projection_ws.pointers.d_projection_matrices,
-                          projection_ws.meta.projection.n_work_items,
-                          builder_stream);
-        handle.sync_stream(builder_stream);
-        for (size_t i = 0; i < work_items.size(); i++) {
-          auto count = work_items[i].instances.count;
-          if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-          copy_projection_matrix_to_owned(generated_projection_matrices[i], *h_sparse_matrices[i]);
-        }
-      } else {
-        raft::update_device(projection_ws.pointers.d_projection_matrices,
-                            projection_matrices.data(),
-                            projection_ws.meta.projection.n_work_items,
-                            builder_stream);
-        for (size_t i = 0; i < work_items.size(); i++) {
-          auto count = work_items[i].instances.count;
-          if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-          copy_projection_matrix_to_owned(projection_matrices[i], *h_sparse_matrices[i]);
-        }
+      raft::update_host(generated_projection_matrices.data(),
+                        projection_ws.pointers.d_projection_matrices,
+                        projection_ws.meta.projection.n_work_items,
+                        builder_stream);
+      handle.sync_stream(builder_stream);
+      for (size_t i = 0; i < work_items.size(); i++) {
+        auto count = work_items[i].instances.count;
+        if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
+        copy_projection_matrix_to_owned(generated_projection_matrices[i], *h_sparse_matrices[i]);
       }
     }
 
-    stats.t_rproj_fit +=
+    stats.t_projection_matrix_generate +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-    stats.t_copy += 0.0;
-    stats.t_pre_transform += 0.0;
     t0 = std::chrono::steady_clock::now();
     launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
-    stats.t_rproj_transform +=
+    stats.t_projection_apply +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-      t0 = std::chrono::steady_clock::now();
+    t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < work_items.size(); i++) {
       auto count = work_items[i].instances.count;
       if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
@@ -854,11 +750,12 @@ struct SPORFBuilder {
       }
     }
 
-    raft::update_device(d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
+    raft::update_device(
+      d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
     stats.t_sampling += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     dataset_proj.data = d_trans.data();
-t0 = std::chrono::steady_clock::now();
+    t0 = std::chrono::steady_clock::now();
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
@@ -866,7 +763,8 @@ t0 = std::chrono::steady_clock::now();
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
     // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-stats.t_histogram += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_histogram +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     t0 = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
@@ -879,21 +777,22 @@ stats.t_histogram += std::chrono::duration<double, std::milli>(std::chrono::stea
     // create child nodes (or make the current ones leaf)
     raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
     SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
-                                                            params.min_samples_leaf,
-                                                            params.min_samples_split,
-                                                            params.max_leaves,
-                                                            params.min_impurity_decrease,
-                                                            dataset_proj,
-                                                            d_work_items,
-                                                            work_items.size(),
-                                                            splits,
-                                                            builder_stream);
+                                                                     params.min_samples_leaf,
+                                                                     params.min_samples_split,
+                                                                     params.max_leaves,
+                                                                     params.min_impurity_decrease,
+                                                                     dataset_proj,
+                                                                     d_work_items,
+                                                                     work_items.size(),
+                                                                     splits,
+                                                                     builder_stream);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     raft::common::nvtx::pop_range();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     handle.sync_stream(builder_stream);
-stats.t_split += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_split +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
     return std::make_tuple(h_splits, work_items.size());
   }

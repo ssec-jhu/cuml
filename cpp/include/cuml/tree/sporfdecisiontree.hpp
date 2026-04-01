@@ -18,10 +18,10 @@
 
 #pragma once
 
-#include <cuml/random_projection/rproj_c.h>
-
 #include "decisiontree.hpp"
 #include <cuda_runtime.h>
+#include <rmm/device_uvector.hpp>
+#include <raft/util/cudart_utils.hpp>
 #include <iostream>
 #include <stdexcept>
 
@@ -102,41 +102,6 @@ template <class T, class L>
 struct ObliqueTreeMetaDataNode : public TreeMetaDataNode<T, L> {
   std::vector<std::unique_ptr<OwnedProjectionMatrix<T>>> projection_vectors;
 };
-
-template <typename DataT, typename IdxT = int>
-void clone_column_to_column_vector(const ML::rand_mat<DataT>& src,
-                                   int src_col_id,
-                                   OwnedProjectionMatrix<DataT, IdxT>& dst) {
-  if (src.type != ML::sparse) {
-    throw std::runtime_error("clone_column_to_column_vector expects a sparse source matrix");
-  }
-  if (src_col_id < 0 || src_col_id + 1 >= static_cast<int>(src.indptr.size())) {
-    throw std::runtime_error("clone_column_to_column_vector: source column index out of range");
-  }
-
-  int col_ptrs[2]{0, 0};
-  raft::update_host(col_ptrs, src.indptr.data() + src_col_id, std::size_t(2), dst.stream);
-  if (cudaStreamSynchronize(dst.stream) != cudaSuccess) {
-    throw std::runtime_error("clone_column_to_column_vector: failed to synchronize stream");
-  }
-
-  int start     = col_ptrs[0];
-  int end       = col_ptrs[1];
-  int n_nonzero = end - start;
-  if (n_nonzero < 0) { throw std::runtime_error("clone_column_to_column_vector: invalid CSC indptr"); }
-
-  dst.indptr  = rmm::device_uvector<IdxT>(2, dst.stream);
-  dst.indices = rmm::device_uvector<IdxT>(n_nonzero, dst.stream);
-  dst.coeffs  = rmm::device_uvector<DataT>(n_nonzero, dst.stream);
-
-  IdxT dst_col_ptrs[2]{0, static_cast<IdxT>(n_nonzero)};
-  raft::update_device(dst.indptr.data(), dst_col_ptrs, std::size_t(2), dst.stream);
-
-  if (n_nonzero > 0) {
-    raft::copy(dst.indices.data(), src.indices.data() + start, n_nonzero, dst.stream);
-    raft::copy(dst.coeffs.data(), src.sparse_data.data() + start, n_nonzero, dst.stream);
-  }
-}
 
 template <typename DataT, typename IdxT = int>
 void clone_column_to_column_vector(const OwnedProjectionMatrix<DataT, IdxT>& src,
