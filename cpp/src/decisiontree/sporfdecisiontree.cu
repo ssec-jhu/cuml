@@ -664,17 +664,6 @@ template void launch_batched_training_projection_kernel<double, double, int>(
   const TrainingProjectionWorkspaceMeta<double, double, int>&,
   cudaStream_t);
 
-template <typename T>
-__device__ inline uint32_t sporf_mix32(T v)
-{
-  uint32_t x = static_cast<uint32_t>(v);
-  x ^= x >> 16;
-  x *= 0x7feb352dU;
-  x ^= x >> 15;
-  x *= 0x846ca68bU;
-  x ^= x >> 16;
-  return x;
-}
 
 template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_training_random_matrix_generate_kernel(

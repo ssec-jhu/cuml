@@ -77,7 +77,7 @@ class SPORFNodeQueue {
   std::shared_ptr<TreeMetaDataNodeT> tree;
   std::vector<SPORFDT::InstanceRange> node_instances_;
   std::deque<SPORFDT::NodeWorkItem> work_items_;
-  const size_t MIN_ROWS_PER_BATCH = 1; //65536;  // heuristic to ensure enough parallelism for GPU kernels
+  const size_t MIN_ROWS_PER_BATCH = 65536;  // heuristic to ensure enough parallelism for GPU kernels
 
  public:
   SPORFNodeQueue(SPORFDecisionTreeParams params,
@@ -351,18 +351,26 @@ struct SPORFBuilder {
   std::vector<std::unique_ptr<OwnedProjectionMatrix<DataT>>> h_sparse_matrices;
 
   struct Stats {
-    double t_sampling;
-    double t_projection_matrix_generate;
-    double t_projection_apply;
-    double t_histogram;
-    double t_split;
+    double t_pop;
+    double t_push;
+    double t_h2d;
+    double t_d2h;
+    double t_kernels;
+    double t_workload_info_cpu;
+    double t_projection_persist_cpu;
+    double t_quantile_sampling_cpu;
+    double t_split_postprocess_cpu;
 
     Stats()
-      : t_sampling(0),
-        t_projection_matrix_generate(0),
-        t_projection_apply(0),
-        t_histogram(0),
-        t_split(0)
+      : t_pop(0),
+        t_push(0),
+        t_h2d(0),
+        t_d2h(0),
+        t_kernels(0),
+        t_workload_info_cpu(0),
+        t_projection_persist_cpu(0),
+        t_quantile_sampling_cpu(0),
+        t_split_postprocess_cpu(0)
     {
     }
   } stats;
@@ -558,7 +566,10 @@ struct SPORFBuilder {
     SPORFNodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs, dataset.N);
     while (queue.HasWork()) {
+      auto t_pop = std::chrono::steady_clock::now();
       auto popped_batch                    = queue.Pop();
+      stats.t_pop +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pop).count();
       auto& work_items                     = std::get<0>(popped_batch);
       auto& projection_chunks              = std::get<1>(popped_batch);
       auto& projection_block_tasks         = std::get<2>(popped_batch);
@@ -571,17 +582,24 @@ struct SPORFBuilder {
                 projection_matrix_chunks,
                 projection_matrix_block_tasks,
                 projection_ws);
+      auto t_push = std::chrono::steady_clock::now();
       queue.Push(work_items, splits_host_ptr, h_sparse_matrices, dataset.n_sampled_cols);
+      stats.t_push +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_push).count();
     }
     auto tree = queue.GetTree();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());
     tree->train_time = timer.getElapsedMilliseconds();
 
-    std::cout << "SPORFBuilder::train: sampling: " << stats.t_sampling <<
-      " ms, projection matrix generate: " << stats.t_projection_matrix_generate <<
-      " ms, projection apply: " << stats.t_projection_apply <<
-      " ms, histogram: " << stats.t_histogram <<
-      " ms, split: " << stats.t_split <<
+    std::cout << "SPORFBuilder::train: pop: " << stats.t_pop <<
+      " ms, push: " << stats.t_push <<
+      " ms, h2d: " << stats.t_h2d <<
+      " ms, d2h: " << stats.t_d2h <<
+      " ms, kernels: " << stats.t_kernels <<
+      " ms, workload_info_cpu: " << stats.t_workload_info_cpu <<
+      " ms, projection_persist_cpu: " << stats.t_projection_persist_cpu <<
+      " ms, quantile_sampling_cpu: " << stats.t_quantile_sampling_cpu <<
+      " ms, split_postprocess_cpu: " << stats.t_split_postprocess_cpu <<
       " ms" << std::endl;
 
 
@@ -606,7 +624,6 @@ struct SPORFBuilder {
       }
       n_blocks_dimx += n_blocks_per_node;
     }
-    raft::update_device(workload_info, h_workload_info, n_blocks_dimx, builder_stream);
     return std::make_pair(n_blocks_dimx, n_large_nodes);
   }
 
@@ -618,13 +635,7 @@ struct SPORFBuilder {
                SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws)
   {
     raft::common::nvtx::range fun_scope("SPORFBuilder::doSplit @sporfbuilder.cuh [batched-levelalgo]");
-    // start fresh on the number of *new* nodes created in this batch
-    RAFT_CUDA_TRY(cudaMemsetAsync(n_nodes, 0, sizeof(IdxT), builder_stream));
-    initSplit<DataT, IdxT, TPB_DEFAULT>(splits, work_items.size(), builder_stream);
-
-    // get the current set of nodes to be worked upon
-    raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
-
+    auto t_cpu = std::chrono::steady_clock::now();
     auto [n_blocks_dimx, n_large_nodes] = this->updateWorkloadInfo(work_items);
 
     for(IdxT i = 0; i < params.max_batch_size; i++ ) {
@@ -632,9 +643,7 @@ struct SPORFBuilder {
         h_colids[i * dataset.n_sampled_cols + c] = c;
       }
     }
-    raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
 
-    auto t0 = std::chrono::steady_clock::now();
     std::vector<DT::ProjectionMatrix<DataT, IdxT>> generated_projection_matrices(
       work_items.size(), DT::ProjectionMatrix<DataT, IdxT>{0, nullptr, nullptr, nullptr});
 
@@ -676,7 +685,21 @@ struct SPORFBuilder {
            "Training projection workspace overflow: chunks");
     ASSERT(projection_ws.meta.projection.n_block_tasks <= projection_ws.meta.projection.cap_block_tasks,
            "Training projection workspace overflow: block_tasks");
+    stats.t_workload_info_cpu +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
+    auto t_kernel = std::chrono::steady_clock::now();
+    // start fresh on the number of *new* nodes created in this batch
+    RAFT_CUDA_TRY(cudaMemsetAsync(n_nodes, 0, sizeof(IdxT), builder_stream));
+    initSplit<DataT, IdxT, TPB_DEFAULT>(splits, work_items.size(), builder_stream);
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+
+    auto t_h2d = std::chrono::steady_clock::now();
+    // get the current set of nodes to be worked upon
+    raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
+    raft::update_device(workload_info, h_workload_info, n_blocks_dimx, builder_stream);
+    raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
     if (!work_items.empty()) {
       raft::update_device(projection_ws.pointers.projection.d_work_items,
                           work_items.data(),
@@ -707,33 +730,44 @@ struct SPORFBuilder {
                           projection_ws.meta.n_generation_block_tasks,
                           builder_stream);
     }
+    stats.t_h2d +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h2d).count();
 
+    t_kernel = std::chrono::steady_clock::now();
     launch_batched_training_random_matrix_bernoulli_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
 
+    auto t_d2h = std::chrono::steady_clock::now();
     if (!work_items.empty()) {
       raft::update_host(generated_projection_matrices.data(),
                         projection_ws.pointers.d_projection_matrices,
                         projection_ws.meta.projection.n_work_items,
                         builder_stream);
       handle.sync_stream(builder_stream);
+    }
+    stats.t_d2h +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
+
+    t_cpu = std::chrono::steady_clock::now();
+    if (!work_items.empty()) {
       for (size_t i = 0; i < work_items.size(); i++) {
         auto count = work_items[i].instances.count;
         if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
         copy_projection_matrix_to_owned(generated_projection_matrices[i], *h_sparse_matrices[i]);
       }
     }
+    stats.t_projection_persist_cpu +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
-    stats.t_projection_matrix_generate +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-
-    t0 = std::chrono::steady_clock::now();
+    t_kernel = std::chrono::steady_clock::now();
     launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
-    stats.t_projection_apply +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
 
-    t0 = std::chrono::steady_clock::now();
+    t_cpu = std::chrono::steady_clock::now();
     for (size_t i = 0; i < work_items.size(); i++) {
       auto count = work_items[i].instances.count;
       if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
@@ -749,32 +783,37 @@ struct SPORFBuilder {
         );
       }
     }
+    stats.t_quantile_sampling_cpu +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
+    t_h2d = std::chrono::steady_clock::now();
     raft::update_device(
       d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
-    stats.t_sampling += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_h2d +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h2d).count();
 
     dataset_proj.data = d_trans.data();
-    t0 = std::chrono::steady_clock::now();
+    t_kernel = std::chrono::steady_clock::now();
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
       computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
-    // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-    stats.t_histogram +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    t0 = std::chrono::steady_clock::now();
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+
+    t_d2h = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
-    // RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
-    // YEAH DON'T CALL THE FOLLOWING FUNCTION. EVER. MY EXPERIENCE WITH IT HAS BEEN THAT IT OVERWRITES THE MEMORY THAT YOU'RE TRYING TO PRINT
-    // DT::printSplits(splits,
-    //                 static_cast<IdxT>(work_items.size()),
-    //                 builder_stream);
-    // printf( "\n\n");
+    stats.t_d2h +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
 
     // create child nodes (or make the current ones leaf)
+    t_cpu = std::chrono::steady_clock::now();
+    stats.t_split_postprocess_cpu +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
+
+    t_kernel = std::chrono::steady_clock::now();
     raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
     SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
                                                                      params.min_samples_leaf,
@@ -789,10 +828,14 @@ struct SPORFBuilder {
     RAFT_CUDA_TRY(cudaPeekAtLastError());
 
     raft::common::nvtx::pop_range();
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+
+    t_d2h = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     handle.sync_stream(builder_stream);
-    stats.t_split +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.t_d2h +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
 
     return std::make_tuple(h_splits, work_items.size());
   }

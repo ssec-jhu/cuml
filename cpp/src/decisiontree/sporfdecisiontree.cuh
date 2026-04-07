@@ -269,6 +269,23 @@ struct TrainingProjectionWorkspaceMeta {
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
+struct SparseSamplingGenerationMeta {
+  IdxT oversampling_factor;
+  IdxT n_component_counts;
+  IdxT n_candidate_indices;
+  IdxT n_unique_indices;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
+struct SparseSamplingGenerationPointers {
+  IdxT* d_component_counts;
+  IdxT* d_component_offsets;
+  IdxT* d_candidate_indices;
+  IdxT* d_unique_indices;
+  IdxT* d_unique_counts;
+};
+
+template <typename DataT, typename LabelT, typename IdxT>
 struct TrainingProjectionWorkspacePointers {
   BatchedProjectionWorkspacePointers<DataT, LabelT, IdxT> projection;
   const DataT*                         d_input_col_major;
@@ -282,6 +299,7 @@ struct TrainingProjectionWorkspacePointers {
   int*                                 d_generation_indices;
   DataT*                               d_generation_sparse_data;
   int*                                 d_generation_nnz_counter;
+  SparseSamplingGenerationPointers<DataT, LabelT, IdxT> sparse_sampling;
 };
 
 template <typename DataT, typename LabelT, typename IdxT>
@@ -294,8 +312,14 @@ struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<int> d_generation_indices_storage;
   rmm::device_uvector<DataT> d_generation_sparse_data_storage;
   rmm::device_uvector<int> d_generation_nnz_counter_storage;
+  rmm::device_uvector<IdxT> d_sparse_sampling_component_counts_storage;
+  rmm::device_uvector<IdxT> d_sparse_sampling_component_offsets_storage;
+  rmm::device_uvector<IdxT> d_sparse_sampling_candidate_indices_storage;
+  rmm::device_uvector<IdxT> d_sparse_sampling_unique_indices_storage;
+  rmm::device_uvector<IdxT> d_sparse_sampling_unique_counts_storage;
   TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers{};
   TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta{};
+  SparseSamplingGenerationMeta<DataT, LabelT, IdxT> sparse_sampling_meta{};
 
   SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
     : d_workspace(0, stream),
@@ -305,7 +329,12 @@ struct SPORFTrainingProjectionWorkspace {
       d_generation_indptr_storage(0, stream),
       d_generation_indices_storage(0, stream),
       d_generation_sparse_data_storage(0, stream),
-      d_generation_nnz_counter_storage(0, stream)
+      d_generation_nnz_counter_storage(0, stream),
+      d_sparse_sampling_component_counts_storage(0, stream),
+      d_sparse_sampling_component_offsets_storage(0, stream),
+      d_sparse_sampling_candidate_indices_storage(0, stream),
+      d_sparse_sampling_unique_indices_storage(0, stream),
+      d_sparse_sampling_unique_counts_storage(0, stream)
   {
     auto align_bytes = [](size_t actual_size) {
       constexpr size_t align = 256;
@@ -331,6 +360,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.generation_min_samples_split = 0;
     meta.generation_density = DataT(0);
     meta.generation_random_state = 0;
+    sparse_sampling_meta.oversampling_factor = 0;
+    sparse_sampling_meta.n_component_counts = 0;
+    sparse_sampling_meta.n_candidate_indices = 0;
+    sparse_sampling_meta.n_unique_indices = 0;
 
     size_t workspace_bytes = 0;
     workspace_bytes += align_bytes(n_rows_ * sizeof(DataT));  // projected values
@@ -377,6 +410,11 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_generation_indices = nullptr;
     pointers.d_generation_sparse_data = nullptr;
     pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
+    pointers.sparse_sampling.d_component_counts = nullptr;
+    pointers.sparse_sampling.d_component_offsets = nullptr;
+    pointers.sparse_sampling.d_candidate_indices = nullptr;
+    pointers.sparse_sampling.d_unique_indices = nullptr;
+    pointers.sparse_sampling.d_unique_counts = nullptr;
   }
 
   void reset(cudaStream_t stream)
@@ -391,6 +429,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.generation_n_features = 0;
     meta.generation_density = DataT(0);
     meta.generation_random_state = 0;
+    sparse_sampling_meta.oversampling_factor = 0;
+    sparse_sampling_meta.n_component_counts = 0;
+    sparse_sampling_meta.n_candidate_indices = 0;
+    sparse_sampling_meta.n_unique_indices = 0;
     if (d_projection_matrices_storage.size() < static_cast<size_t>(meta.projection.cap_work_items)) {
       d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
     }
@@ -469,6 +511,28 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_generation_indices = d_generation_indices_storage.data();
     pointers.d_generation_sparse_data = d_generation_sparse_data_storage.data();
     pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
+  }
+
+  void resize_sparse_sampling_storage(size_t component_count,
+                                      size_t candidate_count,
+                                      size_t unique_count,
+                                      cudaStream_t stream)
+  {
+    d_sparse_sampling_component_counts_storage.resize(component_count, stream);
+    d_sparse_sampling_component_offsets_storage.resize(component_count + 1, stream);
+    d_sparse_sampling_candidate_indices_storage.resize(candidate_count, stream);
+    d_sparse_sampling_unique_indices_storage.resize(unique_count, stream);
+    d_sparse_sampling_unique_counts_storage.resize(component_count, stream);
+
+    pointers.sparse_sampling.d_component_counts = d_sparse_sampling_component_counts_storage.data();
+    pointers.sparse_sampling.d_component_offsets = d_sparse_sampling_component_offsets_storage.data();
+    pointers.sparse_sampling.d_candidate_indices = d_sparse_sampling_candidate_indices_storage.data();
+    pointers.sparse_sampling.d_unique_indices = d_sparse_sampling_unique_indices_storage.data();
+    pointers.sparse_sampling.d_unique_counts = d_sparse_sampling_unique_counts_storage.data();
+
+    sparse_sampling_meta.n_component_counts = static_cast<IdxT>(component_count);
+    sparse_sampling_meta.n_candidate_indices = static_cast<IdxT>(candidate_count);
+    sparse_sampling_meta.n_unique_indices = static_cast<IdxT>(unique_count);
   }
 };
 
