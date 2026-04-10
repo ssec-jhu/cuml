@@ -807,90 +807,189 @@ template void launch_batched_training_random_matrix_bernoulli_kernel<double, dou
   const TrainingProjectionWorkspaceMeta<double, double, int>&,
   cudaStream_t);
 
-/**
- * @brief Partition the samples to left/right nodes based on the best split
- * @return the position of the left child node in the nodes list. However, this
- *         value is valid only for threadIdx.x == 0.
- * @note this should be called by only one block from all participating blocks
- *       'smem' should be at least of size `sizeof(IdxT) * TPB * 2`
- */
-template <typename DataT, typename LabelT, typename IdxT, int TPB>
-DI void partition_samples2(
-  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  NodeWorkItemChunk<IdxT>* d_chunks,
-  BlockTask<IdxT>* d_block_tasks,
-  IdxT n_block_tasks,
-  char* smem
-)
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void gather_winning_tree_projection_nnz_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta,
+  const Split<DataT, IdxT>* d_splits)
 {
-  typedef cub::BlockScan<int, TPB> BlockScanT;
-  __shared__ typename BlockScanT::TempStorage temp1, temp2;
-  volatile auto* row_ids = reinterpret_cast<volatile IdxT*>(dataset.row_ids);
-  // for compaction
-  // size_t smemSize  = sizeof(IdxT) * TPB;
-  // auto* lcomp      = reinterpret_cast<IdxT*>(smem);
-  // auto* rcomp      = reinterpret_cast<IdxT*>(smem + smemSize);
-  // auto range_start = work_item.instances.begin;
-  // auto range_len   = work_item.instances.count;
-  // auto* col        = dataset.data + split.colid * std::size_t(dataset.M);
-  // auto loffset = range_start, part = loffset + split.nLeft, roffset = part;
-  // auto end  = range_start + range_len;
-  // int lflag = 0, rflag = 0, llen = 0, rlen = 0, minlen = 0;
-  // auto tid = threadIdx.x;
-  // while (loffset < part && roffset < end) {
-  //   // find the samples in the left that belong to right and vice-versa
-  //   auto loff = loffset + tid, roff = roffset + tid;
-  //   // d_trans (dataset.data) is aligned with the current row ordering,
-  //   // so index by position within row_ids, not the raw row_id value.
-  //   if (llen == minlen) lflag = loff < part ? col[loff] > split.quesval : 0;
-  //   if (rlen == minlen) rflag = roff < end ? col[roff] <= split.quesval : 0;
-  //   // scan to compute the locations for each 'misfit' in the two partitions
-  //   int lidx, ridx;
-  //   BlockScanT(temp1).ExclusiveSum(lflag, lidx, llen);
-  //   BlockScanT(temp2).ExclusiveSum(rflag, ridx, rlen);
-  //   __syncthreads();
-  //   minlen = llen < rlen ? llen : rlen;
-  //   // compaction to figure out the right locations to swap
-  //   if (lflag) lcomp[lidx] = loff;
-  //   if (rflag) rcomp[ridx] = roff;
-  //   __syncthreads();
-  //   // reset the appropriate flags for the longer of the two
-  //   if (lidx < minlen) lflag = 0;
-  //   if (ridx < minlen) rflag = 0;
-  //   if (llen == minlen) loffset += TPB;
-  //   if (rlen == minlen) roffset += TPB;
-  //   // swap the 'misfit's
-  //   if (tid < minlen) {
-  //     auto a              = row_ids[lcomp[tid]];
-  //     auto b              = row_ids[rcomp[tid]];
-  //     row_ids[lcomp[tid]] = b;
-  //     row_ids[rcomp[tid]] = a;
-  //   }
-  // }
+  auto work_item_idx = static_cast<IdxT>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (work_item_idx >= meta.projection.n_work_items) { return; }
+
+  auto work_item = pointers.projection.d_work_items[work_item_idx];
+  if (static_cast<IdxT>(work_item.instances.count) < meta.generation_min_samples_split) {
+    pointers.d_tree_projection_winning_nnz[work_item_idx] = 0;
+    return;
+  }
+
+  auto split = d_splits[work_item_idx];
+  if (split.colid < 0) {
+    pointers.d_tree_projection_winning_nnz[work_item_idx] = 0;
+    return;
+  }
+
+  auto src = pointers.d_projection_matrices[work_item_idx];
+  if (split.colid + 1 >= src.n_proj_components + 1) {
+    pointers.d_tree_projection_winning_nnz[work_item_idx] = 0;
+    return;
+  }
+
+  auto start = src.d_proj_indptr[split.colid];
+  auto end = src.d_proj_indptr[split.colid + 1];
+  pointers.d_tree_projection_winning_nnz[work_item_idx] = end - start;
 }
 
-template <typename DataT, typename LabelT, typename IdxT, int TPB>
-void launch_partition_samples2(
-  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
-  BlockTask<IdxT>* d_block_tasks,
-  IdxT n_block_tasks,
-  cudaStream_t stream
-)
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void store_winning_tree_projection_vectors_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta,
+  const Split<DataT, IdxT>* d_splits,
+  std::size_t payload_base_offset)
 {
-  dim3 block(BLOCK_TASK_SIZE);  // or 128
-  dim3 grid(n_chunks); // for first version, one block does the partition
-  size_t smem_size = 2 * BLOCK_TASK_SIZE * sizeof(IdxT);
-  partition_samples2<DataT, LabelT, IdxT, TPB><<<grid, block, smem_size, stream>>>(
-    dataset,
-    d_chunks,
-    d_block_tasks,
-    n_block_tasks,
-    nullptr
-  );
+  auto work_item_idx = static_cast<IdxT>(blockIdx.x);
+  if (work_item_idx >= meta.projection.n_work_items) { return; }
+
+  auto work_item = pointers.projection.d_work_items[work_item_idx];
+  auto node_idx = static_cast<IdxT>(work_item.idx);
+  if (node_idx < 0 || node_idx >= meta.cap_tree_projection_vectors) { return; }
+  if (threadIdx.x == 0) { atomicMax(pointers.d_tree_projection_max_node_idx, node_idx); }
+
+  auto split = d_splits[work_item_idx];
+  if (static_cast<IdxT>(work_item.instances.count) < meta.generation_min_samples_split || split.colid < 0) {
+    if (threadIdx.x == 0) {
+      pointers.d_tree_projection_vectors[node_idx] = OffsetProjectionMatrix<IdxT>{
+        0, std::size_t{0}, std::size_t{0}, std::size_t{0}};
+    }
+    return;
+  }
+
+  auto src = pointers.d_projection_matrices[work_item_idx];
+  auto start = static_cast<std::size_t>(src.d_proj_indptr[split.colid]);
+  auto end = static_cast<std::size_t>(src.d_proj_indptr[split.colid + 1]);
+  auto nnz = end - start;
+
+  std::size_t dst_indptr_offset = static_cast<std::size_t>(node_idx) * 2;
+  std::size_t dst_payload_offset =
+    payload_base_offset + static_cast<std::size_t>(pointers.d_tree_projection_winning_offsets[work_item_idx]);
+
+  if (threadIdx.x == 0) {
+    pointers.d_tree_projection_indptr_storage[dst_indptr_offset] = 0;
+    pointers.d_tree_projection_indptr_storage[dst_indptr_offset + 1] = static_cast<IdxT>(nnz);
+    pointers.d_tree_projection_vectors[node_idx] = OffsetProjectionMatrix<IdxT>{
+      1, dst_indptr_offset, dst_payload_offset, dst_payload_offset};
+  }
+
+  for (std::size_t i = static_cast<std::size_t>(threadIdx.x); i < nnz; i += blockDim.x) {
+    pointers.d_tree_projection_indices_storage[dst_payload_offset + i] =
+      src.d_proj_indices[start + i];
+    pointers.d_tree_projection_coeffs_storage[dst_payload_offset + i] =
+      src.d_proj_coeffs[start + i];
+  }
+}
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_store_winning_tree_projection_vectors_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  const Split<DataT, IdxT>* d_splits,
+  std::size_t payload_base_offset,
+  cudaStream_t stream)
+{
+  if (meta.projection.n_work_items <= 0) { return; }
+  dim3 block(BLOCK_TASK_SIZE);
+  dim3 grid(meta.projection.n_work_items);
+  store_winning_tree_projection_vectors_kernel<DataT, LabelT, IdxT>
+    <<<grid, block, 0, stream>>>(pointers, meta, d_splits, payload_base_offset);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
+
+template <typename DataT, typename LabelT, typename IdxT>
+void persist_winning_tree_projection_vectors(
+  SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
+  const Split<DataT, IdxT>* d_splits,
+  cudaStream_t stream)
+{
+  auto& pointers = workspace.pointers;
+  auto& meta = workspace.meta;
+  if (meta.projection.n_work_items <= 0) { return; }
+
+  workspace.resize_tree_projection_batch_scratch(static_cast<size_t>(meta.projection.n_work_items), stream);
+
+  constexpr int TPB = 256;
+  dim3 block(TPB);
+  dim3 grid((meta.projection.n_work_items + TPB - 1) / TPB);
+  gather_winning_tree_projection_nnz_kernel<DataT, LabelT, IdxT>
+    <<<grid, block, 0, stream>>>(pointers, meta, d_splits);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    pointers.d_tree_projection_winning_offsets, 0, sizeof(IdxT), stream));
+  thrust::inclusive_scan(thrust::cuda::par.on(stream),
+                         pointers.d_tree_projection_winning_nnz,
+                         pointers.d_tree_projection_winning_nnz + meta.projection.n_work_items,
+                         pointers.d_tree_projection_winning_offsets + 1);
+
+  IdxT batch_total_nnz = 0;
+  raft::update_host(&batch_total_nnz,
+                    pointers.d_tree_projection_winning_offsets + meta.projection.n_work_items,
+                    std::size_t{1},
+                    stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+  auto old_payload_nnz = static_cast<std::size_t>(meta.tree_projection_payload_nnz);
+  workspace.resize_tree_projection_payload_storage(
+    static_cast<size_t>(meta.cap_tree_projection_vectors),
+    old_payload_nnz + static_cast<size_t>(batch_total_nnz),
+    stream);
+
+  launch_store_winning_tree_projection_vectors_kernel<DataT, LabelT, IdxT>(
+    workspace.pointers, workspace.meta, d_splits, old_payload_nnz, stream);
+
+  raft::update_host(
+    &workspace.meta.tree_projection_max_node_idx, pointers.d_tree_projection_max_node_idx, std::size_t{1}, stream);
+}
+
+template void launch_store_winning_tree_projection_vectors_kernel<float, int, int>(
+  const TrainingProjectionWorkspacePointers<float, int, int>&,
+  const TrainingProjectionWorkspaceMeta<float, int, int>&,
+  const Split<float, int>*,
+  std::size_t,
+  cudaStream_t);
+template void launch_store_winning_tree_projection_vectors_kernel<double, int, int>(
+  const TrainingProjectionWorkspacePointers<double, int, int>&,
+  const TrainingProjectionWorkspaceMeta<double, int, int>&,
+  const Split<double, int>*,
+  std::size_t,
+  cudaStream_t);
+template void launch_store_winning_tree_projection_vectors_kernel<float, float, int>(
+  const TrainingProjectionWorkspacePointers<float, float, int>&,
+  const TrainingProjectionWorkspaceMeta<float, float, int>&,
+  const Split<float, int>*,
+  std::size_t,
+  cudaStream_t);
+template void launch_store_winning_tree_projection_vectors_kernel<double, double, int>(
+  const TrainingProjectionWorkspacePointers<double, double, int>&,
+  const TrainingProjectionWorkspaceMeta<double, double, int>&,
+  const Split<double, int>*,
+  std::size_t,
+  cudaStream_t);
+
+template void persist_winning_tree_projection_vectors<float, int, int>(
+  SPORFTrainingProjectionWorkspace<float, int, int>&,
+  const Split<float, int>*,
+  cudaStream_t);
+template void persist_winning_tree_projection_vectors<double, int, int>(
+  SPORFTrainingProjectionWorkspace<double, int, int>&,
+  const Split<double, int>*,
+  cudaStream_t);
+template void persist_winning_tree_projection_vectors<float, float, int>(
+  SPORFTrainingProjectionWorkspace<float, float, int>&,
+  const Split<float, int>*,
+  cudaStream_t);
+template void persist_winning_tree_projection_vectors<double, double, int>(
+  SPORFTrainingProjectionWorkspace<double, double, int>&,
+  const Split<double, int>*,
+  cudaStream_t);
 
 }  // namespace DT
 }  // namespace ML

@@ -44,6 +44,16 @@ struct ProjectionMatrix {
   const DataT* d_proj_coeffs; // projection matrix component non-zero coefficients
 };
 
+template <typename IdxT = int, typename OffsetT = std::size_t>
+struct OffsetProjectionMatrix {
+  // For persistent device-side tree storage, offsets are relative to the
+  // training workspace backing buffers rather than absolute pointers.
+  IdxT n_proj_components;
+  OffsetT indptr_offset;
+  OffsetT indices_offset;
+  OffsetT coeffs_offset;
+};
+
 template <typename DataT, typename IdxT = int>
 struct OwnedProjectionMatrix {
   explicit OwnedProjectionMatrix(cudaStream_t stream)
@@ -99,8 +109,18 @@ struct SPORFDecisionTreeParams : DecisionTreeParams {
 };
 
 template <class T, class L>
-struct ObliqueTreeMetaDataNode : public TreeMetaDataNode<T, L> {
-  std::vector<std::unique_ptr<OwnedProjectionMatrix<T>>> projection_vectors;
+struct ObliqueTreeMetaDataNode {
+  int treeid;
+  int depth_counter;
+  int leaf_counter;
+  double train_time;
+  std::vector<T> vector_leaf;
+  std::vector<SparseTreeNode<T, L>> sparsetree;
+  int num_outputs;
+  std::vector<OffsetProjectionMatrix<int>> projection_vectors;
+  std::vector<int> projection_indptr_storage;
+  std::vector<int> projection_indices_storage;
+  std::vector<T> projection_coeffs_storage;
 };
 
 template <typename DataT, typename IdxT = int>

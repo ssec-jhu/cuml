@@ -137,10 +137,10 @@ class SPORFPredictNodeQueue {
       auto* work_item = &popped.back();
 
       total_rows += work_item->instances.count;
-      auto* projection_matrix = tree.projection_vectors[work_item->idx].get();
-      if (projection_matrix != nullptr) {
-        max_n_proj_components = std::max<IdxT>(
-          max_n_proj_components, static_cast<IdxT>(projection_matrix->indptr.size() - 1));
+      const auto& projection_matrix = tree.projection_vectors[work_item->idx];
+      if (projection_matrix.n_proj_components > 0) {
+        max_n_proj_components =
+          std::max<IdxT>(max_n_proj_components, projection_matrix.n_proj_components);
       }
 
       for(IdxT threads_left = work_item->instances.count, instances_begin = work_item->instances.begin; threads_left > 0; ) {
@@ -260,6 +260,9 @@ template <typename DataT, typename LabelT, typename IdxT>
 struct TrainingProjectionWorkspaceMeta {
   BatchedProjectionWorkspaceMeta<DataT, LabelT, IdxT> projection;
   IdxT input_n_rows;
+  IdxT cap_tree_projection_vectors;
+  IdxT tree_projection_max_node_idx;
+  IdxT tree_projection_payload_nnz;
   IdxT n_generation_chunks;
   IdxT n_generation_block_tasks;
   IdxT generation_n_features;
@@ -291,6 +294,13 @@ struct TrainingProjectionWorkspacePointers {
   const DataT*                         d_input_col_major;
   const IdxT*                          d_row_ids;
   ProjectionMatrix<DataT, IdxT>*       d_projection_matrices;
+  OffsetProjectionMatrix<IdxT>*        d_tree_projection_vectors;
+  IdxT*                                d_tree_projection_max_node_idx;
+  IdxT*                                d_tree_projection_indptr_storage;
+  IdxT*                                d_tree_projection_indices_storage;
+  DataT*                               d_tree_projection_coeffs_storage;
+  IdxT*                                d_tree_projection_winning_nnz;
+  IdxT*                                d_tree_projection_winning_offsets;
   NodeWorkItemChunk<IdxT>*             d_generation_chunks;
   BlockTask<IdxT>*                     d_generation_block_tasks;
   int*                                 d_generation_keep_mask;
@@ -306,6 +316,13 @@ template <typename DataT, typename LabelT, typename IdxT>
 struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<char> d_workspace;
   rmm::device_uvector<ProjectionMatrix<DataT, IdxT>> d_projection_matrices_storage;
+  rmm::device_uvector<OffsetProjectionMatrix<IdxT>> d_tree_projection_vectors_storage;
+  rmm::device_uvector<IdxT> d_tree_projection_max_node_idx_storage;
+  rmm::device_uvector<IdxT> d_tree_projection_indptr_storage;
+  rmm::device_uvector<IdxT> d_tree_projection_indices_storage;
+  rmm::device_uvector<DataT> d_tree_projection_coeffs_storage;
+  rmm::device_uvector<IdxT> d_tree_projection_winning_nnz_storage;
+  rmm::device_uvector<IdxT> d_tree_projection_winning_offsets_storage;
   rmm::device_uvector<int> d_generation_keep_mask_storage;
   rmm::device_uvector<DataT> d_generation_dense_values_storage;
   rmm::device_uvector<int> d_generation_indptr_storage;
@@ -324,6 +341,13 @@ struct SPORFTrainingProjectionWorkspace {
   SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
     : d_workspace(0, stream),
       d_projection_matrices_storage(0, stream),
+      d_tree_projection_vectors_storage(0, stream),
+      d_tree_projection_max_node_idx_storage(0, stream),
+      d_tree_projection_indptr_storage(0, stream),
+      d_tree_projection_indices_storage(0, stream),
+      d_tree_projection_coeffs_storage(0, stream),
+      d_tree_projection_winning_nnz_storage(0, stream),
+      d_tree_projection_winning_offsets_storage(0, stream),
       d_generation_keep_mask_storage(0, stream),
       d_generation_dense_values_storage(0, stream),
       d_generation_indptr_storage(0, stream),
@@ -354,6 +378,9 @@ struct SPORFTrainingProjectionWorkspace {
     meta.projection.n_chunks = 0;
     meta.projection.n_block_tasks = 0;
     meta.input_n_rows = static_cast<IdxT>(n_rows_);
+    meta.cap_tree_projection_vectors = 0;
+    meta.tree_projection_max_node_idx = IdxT{-1};
+    meta.tree_projection_payload_nnz = 0;
     meta.n_generation_chunks = 0;
     meta.n_generation_block_tasks = 0;
     meta.generation_n_features = 0;
@@ -403,6 +430,13 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_input_col_major = nullptr;
     pointers.d_row_ids = nullptr;
     pointers.d_projection_matrices = d_projection_matrices_storage.data();
+    pointers.d_tree_projection_vectors = nullptr;
+    pointers.d_tree_projection_max_node_idx = nullptr;
+    pointers.d_tree_projection_indptr_storage = nullptr;
+    pointers.d_tree_projection_indices_storage = nullptr;
+    pointers.d_tree_projection_coeffs_storage = nullptr;
+    pointers.d_tree_projection_winning_nnz = nullptr;
+    pointers.d_tree_projection_winning_offsets = nullptr;
     d_generation_nnz_counter_storage.resize(1, stream);
     pointers.d_generation_keep_mask = nullptr;
     pointers.d_generation_dense_values = nullptr;
@@ -424,6 +458,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.projection.n_work_items = 0;
     meta.projection.n_chunks = 0;
     meta.projection.n_block_tasks = 0;
+    meta.cap_tree_projection_vectors =
+      static_cast<IdxT>(d_tree_projection_vectors_storage.size());
+    meta.tree_projection_payload_nnz =
+      static_cast<IdxT>(d_tree_projection_indices_storage.size());
     meta.n_generation_chunks = 0;
     meta.n_generation_block_tasks = 0;
     meta.generation_n_features = 0;
@@ -436,8 +474,85 @@ struct SPORFTrainingProjectionWorkspace {
     if (d_projection_matrices_storage.size() < static_cast<size_t>(meta.projection.cap_work_items)) {
       d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
     }
+    if (d_tree_projection_max_node_idx_storage.size() < 1) {
+      d_tree_projection_max_node_idx_storage.resize(1, stream);
+    }
     pointers.d_projection_matrices = d_projection_matrices_storage.data();
+    pointers.d_tree_projection_vectors = d_tree_projection_vectors_storage.data();
+    pointers.d_tree_projection_max_node_idx = d_tree_projection_max_node_idx_storage.data();
+    pointers.d_tree_projection_indptr_storage = d_tree_projection_indptr_storage.data();
+    pointers.d_tree_projection_indices_storage = d_tree_projection_indices_storage.data();
+    pointers.d_tree_projection_coeffs_storage = d_tree_projection_coeffs_storage.data();
+    pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
+    pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
     if (d_generation_nnz_counter_storage.size() < 1) { d_generation_nnz_counter_storage.resize(1, stream); }
+  }
+
+  void ensure_tree_projection_vector_capacity(size_t n_tree_projection_vectors, cudaStream_t stream)
+  {
+    if (d_tree_projection_vectors_storage.size() < n_tree_projection_vectors) {
+      d_tree_projection_vectors_storage.resize(n_tree_projection_vectors, stream);
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        d_tree_projection_vectors_storage.data(),
+        0,
+        sizeof(OffsetProjectionMatrix<IdxT>) * d_tree_projection_vectors_storage.size(),
+        stream));
+    }
+    meta.cap_tree_projection_vectors =
+      static_cast<IdxT>(d_tree_projection_vectors_storage.size());
+    pointers.d_tree_projection_vectors = d_tree_projection_vectors_storage.data();
+  }
+
+  void clear_tree_projection_state(cudaStream_t stream)
+  {
+    meta.tree_projection_max_node_idx = IdxT{-1};
+    meta.tree_projection_payload_nnz = 0;
+    if (d_tree_projection_max_node_idx_storage.size() < 1) {
+      d_tree_projection_max_node_idx_storage.resize(1, stream);
+    }
+    pointers.d_tree_projection_vectors = d_tree_projection_vectors_storage.data();
+    pointers.d_tree_projection_max_node_idx = d_tree_projection_max_node_idx_storage.data();
+    pointers.d_tree_projection_indptr_storage = d_tree_projection_indptr_storage.data();
+    pointers.d_tree_projection_indices_storage = d_tree_projection_indices_storage.data();
+    pointers.d_tree_projection_coeffs_storage = d_tree_projection_coeffs_storage.data();
+    if (meta.cap_tree_projection_vectors > 0) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(pointers.d_tree_projection_vectors,
+                                    0,
+                                    sizeof(OffsetProjectionMatrix<IdxT>) *
+                                      static_cast<size_t>(meta.cap_tree_projection_vectors),
+                                    stream));
+    }
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      pointers.d_tree_projection_max_node_idx, 0xFF, sizeof(IdxT), stream));
+    d_tree_projection_indptr_storage.resize(0, stream);
+    d_tree_projection_indices_storage.resize(0, stream);
+    d_tree_projection_coeffs_storage.resize(0, stream);
+    pointers.d_tree_projection_indptr_storage = d_tree_projection_indptr_storage.data();
+    pointers.d_tree_projection_indices_storage = d_tree_projection_indices_storage.data();
+    pointers.d_tree_projection_coeffs_storage = d_tree_projection_coeffs_storage.data();
+  }
+
+  void resize_tree_projection_payload_storage(size_t tree_projection_vectors,
+                                              size_t payload_nnz,
+                                              cudaStream_t stream)
+  {
+    d_tree_projection_indptr_storage.resize(tree_projection_vectors * 2, stream);
+    d_tree_projection_indices_storage.resize(payload_nnz, stream);
+    d_tree_projection_coeffs_storage.resize(payload_nnz, stream);
+
+    pointers.d_tree_projection_indptr_storage = d_tree_projection_indptr_storage.data();
+    pointers.d_tree_projection_indices_storage = d_tree_projection_indices_storage.data();
+    pointers.d_tree_projection_coeffs_storage = d_tree_projection_coeffs_storage.data();
+    meta.tree_projection_payload_nnz = static_cast<IdxT>(payload_nnz);
+  }
+
+  void resize_tree_projection_batch_scratch(size_t n_work_items, cudaStream_t stream)
+  {
+    d_tree_projection_winning_nnz_storage.resize(n_work_items, stream);
+    d_tree_projection_winning_offsets_storage.resize(n_work_items + 1, stream);
+
+    pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
+    pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
   }
 
   void ensure_generation_metadata_capacity(IdxT n_generation_chunks_req,
@@ -544,9 +659,18 @@ struct SPORFDecisionTreeWorkspace {
   rmm::device_uvector<SPORFDT::NodeWorkItem> d_leaves;
   rmm::device_uvector<DataT>     d_vector_leaf;
   rmm::device_uvector<ObliqueNode<DataT, IdxT>> d_nodes_storage;
+  rmm::device_uvector<IdxT> d_projection_indptr_storage;
+  rmm::device_uvector<IdxT> d_projection_indices_storage;
+  rmm::device_uvector<DataT> d_projection_coeffs_storage;
 
   SPORFDecisionTreeWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
-    : d_workspace(0, stream), d_leaves(0, stream), d_vector_leaf(0, stream), d_nodes_storage(0, stream)
+    : d_workspace(0, stream),
+      d_leaves(0, stream),
+      d_vector_leaf(0, stream),
+      d_nodes_storage(0, stream),
+      d_projection_indptr_storage(0, stream),
+      d_projection_indices_storage(0, stream),
+      d_projection_coeffs_storage(0, stream)
   {
     auto align_bytes = [](size_t actual_size) {
       constexpr size_t align = 256;
@@ -628,14 +752,46 @@ struct SPORFDecisionTreeWorkspace {
     if (d_nodes_storage.size() < static_cast<size_t>(meta.n_nodes)) {
       d_nodes_storage.resize(static_cast<size_t>(meta.n_nodes), stream);
     }
+    if (d_projection_indptr_storage.size() < tree.projection_indptr_storage.size()) {
+      d_projection_indptr_storage.resize(tree.projection_indptr_storage.size(), stream);
+    }
+    if (d_projection_indices_storage.size() < tree.projection_indices_storage.size()) {
+      d_projection_indices_storage.resize(tree.projection_indices_storage.size(), stream);
+    }
+    if (d_projection_coeffs_storage.size() < tree.projection_coeffs_storage.size()) {
+      d_projection_coeffs_storage.resize(tree.projection_coeffs_storage.size(), stream);
+    }
+
+    if (!tree.projection_indptr_storage.empty()) {
+      raft::update_device(d_projection_indptr_storage.data(),
+                          tree.projection_indptr_storage.data(),
+                          tree.projection_indptr_storage.size(),
+                          stream);
+    }
+    if (!tree.projection_indices_storage.empty()) {
+      raft::update_device(d_projection_indices_storage.data(),
+                          tree.projection_indices_storage.data(),
+                          tree.projection_indices_storage.size(),
+                          stream);
+    }
+    if (!tree.projection_coeffs_storage.empty()) {
+      raft::update_device(d_projection_coeffs_storage.data(),
+                          tree.projection_coeffs_storage.data(),
+                          tree.projection_coeffs_storage.size(),
+                          stream);
+    }
 
     std::vector<ObliqueNode<DataT, IdxT>> nodes_host;
     nodes_host.reserve(tree.sparsetree.size());
     for (size_t i = 0; i < tree.sparsetree.size(); i++) {
-      auto* projection_matrix = tree.projection_vectors[i].get();
       ProjectionMatrix<DataT, IdxT> proj{0, nullptr, nullptr, nullptr};
-      if (projection_matrix) {
-        proj = projection_matrix->view();
+      const auto& projection_matrix = tree.projection_vectors[i];
+      if (projection_matrix.n_proj_components > 0) {
+        proj = ProjectionMatrix<DataT, IdxT>{
+          projection_matrix.n_proj_components,
+          d_projection_indptr_storage.data() + projection_matrix.indptr_offset,
+          d_projection_indices_storage.data() + projection_matrix.indices_offset,
+          d_projection_coeffs_storage.data() + projection_matrix.coeffs_offset};
       }
       nodes_host.push_back(ObliqueNode<DataT, IdxT>{proj, tree.sparsetree[i].QueryValue()});
     }
@@ -935,6 +1091,22 @@ template <typename DataT, typename LabelT, typename IdxT>
 void launch_batched_training_random_matrix_bernoulli_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_store_winning_tree_projection_vectors_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  const Split<DataT, IdxT>* d_splits,
+  std::size_t payload_base_offset,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void persist_winning_tree_projection_vectors(
+  SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
+  const Split<DataT, IdxT>* d_splits,
   cudaStream_t stream
 );
 

@@ -61,6 +61,18 @@ void launch_batched_training_random_matrix_bernoulli_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_store_winning_tree_projection_vectors_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  const Split<DataT, IdxT>* d_splits,
+  std::size_t payload_base_offset,
+  cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
+void persist_winning_tree_projection_vectors(
+  SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
+  const Split<DataT, IdxT>* d_splits,
+  cudaStream_t stream);
 
 
 /**
@@ -91,7 +103,7 @@ class SPORFNodeQueue {
     tree->sparsetree.reserve(max_nodes);
     tree->sparsetree.emplace_back(NodeT::CreateLeafNode(sampled_rows));
     tree->projection_vectors.reserve(max_nodes);
-    tree->projection_vectors.resize(max_nodes);
+    tree->projection_vectors.resize(max_nodes, DT::OffsetProjectionMatrix<IdxT>{0, 0, 0, 0});
     tree->leaf_counter  = 1;
     tree->depth_counter = 0;
     node_instances_.reserve(max_nodes);
@@ -221,12 +233,8 @@ class SPORFNodeQueue {
   }
 
   template <typename SplitT>
-  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items,
-            SplitT* h_splits,
-            std::vector<std::unique_ptr<OwnedProjectionMatrix<DataT>>>& h_sparse_matrices,
-            std::size_t n_sampled_cols)
+  void Push(const std::vector<SPORFDT::NodeWorkItem>& work_items, SplitT* h_splits)
   {
-    (void)n_sampled_cols;
     // Update node queue based on splits
     for (std::size_t i = 0; i < work_items.size(); i++) {
 
@@ -246,14 +254,6 @@ class SPORFNodeQueue {
                                                              split.best_metric_val,
                                                              int64_t(tree->sparsetree.size()),
                                                              parent_range.count);
-
-      tree->projection_vectors.at(item.idx) =
-        std::make_unique<OwnedProjectionMatrix<DataT>>(h_sparse_matrices[i]->stream);
-      ASSERT(h_sparse_matrices[i] != nullptr, "Expected generated projection matrix for split");
-      ASSERT(split.colid >= 0, "Winning projection column id must be non-negative");
-      ASSERT(static_cast<size_t>(split.colid + 1) < h_sparse_matrices[i]->indptr.size(),
-             "Winning projection column id out of bounds for owned projection matrix");
-      clone_column_to_column_vector(*h_sparse_matrices[i], split.colid, *tree->projection_vectors.at(item.idx));
       tree->leaf_counter++;
 
       // left
@@ -348,7 +348,6 @@ struct SPORFBuilder {
   std::vector<IdxT> h_quantile_indices;
   rmm::device_uvector<IdxT> d_quantile_indices;
   rmm::device_uvector<DataT> d_trans;
-  std::vector<std::unique_ptr<OwnedProjectionMatrix<DataT>>> h_sparse_matrices;
 
   struct Stats {
     double t_pop;
@@ -357,9 +356,11 @@ struct SPORFBuilder {
     double t_d2h;
     double t_kernels;
     double t_workload_info_cpu;
-    double t_projection_persist_cpu;
     double t_quantile_sampling_cpu;
     double t_split_postprocess_cpu;
+    double t_projection_store_device;
+    double t_tree_projection_finalize;
+    double t_leaf_predictions;
 
     Stats()
       : t_pop(0),
@@ -368,9 +369,11 @@ struct SPORFBuilder {
         t_d2h(0),
         t_kernels(0),
         t_workload_info_cpu(0),
-        t_projection_persist_cpu(0),
         t_quantile_sampling_cpu(0),
-        t_split_postprocess_cpu(0)
+        t_split_postprocess_cpu(0),
+        t_projection_store_device(0),
+        t_tree_projection_finalize(0),
+        t_leaf_predictions(0)
     {
     }
   } stats;
@@ -433,10 +436,8 @@ struct SPORFBuilder {
     aligned_elems = aligned_bytes / sizeof(DataT);
     d_trans.resize(aligned_elems, builder_stream);
 
-    h_sparse_matrices.reserve(params.max_batch_size);
-    for (int i = 0; i < params.max_batch_size; ++i) {
-      h_sparse_matrices.emplace_back(std::make_unique<OwnedProjectionMatrix<DataT>>(builder_stream));
-    }
+    projection_ws.ensure_tree_projection_vector_capacity(this->maxNodes(), builder_stream);
+    projection_ws.clear_tree_projection_state(builder_stream);
 
     auto [device_workspace_size, host_workspace_size] = workspaceSize();
     d_buff.resize(device_workspace_size, builder_stream);
@@ -583,12 +584,74 @@ struct SPORFBuilder {
                 projection_matrix_block_tasks,
                 projection_ws);
       auto t_push = std::chrono::steady_clock::now();
-      queue.Push(work_items, splits_host_ptr, h_sparse_matrices, dataset.n_sampled_cols);
+      queue.Push(work_items, splits_host_ptr);
       stats.t_push +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_push).count();
     }
     auto tree = queue.GetTree();
+
+    {
+      auto t_tree_projection_finalize = std::chrono::steady_clock::now();
+      IdxT h_tree_projection_max_node_idx = IdxT{-1};
+      raft::update_host(&h_tree_projection_max_node_idx,
+                        projection_ws.pointers.d_tree_projection_max_node_idx,
+                        std::size_t{1},
+                        builder_stream);
+      handle.sync_stream(builder_stream);
+      auto max_projection_node_idx = std::min<std::size_t>(
+        tree->projection_vectors.size(),
+        h_tree_projection_max_node_idx >= 0
+          ? static_cast<std::size_t>(h_tree_projection_max_node_idx + 1)
+          : std::size_t{0});
+      std::vector<DT::OffsetProjectionMatrix<IdxT>> h_tree_projection_vectors(
+        max_projection_node_idx);
+      std::vector<IdxT> h_tree_projection_indptr_storage(max_projection_node_idx * 2);
+      std::vector<IdxT> h_tree_projection_indices_storage(
+        static_cast<std::size_t>(projection_ws.meta.tree_projection_payload_nnz));
+      std::vector<DataT> h_tree_projection_coeffs_storage(
+        static_cast<std::size_t>(projection_ws.meta.tree_projection_payload_nnz));
+      if (!h_tree_projection_vectors.empty()) {
+        raft::update_host(h_tree_projection_vectors.data(),
+                          projection_ws.pointers.d_tree_projection_vectors,
+                          h_tree_projection_vectors.size(),
+                          builder_stream);
+        raft::update_host(h_tree_projection_indptr_storage.data(),
+                          projection_ws.pointers.d_tree_projection_indptr_storage,
+                          h_tree_projection_indptr_storage.size(),
+                          builder_stream);
+      }
+      if (!h_tree_projection_indices_storage.empty()) {
+        raft::update_host(h_tree_projection_indices_storage.data(),
+                          projection_ws.pointers.d_tree_projection_indices_storage,
+                          h_tree_projection_indices_storage.size(),
+                          builder_stream);
+        raft::update_host(h_tree_projection_coeffs_storage.data(),
+                          projection_ws.pointers.d_tree_projection_coeffs_storage,
+                          h_tree_projection_coeffs_storage.size(),
+                          builder_stream);
+      }
+      handle.sync_stream(builder_stream);
+
+      tree->projection_vectors.assign(
+        tree->sparsetree.size(), DT::OffsetProjectionMatrix<IdxT>{0, 0, 0, 0});
+      for (size_t node_idx = 0; node_idx < max_projection_node_idx; ++node_idx) {
+        tree->projection_vectors[node_idx] = h_tree_projection_vectors[node_idx];
+      }
+      tree->projection_indptr_storage = std::move(h_tree_projection_indptr_storage);
+      tree->projection_indices_storage = std::move(h_tree_projection_indices_storage);
+      tree->projection_coeffs_storage = std::move(h_tree_projection_coeffs_storage);
+      stats.t_tree_projection_finalize +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  t_tree_projection_finalize)
+          .count();
+    }
+
+    auto t_leaf_predictions = std::chrono::steady_clock::now();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges());
+    stats.t_leaf_predictions +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_leaf_predictions)
+        .count();
     tree->train_time = timer.getElapsedMilliseconds();
 
     std::cout << "SPORFBuilder::train: pop: " << stats.t_pop <<
@@ -597,9 +660,11 @@ struct SPORFBuilder {
       " ms, d2h: " << stats.t_d2h <<
       " ms, kernels: " << stats.t_kernels <<
       " ms, workload_info_cpu: " << stats.t_workload_info_cpu <<
-      " ms, projection_persist_cpu: " << stats.t_projection_persist_cpu <<
       " ms, quantile_sampling_cpu: " << stats.t_quantile_sampling_cpu <<
       " ms, split_postprocess_cpu: " << stats.t_split_postprocess_cpu <<
+      " ms, projection_store_device: " << stats.t_projection_store_device <<
+      " ms, tree_projection_finalize: " << stats.t_tree_projection_finalize <<
+      " ms, leaf_predictions: " << stats.t_leaf_predictions <<
       " ms" << std::endl;
 
 
@@ -643,9 +708,6 @@ struct SPORFBuilder {
         h_colids[i * dataset.n_sampled_cols + c] = c;
       }
     }
-
-    std::vector<DT::ProjectionMatrix<DataT, IdxT>> generated_projection_matrices(
-      work_items.size(), DT::ProjectionMatrix<DataT, IdxT>{0, nullptr, nullptr, nullptr});
 
     projection_ws.reset(builder_stream);
     projection_ws.meta.input_n_rows = dataset.M;
@@ -739,28 +801,6 @@ struct SPORFBuilder {
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
 
-    auto t_d2h = std::chrono::steady_clock::now();
-    if (!work_items.empty()) {
-      raft::update_host(generated_projection_matrices.data(),
-                        projection_ws.pointers.d_projection_matrices,
-                        projection_ws.meta.projection.n_work_items,
-                        builder_stream);
-      handle.sync_stream(builder_stream);
-    }
-    stats.t_d2h +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
-
-    t_cpu = std::chrono::steady_clock::now();
-    if (!work_items.empty()) {
-      for (size_t i = 0; i < work_items.size(); i++) {
-        auto count = work_items[i].instances.count;
-        if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-        copy_projection_matrix_to_owned(generated_projection_matrices[i], *h_sparse_matrices[i]);
-      }
-    }
-    stats.t_projection_persist_cpu +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
-
     t_kernel = std::chrono::steady_clock::now();
     launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
@@ -803,7 +843,14 @@ struct SPORFBuilder {
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
 
-    t_d2h = std::chrono::steady_clock::now();
+    auto t_projection_store_device = std::chrono::steady_clock::now();
+    persist_winning_tree_projection_vectors<DataT, LabelT, IdxT>(projection_ws, splits, builder_stream);
+    stats.t_projection_store_device +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_projection_store_device)
+        .count();
+
+    auto t_d2h = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     stats.t_d2h +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
