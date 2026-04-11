@@ -1093,6 +1093,15 @@ void launch_batched_training_random_matrix_bernoulli_kernel(
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream
 );
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_quantile_sampling_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  IdxT* d_quantile_indices,
+  IdxT max_n_bins,
+  IdxT min_samples_leaf,
+  cudaStream_t stream
+);
 
 template <typename DataT, typename LabelT, typename IdxT>
 void launch_store_winning_tree_projection_vectors_kernel(

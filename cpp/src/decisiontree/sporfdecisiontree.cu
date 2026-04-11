@@ -790,6 +790,86 @@ void launch_batched_training_random_matrix_bernoulli_kernel(
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
+template <typename DataT, typename LabelT, typename IdxT>
+__global__ void batched_training_quantile_sampling_kernel(
+  TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers,
+  TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta,
+  IdxT* d_quantile_indices,
+  IdxT max_n_bins,
+  IdxT min_samples_leaf)
+{
+  auto linear_idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  auto n_cols = static_cast<std::size_t>(meta.projection.n_proj_components);
+  auto total = static_cast<std::size_t>(meta.projection.n_work_items) * n_cols;
+  if (linear_idx >= total) { return; }
+
+  auto work_item_idx = static_cast<IdxT>(linear_idx / n_cols);
+  auto col = static_cast<IdxT>(linear_idx % n_cols);
+  auto work_item = pointers.projection.d_work_items[work_item_idx];
+  auto count = static_cast<IdxT>(work_item.instances.count);
+  auto dst = d_quantile_indices +
+             (static_cast<std::size_t>(work_item_idx) * n_cols + static_cast<std::size_t>(col)) *
+               static_cast<std::size_t>(max_n_bins);
+
+  if (count < meta.generation_min_samples_split) {
+    for (IdxT j = 0; j < max_n_bins; ++j) dst[j] = 0;
+    return;
+  }
+
+  IdxT sample_count = count < max_n_bins ? count : max_n_bins;
+  IdxT candidate_n_bins = count / min_samples_leaf;
+  IdxT n_bins = candidate_n_bins < max_n_bins ? candidate_n_bins : max_n_bins;
+  sample_count = sample_count > n_bins ? sample_count : n_bins;
+
+  auto node_idx = static_cast<unsigned long long>(work_item.idx);
+  auto logical_idx = node_idx * static_cast<unsigned long long>(n_cols) +
+                     static_cast<unsigned long long>(col);
+
+  curandStatePhilox4_32_10_t state;
+  curand_init(
+    static_cast<unsigned long long>(meta.generation_random_state), logical_idx, 0, &state);
+
+  for (IdxT s = 0; s < sample_count; ++s) {
+    IdxT candidate;
+    bool duplicate;
+    do {
+      candidate = static_cast<IdxT>(curand(&state) % static_cast<unsigned int>(count));
+      duplicate = false;
+      for (IdxT prev = 0; prev < s; ++prev) {
+        if (dst[prev] == candidate) {
+          duplicate = true;
+          break;
+        }
+      }
+    } while (duplicate);
+    dst[s] = candidate;
+  }
+
+  for (IdxT s = sample_count; s < max_n_bins; ++s) {
+    dst[s] = sample_count > 0 ? dst[s % sample_count] : 0;
+  }
+}
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_quantile_sampling_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  IdxT* d_quantile_indices,
+  IdxT max_n_bins,
+  IdxT min_samples_leaf,
+  cudaStream_t stream)
+{
+  auto total = static_cast<std::size_t>(meta.projection.n_work_items) *
+               static_cast<std::size_t>(meta.projection.n_proj_components);
+  if (total == 0 || max_n_bins <= 0) { return; }
+  constexpr int TPB = 256;
+  dim3 block(TPB);
+  dim3 grid((total + TPB - 1) / TPB);
+  batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>
+    <<<grid, block, 0, stream>>>(pointers, meta, d_quantile_indices, max_n_bins, min_samples_leaf);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
 template void launch_batched_training_random_matrix_bernoulli_kernel<float, int, int>(
   const TrainingProjectionWorkspacePointers<float, int, int>&,
   const TrainingProjectionWorkspaceMeta<float, int, int>&,
@@ -805,6 +885,34 @@ template void launch_batched_training_random_matrix_bernoulli_kernel<float, floa
 template void launch_batched_training_random_matrix_bernoulli_kernel<double, double, int>(
   const TrainingProjectionWorkspacePointers<double, double, int>&,
   const TrainingProjectionWorkspaceMeta<double, double, int>&,
+  cudaStream_t);
+template void launch_batched_training_quantile_sampling_kernel<float, int, int>(
+  const TrainingProjectionWorkspacePointers<float, int, int>&,
+  const TrainingProjectionWorkspaceMeta<float, int, int>&,
+  int*,
+  int,
+  int,
+  cudaStream_t);
+template void launch_batched_training_quantile_sampling_kernel<double, int, int>(
+  const TrainingProjectionWorkspacePointers<double, int, int>&,
+  const TrainingProjectionWorkspaceMeta<double, int, int>&,
+  int*,
+  int,
+  int,
+  cudaStream_t);
+template void launch_batched_training_quantile_sampling_kernel<float, float, int>(
+  const TrainingProjectionWorkspacePointers<float, float, int>&,
+  const TrainingProjectionWorkspaceMeta<float, float, int>&,
+  int*,
+  int,
+  int,
+  cudaStream_t);
+template void launch_batched_training_quantile_sampling_kernel<double, double, int>(
+  const TrainingProjectionWorkspacePointers<double, double, int>&,
+  const TrainingProjectionWorkspaceMeta<double, double, int>&,
+  int*,
+  int,
+  int,
   cudaStream_t);
 
 template <typename DataT, typename LabelT, typename IdxT>

@@ -62,6 +62,14 @@ void launch_batched_training_random_matrix_bernoulli_kernel(
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream);
 template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_quantile_sampling_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  IdxT* d_quantile_indices,
+  IdxT max_n_bins,
+  IdxT min_samples_leaf,
+  cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
 void launch_store_winning_tree_projection_vectors_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
@@ -345,7 +353,6 @@ struct SPORFBuilder {
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws;
   /** pinned host buffer to store the trained nodes */
   ML::pinned_host_vector<char> h_buff;
-  std::vector<IdxT> h_quantile_indices;
   rmm::device_uvector<IdxT> d_quantile_indices;
   rmm::device_uvector<DataT> d_trans;
 
@@ -356,7 +363,7 @@ struct SPORFBuilder {
     double t_d2h;
     double t_kernels;
     double t_workload_info_cpu;
-    double t_quantile_sampling_cpu;
+    double t_quantile_sampling_kernel;
     double t_split_postprocess_cpu;
     double t_projection_store_device;
     double t_tree_projection_finalize;
@@ -369,7 +376,7 @@ struct SPORFBuilder {
         t_d2h(0),
         t_kernels(0),
         t_workload_info_cpu(0),
-        t_quantile_sampling_cpu(0),
+        t_quantile_sampling_kernel(0),
         t_split_postprocess_cpu(0),
         t_projection_store_device(0),
         t_tree_projection_finalize(0),
@@ -423,8 +430,6 @@ struct SPORFBuilder {
     ASSERT(n_classes >= 1, "n_classes should be at least 1");
     ASSERT(TPB_DEFAULT * ITEMS_PER_THREAD >= params.max_n_bins,
       "max_n_bins must be <= 2048 for proper functioning of quantile sorting.");
-
-    h_quantile_indices.resize(params.max_batch_size * dataset.n_sampled_cols * params.max_n_bins);
 
     size_t req_bytes     = size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * params.max_n_bins * sizeof(IdxT);
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
@@ -660,7 +665,7 @@ struct SPORFBuilder {
       " ms, d2h: " << stats.t_d2h <<
       " ms, kernels: " << stats.t_kernels <<
       " ms, workload_info_cpu: " << stats.t_workload_info_cpu <<
-      " ms, quantile_sampling_cpu: " << stats.t_quantile_sampling_cpu <<
+      " ms, quantile_sampling_kernel: " << stats.t_quantile_sampling_kernel <<
       " ms, split_postprocess_cpu: " << stats.t_split_postprocess_cpu <<
       " ms, projection_store_device: " << stats.t_projection_store_device <<
       " ms, tree_projection_finalize: " << stats.t_tree_projection_finalize <<
@@ -807,30 +812,18 @@ struct SPORFBuilder {
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
 
-    t_cpu = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < work_items.size(); i++) {
-      auto count = work_items[i].instances.count;
-      if (count < static_cast<unsigned long>(params.min_samples_split)) continue;
-
-      std::vector<IdxT> universe(count);
-      std::iota(universe.begin(), universe.end(), 0);
-
-      for (int c = 0; c < dataset.n_sampled_cols; c++) {
-        std::mt19937_64 rng(seed + static_cast<uint64_t>(treeid) + i + c);
-        // TODO: randomize the order here!
-        std::sample(
-          universe.begin(), universe.end(), h_quantile_indices.begin() + (i * dataset.n_sampled_cols * params.max_n_bins) + (c * params.max_n_bins), params.max_n_bins, rng
-        );
-      }
-    }
-    stats.t_quantile_sampling_cpu +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
-
-    t_h2d = std::chrono::steady_clock::now();
-    raft::update_device(
-      d_quantile_indices.data(), h_quantile_indices.data(), h_quantile_indices.size(), builder_stream);
-    stats.t_h2d +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h2d).count();
+    auto t_quantile_sampling_kernel = std::chrono::steady_clock::now();
+    launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
+      projection_ws.pointers,
+      projection_ws.meta,
+      d_quantile_indices.data(),
+      static_cast<IdxT>(params.max_n_bins),
+      static_cast<IdxT>(params.min_samples_leaf),
+      builder_stream);
+    stats.t_quantile_sampling_kernel +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_quantile_sampling_kernel)
+        .count();
 
     dataset_proj.data = d_trans.data();
     t_kernel = std::chrono::steady_clock::now();
