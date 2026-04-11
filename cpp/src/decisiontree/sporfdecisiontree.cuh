@@ -312,6 +312,16 @@ struct TrainingProjectionWorkspacePointers {
   SparseSamplingGenerationPointers<DataT, LabelT, IdxT> sparse_sampling;
 };
 
+struct PersistWinningTreeProjectionTimings {
+  double t_batch_scratch_resize = 0.0;
+  double t_gather_nnz_kernel = 0.0;
+  double t_offsets_scan = 0.0;
+  double t_total_nnz_d2h_sync = 0.0;
+  double t_payload_resize = 0.0;
+  double t_store_kernel = 0.0;
+  double t_max_node_idx_d2h_sync = 0.0;
+};
+
 template <typename DataT, typename LabelT, typename IdxT>
 struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<char> d_workspace;
@@ -407,6 +417,10 @@ struct SPORFTrainingProjectionWorkspace {
 
     d_workspace.resize(workspace_bytes, stream);
     d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
+    d_tree_projection_winning_nnz_storage.resize(static_cast<size_t>(meta.projection.cap_work_items),
+                                                 stream);
+    d_tree_projection_winning_offsets_storage.resize(
+      static_cast<size_t>(meta.projection.cap_work_items) + 1, stream);
 
     auto* base = d_workspace.data();
     size_t off = 0;
@@ -435,8 +449,8 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_tree_projection_indptr_storage = nullptr;
     pointers.d_tree_projection_indices_storage = nullptr;
     pointers.d_tree_projection_coeffs_storage = nullptr;
-    pointers.d_tree_projection_winning_nnz = nullptr;
-    pointers.d_tree_projection_winning_offsets = nullptr;
+    pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
+    pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
     d_generation_nnz_counter_storage.resize(1, stream);
     pointers.d_generation_keep_mask = nullptr;
     pointers.d_generation_dense_values = nullptr;
@@ -548,8 +562,12 @@ struct SPORFTrainingProjectionWorkspace {
 
   void resize_tree_projection_batch_scratch(size_t n_work_items, cudaStream_t stream)
   {
-    d_tree_projection_winning_nnz_storage.resize(n_work_items, stream);
-    d_tree_projection_winning_offsets_storage.resize(n_work_items + 1, stream);
+    if (d_tree_projection_winning_nnz_storage.size() < n_work_items) {
+      d_tree_projection_winning_nnz_storage.resize(n_work_items, stream);
+    }
+    if (d_tree_projection_winning_offsets_storage.size() < n_work_items + 1) {
+      d_tree_projection_winning_offsets_storage.resize(n_work_items + 1, stream);
+    }
 
     pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
     pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
@@ -1113,7 +1131,7 @@ void launch_store_winning_tree_projection_vectors_kernel(
 );
 
 template <typename DataT, typename LabelT, typename IdxT>
-void persist_winning_tree_projection_vectors(
+PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors(
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
   const Split<DataT, IdxT>* d_splits,
   cudaStream_t stream

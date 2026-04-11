@@ -40,6 +40,7 @@
 #include <decisiontree/sporfdecisiontree.cuh>
 #include <decisiontree/treelite_util.h>
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -176,8 +177,16 @@ class SPORF {
            SPORFMetaData<T, L>*& forest)
   {
     raft::common::nvtx::range fun_scope("SPORF::fit @sporf.cuh");
+    using clock_t = std::chrono::steady_clock;
+    auto to_ms = [](clock_t::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
     this->error_checking(input, labels, n_rows, n_cols, false);
     const raft::handle_t& handle = user_handle;
+    double t_workspace_setup = 0.0;
+    double t_row_sampling = 0.0;
+    double t_tree_fit_envelope = 0.0;
+    double t_final_sync = 0.0;
     int n_sampled_rows           = 0;
     if (this->rf_params.bootstrap) {
       n_sampled_rows = std::round(this->rf_params.max_samples * n_rows);
@@ -204,10 +213,21 @@ class SPORF {
     // ptr.
     // Use a deque instead of vector because it can be used on objects with a deleted copy
     // constructor
+    auto t_workspace_setup_start = clock_t::now();
     std::deque<rmm::device_uvector<int>> selected_rows;
     for (int i = 0; i < n_streams; i++) {
       selected_rows.emplace_back(n_sampled_rows, handle.get_stream_from_stream_pool(i));
     }
+
+    using TrainingWs = DT::SPORFTrainingProjectionWorkspace<T, L, int>;
+    std::deque<TrainingWs> training_workspaces;
+    for (int i = 0; i < n_streams; i++) {
+      training_workspaces.emplace_back(
+        static_cast<size_t>(n_rows),
+        static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
+        handle.get_stream_from_stream_pool(i));
+    }
+    t_workspace_setup += to_ms(clock_t::now() - t_workspace_setup_start);
 
 
     #pragma omp parallel for num_threads(n_streams)
@@ -216,7 +236,13 @@ class SPORF {
       auto s        = handle.get_stream_from_stream_pool(stream_id);
       RAFT_CUDA_TRY(cudaSetDevice(handle.get_device()));
 
+      auto t_row_sampling_start = clock_t::now();
       this->get_row_sample(i, n_rows, &selected_rows[stream_id], s);
+      auto row_sampling_ms = to_ms(clock_t::now() - t_row_sampling_start);
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+      t_row_sampling += row_sampling_ms;
 
       /* Build individual tree in the forest.
         - input is a pointer to orig data that have n_cols features and n_rows rows.
@@ -227,6 +253,7 @@ class SPORF {
           (b) a pointer to a list of row numbers w.r.t original data.
       */
 
+      auto t_tree_fit_start = clock_t::now();
       forest->trees[i] = DT::SPORFDecisionTree::fit(handle,
                                                     s,
                                                     input,
@@ -237,11 +264,27 @@ class SPORF {
                                                     n_unique_labels,
                                                     this->rf_params.tree_params,
                                                     this->rf_params.seed,
-                                                    i);
+                                                    i,
+                                                    training_workspaces[stream_id]);
+      auto tree_fit_ms = to_ms(clock_t::now() - t_tree_fit_start);
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+      t_tree_fit_envelope += tree_fit_ms;
     }
     // Cleanup
+    auto t_final_sync_start = clock_t::now();
     handle.sync_stream_pool();
     handle.sync_stream();
+    t_final_sync += to_ms(clock_t::now() - t_final_sync_start);
+
+    std::cout << "SPORF::fit timings (ms): workspace_setup=" << t_workspace_setup
+              << " row_sampling=" << t_row_sampling
+              << " tree_fit_envelope=" << t_tree_fit_envelope
+              << " final_sync=" << t_final_sync
+              << " (n_trees=" << this->rf_params.n_trees
+              << " n_streams=" << n_streams
+              << ")" << std::endl;
   }
 
   /**

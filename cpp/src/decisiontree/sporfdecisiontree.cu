@@ -1012,49 +1012,88 @@ void launch_store_winning_tree_projection_vectors_kernel(
 }
 
 template <typename DataT, typename LabelT, typename IdxT>
-void persist_winning_tree_projection_vectors(
+PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors(
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
   const Split<DataT, IdxT>* d_splits,
   cudaStream_t stream)
 {
+  PersistWinningTreeProjectionTimings timings;
   auto& pointers = workspace.pointers;
   auto& meta = workspace.meta;
-  if (meta.projection.n_work_items <= 0) { return; }
+  if (meta.projection.n_work_items <= 0) { return timings; }
 
+  cudaEvent_t ev_start{}, ev_stop{};
+  RAFT_CUDA_TRY(cudaEventCreate(&ev_start));
+  RAFT_CUDA_TRY(cudaEventCreate(&ev_stop));
+  auto measure_gpu_ms = [&](double& accum_ms, const auto& fn) {
+    RAFT_CUDA_TRY(cudaEventRecord(ev_start, stream));
+    fn();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_stop, stream));
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_stop));
+    float stage_ms = 0.0f;
+    RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_start, ev_stop));
+    accum_ms += static_cast<double>(stage_ms);
+  };
+
+  auto t0 = std::chrono::steady_clock::now();
   workspace.resize_tree_projection_batch_scratch(static_cast<size_t>(meta.projection.n_work_items), stream);
+  timings.t_batch_scratch_resize =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
   constexpr int TPB = 256;
   dim3 block(TPB);
   dim3 grid((meta.projection.n_work_items + TPB - 1) / TPB);
-  gather_winning_tree_projection_nnz_kernel<DataT, LabelT, IdxT>
-    <<<grid, block, 0, stream>>>(pointers, meta, d_splits);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  measure_gpu_ms(timings.t_gather_nnz_kernel, [&]() {
+    gather_winning_tree_projection_nnz_kernel<DataT, LabelT, IdxT>
+      <<<grid, block, 0, stream>>>(pointers, meta, d_splits);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
+  });
 
-  RAFT_CUDA_TRY(cudaMemsetAsync(
-    pointers.d_tree_projection_winning_offsets, 0, sizeof(IdxT), stream));
-  thrust::inclusive_scan(thrust::cuda::par.on(stream),
-                         pointers.d_tree_projection_winning_nnz,
-                         pointers.d_tree_projection_winning_nnz + meta.projection.n_work_items,
-                         pointers.d_tree_projection_winning_offsets + 1);
+  measure_gpu_ms(timings.t_offsets_scan, [&]() {
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      pointers.d_tree_projection_winning_offsets, 0, sizeof(IdxT), stream));
+    thrust::inclusive_scan(thrust::cuda::par.on(stream),
+                           pointers.d_tree_projection_winning_nnz,
+                           pointers.d_tree_projection_winning_nnz + meta.projection.n_work_items,
+                           pointers.d_tree_projection_winning_offsets + 1);
+  });
 
   IdxT batch_total_nnz = 0;
+  t0 = std::chrono::steady_clock::now();
   raft::update_host(&batch_total_nnz,
                     pointers.d_tree_projection_winning_offsets + meta.projection.n_work_items,
                     std::size_t{1},
                     stream);
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  timings.t_total_nnz_d2h_sync =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
   auto old_payload_nnz = static_cast<std::size_t>(meta.tree_projection_payload_nnz);
+  t0 = std::chrono::steady_clock::now();
   workspace.resize_tree_projection_payload_storage(
     static_cast<size_t>(meta.cap_tree_projection_vectors),
     old_payload_nnz + static_cast<size_t>(batch_total_nnz),
     stream);
+  timings.t_payload_resize =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-  launch_store_winning_tree_projection_vectors_kernel<DataT, LabelT, IdxT>(
-    workspace.pointers, workspace.meta, d_splits, old_payload_nnz, stream);
+  measure_gpu_ms(timings.t_store_kernel, [&]() {
+    launch_store_winning_tree_projection_vectors_kernel<DataT, LabelT, IdxT>(
+      workspace.pointers, workspace.meta, d_splits, old_payload_nnz, stream);
+  });
 
-  raft::update_host(
-    &workspace.meta.tree_projection_max_node_idx, pointers.d_tree_projection_max_node_idx, std::size_t{1}, stream);
+  t0 = std::chrono::steady_clock::now();
+  raft::update_host(&workspace.meta.tree_projection_max_node_idx,
+                    pointers.d_tree_projection_max_node_idx,
+                    std::size_t{1},
+                    stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  timings.t_max_node_idx_d2h_sync =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+  RAFT_CUDA_TRY(cudaEventDestroy(ev_stop));
+  RAFT_CUDA_TRY(cudaEventDestroy(ev_start));
+  return timings;
 }
 
 template void launch_store_winning_tree_projection_vectors_kernel<float, int, int>(
@@ -1082,19 +1121,19 @@ template void launch_store_winning_tree_projection_vectors_kernel<double, double
   std::size_t,
   cudaStream_t);
 
-template void persist_winning_tree_projection_vectors<float, int, int>(
+template PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors<float, int, int>(
   SPORFTrainingProjectionWorkspace<float, int, int>&,
   const Split<float, int>*,
   cudaStream_t);
-template void persist_winning_tree_projection_vectors<double, int, int>(
+template PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors<double, int, int>(
   SPORFTrainingProjectionWorkspace<double, int, int>&,
   const Split<double, int>*,
   cudaStream_t);
-template void persist_winning_tree_projection_vectors<float, float, int>(
+template PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors<float, float, int>(
   SPORFTrainingProjectionWorkspace<float, float, int>&,
   const Split<float, int>*,
   cudaStream_t);
-template void persist_winning_tree_projection_vectors<double, double, int>(
+template PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors<double, double, int>(
   SPORFTrainingProjectionWorkspace<double, double, int>&,
   const Split<double, int>*,
   cudaStream_t);

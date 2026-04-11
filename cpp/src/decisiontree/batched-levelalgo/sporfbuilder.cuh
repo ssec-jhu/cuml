@@ -51,6 +51,7 @@ template <typename DataT, typename LabelT, typename IdxT>
 struct TrainingProjectionWorkspacePointers;
 template <typename DataT, typename LabelT, typename IdxT>
 struct TrainingProjectionWorkspaceMeta;
+struct PersistWinningTreeProjectionTimings;
 template <typename DataT, typename LabelT, typename IdxT>
 void launch_batched_training_projection_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
@@ -77,7 +78,7 @@ void launch_store_winning_tree_projection_vectors_kernel(
   std::size_t payload_base_offset,
   cudaStream_t stream);
 template <typename DataT, typename LabelT, typename IdxT>
-void persist_winning_tree_projection_vectors(
+PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors(
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& workspace,
   const Split<DataT, IdxT>* d_splits,
   cudaStream_t stream);
@@ -362,9 +363,17 @@ struct SPORFBuilder {
     double t_h2d;
     double t_d2h;
     double t_kernels;
+    double t_kernels_pre_sync;
     double t_workload_info_cpu;
+    double t_generation_storage_setup;
+    double t_random_matrix_kernel;
+    double t_training_projection_kernel;
     double t_quantile_sampling_kernel;
+    double t_compute_split_kernel;
+    double t_node_split_kernel;
+    double t_node_split_d2h_sync;
     double t_split_postprocess_cpu;
+    double t_projection_store_pre_sync;
     double t_projection_store_device;
     double t_tree_projection_finalize;
     double t_leaf_predictions;
@@ -375,9 +384,17 @@ struct SPORFBuilder {
         t_h2d(0),
         t_d2h(0),
         t_kernels(0),
+        t_kernels_pre_sync(0),
         t_workload_info_cpu(0),
+        t_generation_storage_setup(0),
+        t_random_matrix_kernel(0),
+        t_training_projection_kernel(0),
         t_quantile_sampling_kernel(0),
+        t_compute_split_kernel(0),
+        t_node_split_kernel(0),
+        t_node_split_d2h_sync(0),
         t_split_postprocess_cpu(0),
+        t_projection_store_pre_sync(0),
         t_projection_store_device(0),
         t_tree_projection_finalize(0),
         t_leaf_predictions(0)
@@ -664,9 +681,17 @@ struct SPORFBuilder {
       " ms, h2d: " << stats.t_h2d <<
       " ms, d2h: " << stats.t_d2h <<
       " ms, kernels: " << stats.t_kernels <<
+      " ms, kernels_pre_sync: " << stats.t_kernels_pre_sync <<
       " ms, workload_info_cpu: " << stats.t_workload_info_cpu <<
+      " ms, generation_storage_setup: " << stats.t_generation_storage_setup <<
+      " ms, random_matrix_kernel: " << stats.t_random_matrix_kernel <<
+      " ms, training_projection_kernel: " << stats.t_training_projection_kernel <<
       " ms, quantile_sampling_kernel: " << stats.t_quantile_sampling_kernel <<
+      " ms, compute_split_kernel: " << stats.t_compute_split_kernel <<
+      " ms, node_split_kernel: " << stats.t_node_split_kernel <<
+      " ms, node_split_d2h_sync: " << stats.t_node_split_d2h_sync <<
       " ms, split_postprocess_cpu: " << stats.t_split_postprocess_cpu <<
+      " ms, projection_store_pre_sync: " << stats.t_projection_store_pre_sync <<
       " ms, projection_store_device: " << stats.t_projection_store_device <<
       " ms, tree_projection_finalize: " << stats.t_tree_projection_finalize <<
       " ms, leaf_predictions: " << stats.t_leaf_predictions <<
@@ -713,7 +738,10 @@ struct SPORFBuilder {
         h_colids[i * dataset.n_sampled_cols + c] = c;
       }
     }
+    stats.t_workload_info_cpu +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
+    auto t_generation_storage_setup = std::chrono::steady_clock::now();
     projection_ws.reset(builder_stream);
     projection_ws.meta.input_n_rows = dataset.M;
     projection_ws.meta.projection.n_rows = dataset.n_sampled_rows;
@@ -745,6 +773,10 @@ struct SPORFBuilder {
                                    static_cast<size_t>(std::max<IdxT>(1, dataset.n_sampled_cols) + 1);
 
     projection_ws.resize_generation_storage(dense_generation_len, generation_indptr_len, builder_stream);
+    stats.t_generation_storage_setup +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_generation_storage_setup)
+        .count();
 
     ASSERT(projection_ws.meta.projection.n_work_items <= projection_ws.meta.projection.cap_work_items,
            "Training projection workspace overflow: work_items");
@@ -752,8 +784,6 @@ struct SPORFBuilder {
            "Training projection workspace overflow: chunks");
     ASSERT(projection_ws.meta.projection.n_block_tasks <= projection_ws.meta.projection.cap_block_tasks,
            "Training projection workspace overflow: block_tasks");
-    stats.t_workload_info_cpu +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
     auto t_kernel = std::chrono::steady_clock::now();
     // start fresh on the number of *new* nodes created in this batch
@@ -800,19 +830,40 @@ struct SPORFBuilder {
     stats.t_h2d +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h2d).count();
 
+    cudaEvent_t ev_kernel_start{}, ev_kernel_stop{};
+    RAFT_CUDA_TRY(cudaEventCreate(&ev_kernel_start));
+    RAFT_CUDA_TRY(cudaEventCreate(&ev_kernel_stop));
+
     t_kernel = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     launch_batched_training_random_matrix_bernoulli_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream));
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
+    {
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
+      stats.t_random_matrix_kernel += static_cast<double>(stage_ms);
+    }
 
     t_kernel = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers, projection_ws.meta, builder_stream);
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream));
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
+    {
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
+      stats.t_training_projection_kernel += static_cast<double>(stage_ms);
+    }
 
-    auto t_quantile_sampling_kernel = std::chrono::steady_clock::now();
+    t_kernel = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers,
       projection_ws.meta,
@@ -820,13 +871,19 @@ struct SPORFBuilder {
       static_cast<IdxT>(params.max_n_bins),
       static_cast<IdxT>(params.min_samples_leaf),
       builder_stream);
-    stats.t_quantile_sampling_kernel +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                t_quantile_sampling_kernel)
-        .count();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream));
+    stats.t_kernels +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
+    {
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
+      stats.t_quantile_sampling_kernel += static_cast<double>(stage_ms);
+    }
 
     dataset_proj.data = d_trans.data();
     t_kernel = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
@@ -835,9 +892,34 @@ struct SPORFBuilder {
     }
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream));
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
+    {
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
+      stats.t_compute_split_kernel += static_cast<double>(stage_ms);
+    }
+
+    RAFT_CUDA_TRY(cudaEventDestroy(ev_kernel_stop));
+    RAFT_CUDA_TRY(cudaEventDestroy(ev_kernel_start));
+
+    auto t_kernels_pre_sync = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+    stats.t_kernels_pre_sync +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_kernels_pre_sync)
+        .count();
+
+    auto t_projection_store_pre_sync = std::chrono::steady_clock::now();
+    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+    stats.t_projection_store_pre_sync +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                t_projection_store_pre_sync)
+        .count();
 
     auto t_projection_store_device = std::chrono::steady_clock::now();
-    persist_winning_tree_projection_vectors<DataT, LabelT, IdxT>(projection_ws, splits, builder_stream);
+    persist_winning_tree_projection_vectors<DataT, LabelT, IdxT>(
+      projection_ws, splits, builder_stream);
     stats.t_projection_store_device +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                 t_projection_store_device)
@@ -855,6 +937,9 @@ struct SPORFBuilder {
 
     t_kernel = std::chrono::steady_clock::now();
     raft::common::nvtx::push_range("nodeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
+    RAFT_CUDA_TRY(cudaEventCreate(&ev_kernel_start));
+    RAFT_CUDA_TRY(cudaEventCreate(&ev_kernel_stop));
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
                                                                      params.min_samples_leaf,
                                                                      params.min_samples_split,
@@ -866,14 +951,25 @@ struct SPORFBuilder {
                                                                      splits,
                                                                      builder_stream);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
+    RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream));
 
     raft::common::nvtx::pop_range();
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
+    RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
+    {
+      float stage_ms = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
+      stats.t_node_split_kernel += static_cast<double>(stage_ms);
+    }
+    RAFT_CUDA_TRY(cudaEventDestroy(ev_kernel_stop));
+    RAFT_CUDA_TRY(cudaEventDestroy(ev_kernel_start));
 
     t_d2h = std::chrono::steady_clock::now();
     raft::update_host(h_splits, splits, work_items.size(), builder_stream);
     handle.sync_stream(builder_stream);
+    stats.t_node_split_d2h_sync +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
     stats.t_d2h +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
 
@@ -985,6 +1081,7 @@ struct SPORFBuilder {
                         batch_size * dataset.num_outputs,
                         builder_stream);
     }
+    handle.sync_stream(builder_stream);
   }
 };  // end Builder
 
