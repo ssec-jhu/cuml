@@ -138,6 +138,13 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                                  int* n_unique_labels,
                                  bool* is_dense_zero_based) except +
 
+    cdef void get_unique_labels(const handle_t& handle,
+                                const int* labels,
+                                int n_rows,
+                                int* unique_labels_out,
+                                int* n_unique_labels,
+                                bool* is_dense_zero_based) except +
+
     cdef void fit(handle_t& handle,
                   SPORFMetaData[float, int]*,
                   float*,
@@ -389,45 +396,39 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                             set_n_features_in=True,
                                             get_output_type=False)
 
-    def _dataset_setup_for_fit_fast(
+    def _dataset_setup_for_fit_experimental(
             self, X, y,
             convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
         t_dataset_setup_start = time.perf_counter()
         self._reset_forest_data()
         t_reset = time.perf_counter()
-        cdef handle_t* handle_ = <handle_t*><uintptr_t>self.handle.getHandle()
-        cdef uintptr_t y_ptr
-        cdef int n_unique_labels = 0
-        cdef bool is_dense_zero_based = False
+        current_stream = cp.cuda.get_current_stream()
 
-        if not isinstance(X, cudf.DataFrame):
+        if not isinstance(X, np.ndarray):
             raise TypeError(
                 "SPORFClassifier._dataset_setup_for_fit_fast expects X to be "
-                "a cudf.DataFrame"
+                "a numpy.ndarray"
             )
-        if isinstance(y, cudf.DataFrame):
-            if y.shape[1] != 1:
-                raise TypeError(
-                    "SPORFClassifier._dataset_setup_for_fit_fast expects y to "
-                    "be a cudf.Series or single-column cudf.DataFrame"
-                )
-        elif not isinstance(y, cudf.Series):
+        if not isinstance(y, np.ndarray):
             raise TypeError(
                 "SPORFClassifier._dataset_setup_for_fit_fast expects y to be "
-                "a cudf.Series or single-column cudf.DataFrame"
+                "a numpy.ndarray"
             )
 
-        X_arr = X.to_cupy(copy=False)
-        if convert_dtype and X_arr.dtype != np.float32:
-            X_arr = X_arr.astype(np.float32)
-        if X_arr.dtype not in (np.float32, np.float64):
-            raise TypeError(
-                "The features `X` need to be of dtype `float32` or `float64`"
-            )
-        X_arr = cp.array(X_arr, order='F', copy=False)
+        if X.ndim != 2:
+            raise ValueError("The features `X` need to be a 2D numpy.ndarray")
+        if convert_dtype:
+            X_arr = cp.asarray(X, dtype=cp.float32, order='F')
+        else:
+            if X.dtype not in (np.float32, np.float64):
+                raise TypeError(
+                    "The features `X` need to be of dtype `float32` or `float64`"
+                )
+            X_arr = cp.asarray(X, order='F')
+        current_stream.synchronize()
         X_m = CumlArray.from_input(X_arr, order='F')
-        self.n_rows = X_arr.shape[0]
-        self.n_cols = X_arr.shape[1]
+        self.n_rows = X.shape[0]
+        self.n_cols = X.shape[1]
         self.dtype = X_arr.dtype
         t_x_input = time.perf_counter()
         if self.n_bins > self.n_rows:
@@ -436,42 +437,44 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                           "Changing `n_bins` to number of training samples.")
             self.n_bins = self.n_rows
 
-        if isinstance(y, cudf.DataFrame):
-            y = y.iloc[:, 0]
-        y_arr = y.to_cupy(copy=False)
-        if y_arr.ndim != 1:
-            y_arr = y_arr.reshape(-1)
-        if convert_dtype and y_arr.dtype != np.int32:
-            y_arr = y_arr.astype(np.int32)
-        y_dtype = y_arr.dtype
-        t_y_input = time.perf_counter()
-        if y_dtype != np.int32:
-            raise TypeError("The labels `y` need to be of dtype"
-                            " `int32`")
-        if y_arr.shape[0] != self.n_rows:
+        if y.ndim > 2:
+            raise ValueError("The labels `y` need to be a 1D numpy.ndarray or column vector")
+        y_host = np.asarray(y).reshape(-1)
+        if convert_dtype and y_host.dtype != np.int32:
+            y_host = y_host.astype(np.int32, copy=False)
+        if y_host.dtype != np.int32:
+            raise TypeError(
+                "The labels `y` need to be of dtype `int32`"
+            )
+        if y_host.shape[0] != self.n_rows:
             raise ValueError(
                 "The labels `y` need to have the same number of rows as `X`"
             )
-        y_m = CumlArray.from_input(y_arr, order='K')
-        y_ptr = y_m.ptr
-        get_label_metadata(handle_[0],
-                           <const int*>y_ptr,
-                           <int>self.n_rows,
-                           &n_unique_labels,
-                           &is_dense_zero_based)
-        self.num_classes = self.n_classes_ = n_unique_labels
+        classes_host = np.unique(y_host)
+        n_unique_labels = classes_host.shape[0]
+        is_dense_zero_based = (
+            n_unique_labels > 0 and classes_host[0] == 0 and classes_host[-1] == (n_unique_labels - 1)
+        )
         t_label_metadata = time.perf_counter()
-        if is_dense_zero_based:
-            self.classes_ = cp.arange(self.num_classes, dtype=np.int32)
-            self.use_monotonic = False
-        else:
-            self.classes_ = cp.unique(y_arr)
-            self.use_monotonic = True
-        t_label_unique_fallback = time.perf_counter()
+
+        self.num_classes = self.n_classes_ = n_unique_labels
+        self.use_monotonic = not is_dense_zero_based
+        t_label_class_meta = time.perf_counter()
         if self.use_monotonic:
-            y_arr, _ = make_monotonic(y_arr, classes=self.classes_)
-            y_m = CumlArray.from_input(y_arr, order='K')
+            y_host = np.searchsorted(classes_host, y_host).astype(np.int32, copy=False)
         t_label_remap = time.perf_counter()
+
+        y_arr = cp.asarray(y_host)
+        current_stream.synchronize()
+        y_m = CumlArray.from_input(y_arr, order='K')
+        t_y_input = time.perf_counter()
+
+        current_stream.synchronize()
+        t_label_classes_start = time.perf_counter()
+        self.classes_ = cp.asarray(classes_host)
+        t_label_classes_materialize = time.perf_counter()
+        current_stream.synchronize()
+        t_label_classes_sync = time.perf_counter()
         t_label_setup = time.perf_counter()
 
         if len(y_m.shape) == 1:
@@ -492,29 +495,53 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
                   f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
                   f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
-                  f"y_input={(t_y_input - t_x_input) * 1000.0:.3f} "
-                  f"label_metadata={(t_label_metadata - t_y_input) * 1000.0:.3f} "
-                  f"label_unique_fallback={(t_label_unique_fallback - t_label_metadata) * 1000.0:.3f} "
-                  f"label_remap={(t_label_remap - t_label_unique_fallback) * 1000.0:.3f} "
-                  f"label_setup={(t_label_setup - t_y_input) * 1000.0:.3f} "
+                  f"label_metadata={(t_label_metadata - t_x_input) * 1000.0:.3f} "
+                  f"class_meta={(t_label_class_meta - t_label_metadata) * 1000.0:.3f} "
+                  f"label_remap={(t_label_remap - t_label_class_meta) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_label_remap) * 1000.0:.3f} "
+                  f"class_materialize={(t_label_classes_materialize - t_label_classes_start) * 1000.0:.3f} "
+                  f"class_sync={(t_label_classes_sync - t_label_classes_materialize) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_x_input) * 1000.0:.3f} "
                   f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
                   f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
         return X_m, y_m, max_feature_val
 
 
-    def _dataset_setup_for_fit(
+    def _dataset_setup_for_fit_fast(
             self, X, y,
             convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
         t_dataset_setup_start = time.perf_counter()
         self._reset_forest_data()
         t_reset = time.perf_counter()
+        current_stream = cp.cuda.get_current_stream()
 
-        X_m, self.n_rows, self.n_cols, self.dtype = \
-            input_to_cuml_array(X,
-                                convert_to_dtype=(np.float32 if convert_dtype
-                                                  else None),
-                                check_dtype=[np.float32, np.float64],
-                                order='F')
+        if not isinstance(X, np.ndarray):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects X to be "
+                "a numpy.ndarray"
+            )
+        if not isinstance(y, np.ndarray):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects y to be "
+                "a numpy.ndarray"
+            )
+
+        if X.ndim != 2:
+            raise ValueError("The features `X` need to be a 2D numpy.ndarray")
+        if convert_dtype and X.dtype != np.float32:
+            X_host = np.asfortranarray(X, dtype=np.float32)
+        else:
+            if X.dtype not in (np.float32, np.float64):
+                raise TypeError(
+                    "The features `X` need to be of dtype `float32` or `float64`"
+                )
+            X_host = np.asfortranarray(X)
+        X_arr = cp.asarray(X_host)
+        current_stream.synchronize()
+        X_m = CumlArray.from_input(X_arr, order='F')
+        self.n_rows = X_host.shape[0]
+        self.n_cols = X_host.shape[1]
+        self.dtype = X_host.dtype
         t_x_input = time.perf_counter()
         if self.n_bins > self.n_rows:
             warnings.warn("The number of bins, `n_bins` is greater than "
@@ -522,25 +549,44 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                           "Changing `n_bins` to number of training samples.")
             self.n_bins = self.n_rows
 
-        y_m, _, _, y_dtype = \
-            input_to_cuml_array(
-                y, check_dtype=np.int32,
-                convert_to_dtype=(np.int32 if convert_dtype
-                                  else None),
-                check_rows=self.n_rows, check_cols=1)
-        t_y_input = time.perf_counter()
-        if y_dtype != np.int32:
-            raise TypeError("The labels `y` need to be of dtype"
-                            " `int32`")
-        self.classes_ = cp.unique(y_m)
-        t_classes_unique = time.perf_counter()
-        self.num_classes = self.n_classes_ = len(self.classes_)
-        self.use_monotonic = not check_labels(
-            y_m, cp.arange(self.num_classes, dtype=np.int32))
-        t_check_labels = time.perf_counter()
+        if y.ndim > 2:
+            raise ValueError("The labels `y` need to be a 1D numpy.ndarray or column vector")
+        y_host = np.asarray(y).reshape(-1)
+        if convert_dtype and y_host.dtype != np.int32:
+            y_host = y_host.astype(np.int32, copy=False)
+        if y_host.dtype != np.int32:
+            raise TypeError(
+                "The labels `y` need to be of dtype `int32`"
+            )
+        if y_host.shape[0] != self.n_rows:
+            raise ValueError(
+                "The labels `y` need to have the same number of rows as `X`"
+            )
+        classes_host = np.unique(y_host)
+        n_unique_labels = classes_host.shape[0]
+        is_dense_zero_based = (
+            n_unique_labels > 0 and classes_host[0] == 0 and classes_host[-1] == (n_unique_labels - 1)
+        )
+        t_label_metadata = time.perf_counter()
+
+        self.num_classes = self.n_classes_ = n_unique_labels
+        self.use_monotonic = not is_dense_zero_based
+        t_label_class_meta = time.perf_counter()
         if self.use_monotonic:
-            y_m, _ = make_monotonic(y_m)
-        t_make_monotonic = time.perf_counter()
+            y_host = np.searchsorted(classes_host, y_host).astype(np.int32, copy=False)
+        t_label_remap = time.perf_counter()
+
+        y_arr = cp.asarray(y_host)
+        current_stream.synchronize()
+        y_m = CumlArray.from_input(y_arr, order='K')
+        t_y_input = time.perf_counter()
+
+        current_stream.synchronize()
+        t_label_classes_start = time.perf_counter()
+        self.classes_ = cp.asarray(classes_host)
+        t_label_classes_materialize = time.perf_counter()
+        current_stream.synchronize()
+        t_label_classes_sync = time.perf_counter()
         t_label_setup = time.perf_counter()
 
         if len(y_m.shape) == 1:
@@ -561,14 +607,17 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
                   f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
                   f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
-                  f"y_input={(t_y_input - t_x_input) * 1000.0:.3f} "
-                  f"classes_unique={(t_classes_unique - t_y_input) * 1000.0:.3f} "
-                  f"check_labels={(t_check_labels - t_classes_unique) * 1000.0:.3f} "
-                  f"make_monotonic={(t_make_monotonic - t_check_labels) * 1000.0:.3f} "
-                  f"label_setup={(t_label_setup - t_y_input) * 1000.0:.3f} "
+                  f"label_metadata={(t_label_metadata - t_x_input) * 1000.0:.3f} "
+                  f"class_meta={(t_label_class_meta - t_label_metadata) * 1000.0:.3f} "
+                  f"label_remap={(t_label_remap - t_label_class_meta) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_label_remap) * 1000.0:.3f} "
+                  f"class_materialize={(t_label_classes_materialize - t_label_classes_start) * 1000.0:.3f} "
+                  f"class_sync={(t_label_classes_sync - t_label_classes_materialize) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_x_input) * 1000.0:.3f} "
                   f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
                   f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
         return X_m, y_m, max_feature_val
+
 
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
@@ -727,8 +776,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         t_fit_wall_start = time.perf_counter()
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit_fast(X, y, convert_dtype)
         t_dataset_setup = time.perf_counter() - t_fit_wall_start
-        # Track the labels to see if update is necessary
-        self.update_labels = not check_labels(y_m, self.classes_)
+        self.update_labels = self.use_monotonic
         cdef uintptr_t X_ptr, y_ptr
 
         X_ptr = X_m.ptr

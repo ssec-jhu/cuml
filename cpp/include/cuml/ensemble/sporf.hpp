@@ -71,6 +71,13 @@ void get_label_metadata(const raft::handle_t& user_handle,
                         int* n_unique_labels,
                         bool* is_dense_zero_based);
 
+void get_unique_labels(const raft::handle_t& user_handle,
+                       const int* labels,
+                       int n_rows,
+                       int* unique_labels_out,
+                       int* n_unique_labels,
+                       bool* is_dense_zero_based);
+
 void fit(const raft::handle_t& user_handle,
          SPORFClassifierF*& forest,
          float* input,

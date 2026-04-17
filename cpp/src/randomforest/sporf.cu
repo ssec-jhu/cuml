@@ -36,11 +36,12 @@ namespace ML {
 using namespace MLCommon;
 using namespace std;
 
-void get_label_metadata(const raft::handle_t& user_handle,
-                        const int* labels,
-                        int n_rows,
-                        int* n_unique_labels,
-                        bool* is_dense_zero_based)
+void get_unique_labels(const raft::handle_t& user_handle,
+                       const int* labels,
+                       int n_rows,
+                       int* unique_labels_out,
+                       int* n_unique_labels,
+                       bool* is_dense_zero_based)
 {
   ASSERT(labels != nullptr, "labels pointer cannot be null");
   ASSERT(n_unique_labels != nullptr, "n_unique_labels output cannot be null");
@@ -78,6 +79,23 @@ void get_label_metadata(const raft::handle_t& user_handle,
 
   *n_unique_labels      = unique_count;
   *is_dense_zero_based = (first_label == 0) && (last_label == (unique_count - 1));
+  if (unique_labels_out != nullptr) {
+    RAFT_CUDA_TRY(cudaMemcpyAsync(unique_labels_out,
+                                  sorted_labels.data(),
+                                  sizeof(int) * unique_count,
+                                  cudaMemcpyDeviceToDevice,
+                                  stream));
+  }
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+}
+
+void get_label_metadata(const raft::handle_t& user_handle,
+                        const int* labels,
+                        int n_rows,
+                        int* n_unique_labels,
+                        bool* is_dense_zero_based)
+{
+  get_unique_labels(user_handle, labels, n_rows, nullptr, n_unique_labels, is_dense_zero_based);
 }
 
 /**
