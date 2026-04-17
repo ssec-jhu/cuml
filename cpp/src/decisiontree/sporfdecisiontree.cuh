@@ -40,6 +40,7 @@
 #include <treelite/tree.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <iomanip>
 #include <locale>
@@ -875,6 +876,7 @@ class SPORFDecisionTree {
     int treeid,
     SPORFTrainingProjectionWorkspace<DataT, LabelT, int>& projection_ws)
   {
+    auto t_tree_fit_wall_start = std::chrono::steady_clock::now();
     if (params.split_criterion ==
         CRITERION::CRITERION_END) {  // Set default to GINI (classification) or MSE (regression)
       CRITERION default_criterion =
@@ -882,67 +884,10 @@ class SPORFDecisionTree {
       params.split_criterion = default_criterion;
     }
     using IdxT = int;
+    std::shared_ptr<TreeMetaDataNode<DataT, LabelT>> tree;
     // Dispatch objective
     if (not std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GINI) {
-      return SPORFBuilder<GiniObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                      s,
-                                                                      treeid,
-                                                                      seed,
-                                                                      params,
-                                                                      data,
-                                                                      labels,
-                                                                      nrows,
-                                                                      ncols,
-                                                                      row_ids,
-                                                                      unique_labels,
-                                                                      projection_ws)
-        .train();
-    } else if (not std::is_same<DataT, LabelT>::value and
-               params.split_criterion == CRITERION::ENTROPY) {
-      return SPORFBuilder<EntropyObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                         s,
-                                                                         treeid,
-                                                                         seed,
-                                                                         params,
-                                                                         data,
-                                                                         labels,
-                                                                         nrows,
-                                                                         ncols,
-                                                                         row_ids,
-                                                                         unique_labels,
-                                                                         projection_ws)
-        .train();
-    } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
-      return SPORFBuilder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                     s,
-                                                                     treeid,
-                                                                     seed,
-                                                                     params,
-                                                                     data,
-                                                                     labels,
-                                                                     nrows,
-                                                                     ncols,
-                                                                     row_ids,
-                                                                     unique_labels,
-                                                                     projection_ws)
-        .train();
-    } else if (std::is_same<DataT, LabelT>::value and
-               params.split_criterion == CRITERION::POISSON) {
-      return SPORFBuilder<PoissonObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                         s,
-                                                                         treeid,
-                                                                         seed,
-                                                                         params,
-                                                                         data,
-                                                                         labels,
-                                                                         nrows,
-                                                                         ncols,
-                                                                         row_ids,
-                                                                         unique_labels,
-                                                                         projection_ws)
-        .train();
-    } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
-      return SPORFBuilder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+      tree = SPORFBuilder<GiniObjectiveFunction<DataT, LabelT, IdxT>>(handle,
                                                                        s,
                                                                        treeid,
                                                                        seed,
@@ -954,25 +899,89 @@ class SPORFDecisionTree {
                                                                        row_ids,
                                                                        unique_labels,
                                                                        projection_ws)
-        .train();
+               .train();
+    } else if (not std::is_same<DataT, LabelT>::value and
+               params.split_criterion == CRITERION::ENTROPY) {
+      tree = SPORFBuilder<EntropyObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                          s,
+                                                                          treeid,
+                                                                          seed,
+                                                                          params,
+                                                                          data,
+                                                                          labels,
+                                                                          nrows,
+                                                                          ncols,
+                                                                          row_ids,
+                                                                          unique_labels,
+                                                                          projection_ws)
+               .train();
+    } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
+      tree = SPORFBuilder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                      s,
+                                                                      treeid,
+                                                                      seed,
+                                                                      params,
+                                                                      data,
+                                                                      labels,
+                                                                      nrows,
+                                                                      ncols,
+                                                                      row_ids,
+                                                                      unique_labels,
+                                                                      projection_ws)
+               .train();
+    } else if (std::is_same<DataT, LabelT>::value and
+               params.split_criterion == CRITERION::POISSON) {
+      tree = SPORFBuilder<PoissonObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                          s,
+                                                                          treeid,
+                                                                          seed,
+                                                                          params,
+                                                                          data,
+                                                                          labels,
+                                                                          nrows,
+                                                                          ncols,
+                                                                          row_ids,
+                                                                          unique_labels,
+                                                                          projection_ws)
+               .train();
+    } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
+      tree = SPORFBuilder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                        s,
+                                                                        treeid,
+                                                                        seed,
+                                                                        params,
+                                                                        data,
+                                                                        labels,
+                                                                        nrows,
+                                                                        ncols,
+                                                                        row_ids,
+                                                                        unique_labels,
+                                                                        projection_ws)
+               .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::INVERSE_GAUSSIAN) {
-      return SPORFBuilder<InverseGaussianObjectiveFunction<DataT, LabelT, IdxT>>(handle,
-                                                                                 s,
-                                                                                 treeid,
-                                                                                 seed,
-                                                                                 params,
-                                                                                 data,
-                                                                                 labels,
-                                                                                 nrows,
-                                                                                 ncols,
-                                                                                 row_ids,
-                                                                                 unique_labels,
-                                                                                 projection_ws)
-        .train();
+      tree = SPORFBuilder<InverseGaussianObjectiveFunction<DataT, LabelT, IdxT>>(handle,
+                                                                                  s,
+                                                                                  treeid,
+                                                                                  seed,
+                                                                                  params,
+                                                                                  data,
+                                                                                  labels,
+                                                                                  nrows,
+                                                                                  ncols,
+                                                                                  row_ids,
+                                                                                  unique_labels,
+                                                                                  projection_ws)
+               .train();
     } else {
       ASSERT(false, "Unknown split criterion.");
     }
+    auto tree_fit_wall_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t_tree_fit_wall_start)
+                              .count();
+    std::cout << "SPORFDecisionTree::fit wall (ms): treeid=" << treeid
+              << " total=" << tree_fit_wall_ms << std::endl;
+    return tree;
   }
 
   inline static size_t calculateAlignedBytes(size_t actual_size) {

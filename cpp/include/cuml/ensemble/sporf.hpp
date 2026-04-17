@@ -65,6 +65,12 @@ struct SPORFMetaData {
 typedef SPORFMetaData<float, int> SPORFClassifierF;
 typedef SPORFMetaData<double, int> SPORFClassifierD;
 
+void get_label_metadata(const raft::handle_t& user_handle,
+                        const int* labels,
+                        int n_rows,
+                        int* n_unique_labels,
+                        bool* is_dense_zero_based);
+
 void fit(const raft::handle_t& user_handle,
          SPORFClassifierF*& forest,
          float* input,

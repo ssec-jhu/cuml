@@ -17,7 +17,13 @@
 #
 # distutils: language = c++
 
+import math
 import numpy as np
+import time
+import typing
+import warnings
+import cupy as cp
+import cudf
 from numpy._core.multiarray import set_typeDict
 from treelite import Model as TreeliteModel
 
@@ -26,13 +32,13 @@ import cuml.internals.nvtx as nvtx
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
-from cuml.ensemble.randomforest_common import BaseRandomForestModel
+from cuml.ensemble.randomforest_common import BaseRandomForestModel, compute_max_features
 from cuml.fil.fil import ForestInference
 from cuml.internals.array import CumlArray
 from cuml.internals.interop import UnsupportedOnGPU, to_cpu, to_gpu
 from cuml.internals.mixins import ClassifierMixin
 from cuml.internals.utils import check_random_seed
-from cuml.prims.label.classlabels import check_labels, invert_labels
+from cuml.prims.label.classlabels import check_labels, invert_labels, make_monotonic
 
 from libc.stdint cimport uint64_t, uintptr_t
 from libcpp cimport bool
@@ -125,6 +131,12 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
 
     ctypedef SPORFMetaData[float, int] SPORFClassifierF
     ctypedef SPORFMetaData[double, int] SPORFClassifierD
+
+    cdef void get_label_metadata(const handle_t& handle,
+                                 const int* labels,
+                                 int n_rows,
+                                 int* n_unique_labels,
+                                 bool* is_dense_zero_based) except +
 
     cdef void fit(handle_t& handle,
                   SPORFMetaData[float, int]*,
@@ -373,6 +385,191 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                 # fallback: store as-is (will likely raise later if invalid)
                 self.histogram_method = histogram_method
 
+    @cuml.internals.api_base_return_generic(set_output_type=True,
+                                            set_n_features_in=True,
+                                            get_output_type=False)
+
+    def _dataset_setup_for_fit_fast(
+            self, X, y,
+            convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
+        t_dataset_setup_start = time.perf_counter()
+        self._reset_forest_data()
+        t_reset = time.perf_counter()
+        cdef handle_t* handle_ = <handle_t*><uintptr_t>self.handle.getHandle()
+        cdef uintptr_t y_ptr
+        cdef int n_unique_labels = 0
+        cdef bool is_dense_zero_based = False
+
+        if not isinstance(X, cudf.DataFrame):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects X to be "
+                "a cudf.DataFrame"
+            )
+        if isinstance(y, cudf.DataFrame):
+            if y.shape[1] != 1:
+                raise TypeError(
+                    "SPORFClassifier._dataset_setup_for_fit_fast expects y to "
+                    "be a cudf.Series or single-column cudf.DataFrame"
+                )
+        elif not isinstance(y, cudf.Series):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects y to be "
+                "a cudf.Series or single-column cudf.DataFrame"
+            )
+
+        X_arr = X.to_cupy(copy=False)
+        if convert_dtype and X_arr.dtype != np.float32:
+            X_arr = X_arr.astype(np.float32)
+        if X_arr.dtype not in (np.float32, np.float64):
+            raise TypeError(
+                "The features `X` need to be of dtype `float32` or `float64`"
+            )
+        X_arr = cp.array(X_arr, order='F', copy=False)
+        X_m = CumlArray.from_input(X_arr, order='F')
+        self.n_rows = X_arr.shape[0]
+        self.n_cols = X_arr.shape[1]
+        self.dtype = X_arr.dtype
+        t_x_input = time.perf_counter()
+        if self.n_bins > self.n_rows:
+            warnings.warn("The number of bins, `n_bins` is greater than "
+                          "the number of samples used for training. "
+                          "Changing `n_bins` to number of training samples.")
+            self.n_bins = self.n_rows
+
+        if isinstance(y, cudf.DataFrame):
+            y = y.iloc[:, 0]
+        y_arr = y.to_cupy(copy=False)
+        if y_arr.ndim != 1:
+            y_arr = y_arr.reshape(-1)
+        if convert_dtype and y_arr.dtype != np.int32:
+            y_arr = y_arr.astype(np.int32)
+        y_dtype = y_arr.dtype
+        t_y_input = time.perf_counter()
+        if y_dtype != np.int32:
+            raise TypeError("The labels `y` need to be of dtype"
+                            " `int32`")
+        if y_arr.shape[0] != self.n_rows:
+            raise ValueError(
+                "The labels `y` need to have the same number of rows as `X`"
+            )
+        y_m = CumlArray.from_input(y_arr, order='K')
+        y_ptr = y_m.ptr
+        get_label_metadata(handle_[0],
+                           <const int*>y_ptr,
+                           <int>self.n_rows,
+                           &n_unique_labels,
+                           &is_dense_zero_based)
+        self.num_classes = self.n_classes_ = n_unique_labels
+        t_label_metadata = time.perf_counter()
+        if is_dense_zero_based:
+            self.classes_ = cp.arange(self.num_classes, dtype=np.int32)
+            self.use_monotonic = False
+        else:
+            self.classes_ = cp.unique(y_arr)
+            self.use_monotonic = True
+        t_label_unique_fallback = time.perf_counter()
+        if self.use_monotonic:
+            y_arr, _ = make_monotonic(y_arr, classes=self.classes_)
+            y_m = CumlArray.from_input(y_arr, order='K')
+        t_label_remap = time.perf_counter()
+        t_label_setup = time.perf_counter()
+
+        if len(y_m.shape) == 1:
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y_m.shape[1]
+        self.n_features_in_ = X_m.shape[1]
+
+        max_feature_val = compute_max_features(self.max_features, self.n_cols)
+        if isinstance(self.min_samples_leaf, float):
+            self.min_samples_leaf = \
+                math.ceil(self.min_samples_leaf * self.n_rows)
+        if isinstance(self.min_samples_split, float):
+            self.min_samples_split = \
+                max(2, math.ceil(self.min_samples_split * self.n_rows))
+        t_scalar_setup = time.perf_counter()
+        if self.verbose:
+            print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
+                  f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
+                  f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_x_input) * 1000.0:.3f} "
+                  f"label_metadata={(t_label_metadata - t_y_input) * 1000.0:.3f} "
+                  f"label_unique_fallback={(t_label_unique_fallback - t_label_metadata) * 1000.0:.3f} "
+                  f"label_remap={(t_label_remap - t_label_unique_fallback) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_y_input) * 1000.0:.3f} "
+                  f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
+                  f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
+        return X_m, y_m, max_feature_val
+
+
+    def _dataset_setup_for_fit(
+            self, X, y,
+            convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
+        t_dataset_setup_start = time.perf_counter()
+        self._reset_forest_data()
+        t_reset = time.perf_counter()
+
+        X_m, self.n_rows, self.n_cols, self.dtype = \
+            input_to_cuml_array(X,
+                                convert_to_dtype=(np.float32 if convert_dtype
+                                                  else None),
+                                check_dtype=[np.float32, np.float64],
+                                order='F')
+        t_x_input = time.perf_counter()
+        if self.n_bins > self.n_rows:
+            warnings.warn("The number of bins, `n_bins` is greater than "
+                          "the number of samples used for training. "
+                          "Changing `n_bins` to number of training samples.")
+            self.n_bins = self.n_rows
+
+        y_m, _, _, y_dtype = \
+            input_to_cuml_array(
+                y, check_dtype=np.int32,
+                convert_to_dtype=(np.int32 if convert_dtype
+                                  else None),
+                check_rows=self.n_rows, check_cols=1)
+        t_y_input = time.perf_counter()
+        if y_dtype != np.int32:
+            raise TypeError("The labels `y` need to be of dtype"
+                            " `int32`")
+        self.classes_ = cp.unique(y_m)
+        t_classes_unique = time.perf_counter()
+        self.num_classes = self.n_classes_ = len(self.classes_)
+        self.use_monotonic = not check_labels(
+            y_m, cp.arange(self.num_classes, dtype=np.int32))
+        t_check_labels = time.perf_counter()
+        if self.use_monotonic:
+            y_m, _ = make_monotonic(y_m)
+        t_make_monotonic = time.perf_counter()
+        t_label_setup = time.perf_counter()
+
+        if len(y_m.shape) == 1:
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y_m.shape[1]
+        self.n_features_in_ = X_m.shape[1]
+
+        max_feature_val = compute_max_features(self.max_features, self.n_cols)
+        if isinstance(self.min_samples_leaf, float):
+            self.min_samples_leaf = \
+                math.ceil(self.min_samples_leaf * self.n_rows)
+        if isinstance(self.min_samples_split, float):
+            self.min_samples_split = \
+                max(2, math.ceil(self.min_samples_split * self.n_rows))
+        t_scalar_setup = time.perf_counter()
+        if self.verbose:
+            print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
+                  f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
+                  f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_x_input) * 1000.0:.3f} "
+                  f"classes_unique={(t_classes_unique - t_y_input) * 1000.0:.3f} "
+                  f"check_labels={(t_check_labels - t_classes_unique) * 1000.0:.3f} "
+                  f"make_monotonic={(t_make_monotonic - t_check_labels) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_y_input) * 1000.0:.3f} "
+                  f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
+                  f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
+        return X_m, y_m, max_feature_val
+
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
     # Link to the above issue on github:
@@ -527,7 +724,9 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             y to be of dtype int32. This will increase memory used for
             the method.
         """
-        X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
+        t_fit_wall_start = time.perf_counter()
+        X_m, y_m, max_feature_val = self._dataset_setup_for_fit_fast(X, y, convert_dtype)
+        t_dataset_setup = time.perf_counter() - t_fit_wall_start
         # Track the labels to see if update is necessary
         self.update_labels = not check_labels(y_m, self.classes_)
         cdef uintptr_t X_ptr, y_ptr
@@ -564,6 +763,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                      <float> self.density,
                                      <HISTOGRAM_METHOD> self.histogram_method)
 
+        t_native_fit_start = time.perf_counter()
         if self.dtype == np.float32:
             fit(handle_[0],
                 rf_forest,
@@ -591,11 +791,24 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             raise TypeError("supports only np.float32 and np.float64 input,"
                             " but input of type '%s' passed."
                             % (str(self.dtype)))
+        t_native_fit = time.perf_counter() - t_native_fit_start
         # make sure that the `fit` is complete before the following delete
         # call happens
+        t_sync_start = time.perf_counter()
         self.handle.sync()
+        t_sync = time.perf_counter() - t_sync_start
+        t_teardown_start = time.perf_counter()
         del X_m
         del y_m
+        t_teardown = time.perf_counter() - t_teardown_start
+        t_fit_wall = time.perf_counter() - t_fit_wall_start
+        if self.verbose:
+            print("SPORFClassifier.fit timings (ms): "
+                  f"dataset_setup={t_dataset_setup * 1000.0:.3f} "
+                  f"native_fit={t_native_fit * 1000.0:.3f} "
+                  f"sync={t_sync * 1000.0:.3f} "
+                  f"teardown={t_teardown * 1000.0:.3f} "
+                  f"wall_total={t_fit_wall * 1000.0:.3f}")
         return self
 
     @cuml.internals.api_base_return_array(get_output_dtype=True)

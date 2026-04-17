@@ -586,6 +586,8 @@ struct SPORFBuilder {
   {
     raft::common::nvtx::range fun_scope("SPORFBuilder::train @sporfbuilder.cuh [batched-levelalgo]");
     MLCommon::TimerCPU timer;
+    auto t_train_wall_start = std::chrono::steady_clock::now();
+    double t_doSplit_wall = 0.0;
     SPORFNodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs, dataset.N);
     while (queue.HasWork()) {
@@ -598,6 +600,7 @@ struct SPORFBuilder {
       auto& projection_block_tasks         = std::get<2>(popped_batch);
       auto& projection_matrix_chunks       = std::get<3>(popped_batch);
       auto& projection_matrix_block_tasks  = std::get<4>(popped_batch);
+      auto t_doSplit_start = std::chrono::steady_clock::now();
       auto [splits_host_ptr, splits_count] =
         doSplit(work_items,
                 projection_chunks,
@@ -605,6 +608,10 @@ struct SPORFBuilder {
                 projection_matrix_chunks,
                 projection_matrix_block_tasks,
                 projection_ws);
+      t_doSplit_wall +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  t_doSplit_start)
+          .count();
       auto t_push = std::chrono::steady_clock::now();
       queue.Push(work_items, splits_host_ptr);
       stats.t_push +=
@@ -675,7 +682,9 @@ struct SPORFBuilder {
                                                 t_leaf_predictions)
         .count();
     tree->train_time = timer.getElapsedMilliseconds();
-
+    auto train_wall_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_train_wall_start)
+                           .count();
     std::cout << "SPORFBuilder::train: pop: " << stats.t_pop <<
       " ms, push: " << stats.t_push <<
       " ms, h2d: " << stats.t_h2d <<
@@ -695,6 +704,8 @@ struct SPORFBuilder {
       " ms, projection_store_device: " << stats.t_projection_store_device <<
       " ms, tree_projection_finalize: " << stats.t_tree_projection_finalize <<
       " ms, leaf_predictions: " << stats.t_leaf_predictions <<
+      " ms, wall_total: " << train_wall_ms <<
+      " ms, wall_doSplit: " << t_doSplit_wall <<
       " ms" << std::endl;
 
 

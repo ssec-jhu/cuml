@@ -36,6 +36,50 @@ namespace ML {
 using namespace MLCommon;
 using namespace std;
 
+void get_label_metadata(const raft::handle_t& user_handle,
+                        const int* labels,
+                        int n_rows,
+                        int* n_unique_labels,
+                        bool* is_dense_zero_based)
+{
+  ASSERT(labels != nullptr, "labels pointer cannot be null");
+  ASSERT(n_unique_labels != nullptr, "n_unique_labels output cannot be null");
+  ASSERT(is_dense_zero_based != nullptr, "is_dense_zero_based output cannot be null");
+  ASSERT(n_rows >= 0, "n_rows must be non-negative");
+
+  auto stream = user_handle.get_stream();
+  if (n_rows == 0) {
+    *n_unique_labels      = 0;
+    *is_dense_zero_based = false;
+    return;
+  }
+
+  rmm::device_uvector<int> sorted_labels(n_rows, stream);
+  RAFT_CUDA_TRY(cudaMemcpyAsync(
+    sorted_labels.data(), labels, sizeof(int) * n_rows, cudaMemcpyDeviceToDevice, stream));
+
+  thrust::sort(thrust::cuda::par.on(stream), sorted_labels.begin(), sorted_labels.end());
+  auto new_end       = thrust::unique(thrust::cuda::par.on(stream), sorted_labels.begin(), sorted_labels.end());
+  auto unique_count  = static_cast<int>(thrust::distance(sorted_labels.begin(), new_end));
+
+  int first_label = 0;
+  int last_label  = 0;
+  RAFT_CUDA_TRY(cudaMemcpyAsync(&first_label,
+                                sorted_labels.data(),
+                                sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                stream));
+  RAFT_CUDA_TRY(cudaMemcpyAsync(&last_label,
+                                sorted_labels.data() + (unique_count - 1),
+                                sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                stream));
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+  *n_unique_labels      = unique_count;
+  *is_dense_zero_based = (first_label == 0) && (last_label == (unique_count - 1));
+}
+
 /**
  * @brief Check validity of all random forest hyper-parameters.
  * @param[in] rf_params: random forest hyper-parameters

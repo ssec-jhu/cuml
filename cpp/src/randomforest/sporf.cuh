@@ -35,6 +35,8 @@
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
 #include <decisiontree/decisiontree.cuh>
 #include <decisiontree/sporfdecisiontree.cuh>
@@ -181,6 +183,7 @@ class SPORF {
     auto to_ms = [](clock_t::duration d) {
       return std::chrono::duration<double, std::milli>(d).count();
     };
+    auto t_fit_wall_start = clock_t::now();
     this->error_checking(input, labels, n_rows, n_cols, false);
     const raft::handle_t& handle = user_handle;
     double t_workspace_setup = 0.0;
@@ -277,11 +280,13 @@ class SPORF {
     handle.sync_stream_pool();
     handle.sync_stream();
     t_final_sync += to_ms(clock_t::now() - t_final_sync_start);
+    auto fit_wall_ms = to_ms(clock_t::now() - t_fit_wall_start);
 
     std::cout << "SPORF::fit timings (ms): workspace_setup=" << t_workspace_setup
               << " row_sampling=" << t_row_sampling
-              << " tree_fit_envelope=" << t_tree_fit_envelope
+              << " tree_fit_envelope_accum=" << t_tree_fit_envelope
               << " final_sync=" << t_final_sync
+              << " wall_total=" << fit_wall_ms
               << " (n_trees=" << this->rf_params.n_trees
               << " n_streams=" << n_streams
               << ")" << std::endl;
