@@ -38,7 +38,10 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <algorithm>
+#include <array>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -95,18 +98,48 @@ class SPORFNodeQueue {
   using TreeMetaDataNodeT = DT::ObliqueTreeMetaDataNode<DataT, LabelT>;
   const SPORFDecisionTreeParams params;
   const IdxT n_features;
+  const std::size_t min_rows_per_batch_;
   std::shared_ptr<TreeMetaDataNodeT> tree;
   std::vector<SPORFDT::InstanceRange> node_instances_;
   std::deque<SPORFDT::NodeWorkItem> work_items_;
-  const size_t MIN_ROWS_PER_BATCH = 65536;  // heuristic to ensure enough parallelism for GPU kernels
 
  public:
+  struct PopBatch {
+    std::vector<SPORFDT::NodeWorkItem> popped;
+    std::vector<DT::BlockTask<IdxT>> projection_block_tasks;
+    std::vector<DT::NodeWorkItemChunk<IdxT>> projection_chunks;
+    std::vector<DT::BlockTask<IdxT>> projection_matrix_block_tasks;
+    std::vector<DT::NodeWorkItemChunk<IdxT>> projection_matrix_chunks;
+
+    void clear()
+    {
+      popped.clear();
+      projection_block_tasks.clear();
+      projection_chunks.clear();
+      projection_matrix_block_tasks.clear();
+      projection_matrix_chunks.clear();
+    }
+
+    void reserve(std::size_t batch_cap)
+    {
+      popped.reserve(batch_cap);
+      projection_block_tasks.reserve(batch_cap);
+      projection_chunks.reserve(batch_cap);
+      projection_matrix_block_tasks.reserve(batch_cap);
+      projection_matrix_chunks.reserve(batch_cap);
+    }
+  };
+
   SPORFNodeQueue(SPORFDecisionTreeParams params,
                  size_t max_nodes,
                  size_t sampled_rows,
                  int num_outputs,
-                 IdxT n_features_)
-    : params(params), n_features(n_features_), tree(std::make_shared<TreeMetaDataNodeT>())
+                 IdxT n_features_,
+                 std::size_t min_rows_per_batch)
+    : params(params),
+      n_features(n_features_),
+      min_rows_per_batch_(std::max<std::size_t>(1, min_rows_per_batch)),
+      tree(std::make_shared<TreeMetaDataNodeT>())
   {
     tree->num_outputs = num_outputs;
     tree->sparsetree.reserve(max_nodes);
@@ -127,29 +160,37 @@ class SPORFNodeQueue {
 
   bool HasWork() { return work_items_.size() > 0; }
 
-  auto Pop()
+  std::size_t Pop(PopBatch& batch,
+                  double* queue_extract_ms = nullptr,
+                  double* projection_build_ms = nullptr)
   {
     size_t total_rows = 0;
-    std::vector<SPORFDT::NodeWorkItem> popped;
-    std::vector<DT::BlockTask<IdxT>> projection_block_tasks;
-    std::vector<DT::NodeWorkItemChunk<IdxT>> projection_chunks;
-    std::vector<DT::BlockTask<IdxT>> projection_matrix_block_tasks;
-    std::vector<DT::NodeWorkItemChunk<IdxT>> projection_matrix_chunks;
-    popped.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    projection_block_tasks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    projection_chunks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    projection_matrix_block_tasks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    projection_matrix_chunks.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
+    auto batch_cap = std::min(size_t(params.max_batch_size), work_items_.size());
+    batch.clear();
+    batch.reserve(batch_cap);
+    auto& popped = batch.popped;
+    auto& projection_block_tasks = batch.projection_block_tasks;
+    auto& projection_chunks = batch.projection_chunks;
+    auto& projection_matrix_block_tasks = batch.projection_matrix_block_tasks;
+    auto& projection_matrix_chunks = batch.projection_matrix_chunks;
 
-    while (work_items_.size() > 0 && popped.size() < std::size_t(params.max_batch_size)) {
+    while (work_items_.size() > 0 && popped.size() < std::size_t(params.max_batch_size) &&
+           (popped.empty() || total_rows < min_rows_per_batch_)) {
+      auto t_queue_extract = std::chrono::steady_clock::now();
       popped.emplace_back(work_items_.front());
       work_items_.pop_front();
       total_rows += popped.back().instances.count;
+      if (queue_extract_ms != nullptr) {
+        *queue_extract_ms += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t_queue_extract)
+                               .count();
+      }
 
       auto* work_item = &popped.back();
       auto count = static_cast<IdxT>(work_item->instances.count);
       if (count < static_cast<IdxT>(params.min_samples_split)) { continue; }
 
+      auto t_projection_build = std::chrono::steady_clock::now();
       for (IdxT threads_left = count,
                 instances_begin = static_cast<IdxT>(work_item->instances.begin);
            threads_left > 0;) {
@@ -224,12 +265,13 @@ class SPORFNodeQueue {
         feature_begin += thread_count;
         threads_left -= thread_count;
       }
+      if (projection_build_ms != nullptr) {
+        *projection_build_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_projection_build)
+                                  .count();
+      }
     }
-    return std::make_tuple(std::move(popped),
-                           std::move(projection_chunks),
-                           std::move(projection_block_tasks),
-                           std::move(projection_matrix_chunks),
-                           std::move(projection_matrix_block_tasks));
+    return total_rows;
   }
 
   // This node is allowed to be expanded further (if its split gain is high enough)
@@ -356,9 +398,13 @@ struct SPORFBuilder {
   ML::pinned_host_vector<char> h_buff;
   rmm::device_uvector<IdxT> d_quantile_indices;
   rmm::device_uvector<DataT> d_trans;
+  rmm::device_uvector<unsigned long long> d_compute_split_debug;
+  DT::SPORFDeviceBatchingPolicy device_batching_policy;
 
   struct Stats {
     double t_pop;
+    double t_pop_queue_extract;
+    double t_pop_projection_build;
     double t_push;
     double t_h2d;
     double t_d2h;
@@ -377,9 +423,14 @@ struct SPORFBuilder {
     double t_projection_store_device;
     double t_tree_projection_finalize;
     double t_leaf_predictions;
+    std::size_t pop_batches;
+    std::size_t pop_total_rows;
+    std::size_t pop_max_rows;
 
     Stats()
       : t_pop(0),
+        t_pop_queue_extract(0),
+        t_pop_projection_build(0),
         t_push(0),
         t_h2d(0),
         t_d2h(0),
@@ -397,7 +448,10 @@ struct SPORFBuilder {
         t_projection_store_pre_sync(0),
         t_projection_store_device(0),
         t_tree_projection_finalize(0),
-        t_leaf_predictions(0)
+        t_leaf_predictions(0),
+        pop_batches(0),
+        pop_total_rows(0),
+        pop_max_rows(0)
     {
     }
   } stats;
@@ -413,7 +467,8 @@ struct SPORFBuilder {
           IdxT n_cols,
           rmm::device_uvector<IdxT>* row_ids,
           IdxT n_classes,
-          SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws_)
+          SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws_,
+          const DT::SPORFDeviceBatchingPolicy& device_batching_policy_)
     : handle(handle),
       builder_stream(s),
       treeid(treeid),
@@ -432,6 +487,8 @@ struct SPORFBuilder {
       d_quantile_indices(0, builder_stream),
       d_buff(0, builder_stream),
       d_trans(0, builder_stream),
+      d_compute_split_debug(16, builder_stream),
+      device_batching_policy(device_batching_policy_),
       dataset_proj{
         0,
         labels,
@@ -451,18 +508,40 @@ struct SPORFBuilder {
     size_t req_bytes     = size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * params.max_n_bins * sizeof(IdxT);
     size_t aligned_bytes = calculateAlignedBytes(req_bytes);
     size_t aligned_elems = aligned_bytes / sizeof(IdxT);
+    std::cout << "SPORF alloc request: name=builder_quantile_indices"
+              << " bytes=" << aligned_bytes
+              << " elems=" << aligned_elems
+              << " max_batch_size=" << params.max_batch_size
+              << " n_sampled_cols=" << dataset.n_sampled_cols
+              << " max_n_bins=" << params.max_n_bins
+              << std::endl;
     d_quantile_indices.resize(aligned_elems, builder_stream);
 
     req_bytes     = size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols) * sizeof(DataT);
     aligned_bytes = calculateAlignedBytes(req_bytes);
     aligned_elems = aligned_bytes / sizeof(DataT);
+    std::cout << "SPORF alloc request: name=builder_transpose_buffer"
+              << " bytes=" << aligned_bytes
+              << " elems=" << aligned_elems
+              << " n_sampled_rows=" << dataset.n_sampled_rows
+              << " n_sampled_cols=" << dataset.n_sampled_cols
+              << std::endl;
     d_trans.resize(aligned_elems, builder_stream);
 
     projection_ws.ensure_tree_projection_vector_capacity(this->maxNodes(), builder_stream);
     projection_ws.clear_tree_projection_state(builder_stream);
 
     auto [device_workspace_size, host_workspace_size] = workspaceSize();
+    std::cout << "SPORF alloc request: name=builder_device_workspace"
+              << " bytes=" << device_workspace_size
+              << " max_batch_size=" << params.max_batch_size
+              << " max_blocks_dimx=" << max_blocks_dimx
+              << " n_sampled_cols=" << dataset.n_sampled_cols
+              << std::endl;
     d_buff.resize(device_workspace_size, builder_stream);
+    std::cout << "SPORF alloc request: name=builder_host_workspace"
+              << " bytes=" << host_workspace_size
+              << std::endl;
     h_buff.resize(host_workspace_size);
     assignWorkspace(d_buff.data(), h_buff.data());
   }
@@ -484,13 +563,9 @@ struct SPORFBuilder {
    */
   size_t maxNodes() const
   {
-    if (params.max_depth < 13) {
-      // Start with allocation for a dense tree for depth < 13
-      return pow(2, (params.max_depth + 1)) - 1;
-    } else {
-      // Start with fixed size allocation for depth >= 13
-      return 8191;
-    }
+    auto levels = static_cast<unsigned int>(params.max_depth + 1);
+    if (levels >= sizeof(size_t) * 8) { return std::numeric_limits<size_t>::max(); }
+    return (size_t{1} << levels) - 1;
   }
 
   /**
@@ -589,17 +664,39 @@ struct SPORFBuilder {
     auto t_train_wall_start = std::chrono::steady_clock::now();
     double t_doSplit_wall = 0.0;
     SPORFNodeQueue<DataT, LabelT> queue(
-      params, this->maxNodes(), dataset.n_sampled_rows, dataset.num_outputs, dataset.N);
+      params,
+      this->maxNodes(),
+      dataset.n_sampled_rows,
+      dataset.num_outputs,
+      dataset.N,
+      device_batching_policy.target_rows_per_batch);
+    typename SPORFNodeQueue<DataT, LabelT>::PopBatch popped_batch;
     while (queue.HasWork()) {
       auto t_pop = std::chrono::steady_clock::now();
-      auto popped_batch                    = queue.Pop();
+      double t_pop_queue_extract = 0.0;
+      double t_pop_projection_build = 0.0;
+      auto pop_total_rows = queue.Pop(popped_batch, &t_pop_queue_extract, &t_pop_projection_build);
       stats.t_pop +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pop).count();
-      auto& work_items                     = std::get<0>(popped_batch);
-      auto& projection_chunks              = std::get<1>(popped_batch);
-      auto& projection_block_tasks         = std::get<2>(popped_batch);
-      auto& projection_matrix_chunks       = std::get<3>(popped_batch);
-      auto& projection_matrix_block_tasks  = std::get<4>(popped_batch);
+      stats.t_pop_queue_extract += t_pop_queue_extract;
+      stats.t_pop_projection_build += t_pop_projection_build;
+      stats.pop_batches += 1;
+      stats.pop_total_rows += pop_total_rows;
+      stats.pop_max_rows = std::max(stats.pop_max_rows, pop_total_rows);
+      auto& work_items                    = popped_batch.popped;
+      auto& projection_chunks             = popped_batch.projection_chunks;
+      auto& projection_block_tasks        = popped_batch.projection_block_tasks;
+      auto& projection_matrix_chunks      = popped_batch.projection_matrix_chunks;
+      auto& projection_matrix_block_tasks = popped_batch.projection_matrix_block_tasks;
+      std::cout << "SPORFBuilder::pop batch: treeid=" << treeid
+                << " batch=" << (stats.pop_batches - 1)
+                << " rows=" << pop_total_rows
+                << " items=" << work_items.size()
+                << " projection_chunks=" << projection_chunks.size()
+                << " projection_block_tasks=" << projection_block_tasks.size()
+                << " projection_matrix_chunks=" << projection_matrix_chunks.size()
+                << " projection_matrix_block_tasks=" << projection_matrix_block_tasks.size()
+                << std::endl;
       auto t_doSplit_start = std::chrono::steady_clock::now();
       auto [splits_host_ptr, splits_count] =
         doSplit(work_items,
@@ -686,6 +783,15 @@ struct SPORFBuilder {
                            std::chrono::steady_clock::now() - t_train_wall_start)
                            .count();
     std::cout << "SPORFBuilder::train: pop: " << stats.t_pop <<
+      " ms, pop_queue_extract: " << stats.t_pop_queue_extract <<
+      " ms, pop_projection_build: " << stats.t_pop_projection_build <<
+      " ms, pop_batches: " << stats.pop_batches <<
+      ", pop_total_rows: " << stats.pop_total_rows <<
+      ", pop_avg_rows: " << (stats.pop_batches > 0
+                              ? static_cast<double>(stats.pop_total_rows) /
+                                  static_cast<double>(stats.pop_batches)
+                              : 0.0) <<
+      ", pop_max_rows: " << stats.pop_max_rows <<
       " ms, push: " << stats.t_push <<
       " ms, h2d: " << stats.t_h2d <<
       " ms, d2h: " << stats.t_d2h <<
@@ -726,6 +832,15 @@ struct SPORFBuilder {
       if (n_blocks_per_node > 1) ++n_large_nodes;
 
       for (int b = 0; b < n_blocks_per_node; b++) {
+        ASSERT(n_blocks_dimx + b < max_blocks_dimx,
+               "SPORF workload_info overflow: n_blocks_dimx=%d block=%d max_blocks_dimx=%d "
+               "work_items=%zu item=%zu item_rows=%zu",
+               n_blocks_dimx,
+               b,
+               max_blocks_dimx,
+               work_items.size(),
+               i,
+               item.instances.count);
         h_workload_info[n_blocks_dimx + b] = {int(i), n_large_nodes - 1, b, n_blocks_per_node};
       }
       n_blocks_dimx += n_blocks_per_node;
@@ -760,6 +875,12 @@ struct SPORFBuilder {
     projection_ws.meta.projection.n_work_items = static_cast<IdxT>(work_items.size());
     projection_ws.meta.projection.n_chunks = static_cast<IdxT>(projection_chunks.size());
     projection_ws.meta.projection.n_block_tasks = static_cast<IdxT>(projection_block_tasks.size());
+    projection_ws.peak_projection_work_items =
+      std::max(projection_ws.peak_projection_work_items, work_items.size());
+    projection_ws.peak_projection_chunks =
+      std::max(projection_ws.peak_projection_chunks, projection_chunks.size());
+    projection_ws.peak_projection_block_tasks =
+      std::max(projection_ws.peak_projection_block_tasks, projection_block_tasks.size());
     // In the SPORF builder, `n_sampled_cols` is reused as the random-projection
     // output dimensionality, i.e. the number of projection components per node.
     projection_ws.meta.projection.n_proj_components = dataset.n_sampled_cols;
@@ -799,6 +920,9 @@ struct SPORFBuilder {
     auto t_kernel = std::chrono::steady_clock::now();
     // start fresh on the number of *new* nodes created in this batch
     RAFT_CUDA_TRY(cudaMemsetAsync(n_nodes, 0, sizeof(IdxT), builder_stream));
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      done_count, 0, sizeof(int) * params.max_batch_size * n_blks_for_cols, builder_stream));
+    RAFT_CUDA_TRY(cudaMemsetAsync(mutex, 0, sizeof(int) * params.max_batch_size, builder_stream));
     initSplit<DataT, IdxT, TPB_DEFAULT>(splits, work_items.size(), builder_stream);
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
@@ -898,7 +1022,7 @@ struct SPORFBuilder {
     // iterate through a batch of columns (to reduce the memory pressure) and
     // compute the best split at the end
     for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
-      computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes);
+      computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes, work_items.size());
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
     stats.t_kernels +=
@@ -1008,7 +1132,11 @@ struct SPORFBuilder {
     return smem_size;
   }
 
-  void computeSplit(IdxT col, DatasetT& dataset, size_t n_blocks_dimx, size_t n_large_nodes)
+  void computeSplit(IdxT col,
+                    DatasetT& dataset,
+                    size_t n_blocks_dimx,
+                    size_t n_large_nodes,
+                    size_t n_work_items)
   {
     // if no instances to split, return
     if (n_blocks_dimx == 0) return;
@@ -1023,7 +1151,93 @@ struct SPORFBuilder {
     // required total length (in bins) of the global segmented histograms over all
     // classes, features and (large)nodes.
     int len_histograms = n_bins * n_classes * n_blocks_dimy * n_large_nodes;
+    auto max_len_histograms =
+      params.max_batch_size * params.max_n_bins * n_blks_for_cols * dataset.num_outputs;
+    ASSERT(n_blocks_dimx <= static_cast<size_t>(max_blocks_dimx),
+           "SPORF computeSplit workload_info overflow: n_blocks_dimx=%zu max_blocks_dimx=%d "
+           "n_large_nodes=%zu",
+           n_blocks_dimx,
+           max_blocks_dimx,
+           n_large_nodes);
+    ASSERT(n_large_nodes <= static_cast<size_t>(params.max_batch_size),
+           "SPORF computeSplit histogram overflow: n_large_nodes=%zu max_batch_size=%d",
+           n_large_nodes,
+           params.max_batch_size);
+    ASSERT(static_cast<size_t>(len_histograms) <= static_cast<size_t>(max_len_histograms),
+           "SPORF computeSplit histogram overflow: len_histograms=%d max_len_histograms=%zu "
+           "n_bins=%d n_classes=%d n_blocks_dimy=%d n_large_nodes=%zu",
+           len_histograms,
+           static_cast<size_t>(max_len_histograms),
+           n_bins,
+           n_classes,
+           n_blocks_dimy,
+           n_large_nodes);
+    std::cout << "SPORFBuilder::computeSplit launch:"
+              << " treeid=" << treeid
+              << " col=" << col
+              << " grid_x=" << n_blocks_dimx
+              << " grid_y=" << n_blocks_dimy
+              << " n_large_nodes=" << n_large_nodes
+              << " len_histograms=" << len_histograms
+              << " max_len_histograms=" << max_len_histograms
+              << " smem_size=" << smem_size
+              << std::endl;
     RAFT_CUDA_TRY(cudaMemsetAsync(histograms, 0, sizeof(BinT) * len_histograms, builder_stream));
+    RAFT_CUDA_TRY(cudaMemsetAsync(d_compute_split_debug.data(),
+                                  0,
+                                  sizeof(unsigned long long) * d_compute_split_debug.size(),
+                                  builder_stream));
+    std::cout << "here" << std::endl;
+    SPORFDT::launchValidateComputeSplitInputsKernel<DataT, LabelT, IdxT>(
+      dataset,
+      d_quantile_indices.data(),
+      d_work_items,
+      static_cast<IdxT>(n_work_items),
+      col,
+      d_colids,
+      workload_info,
+      static_cast<IdxT>(n_blocks_dimx),
+      static_cast<IdxT>(n_blocks_dimy),
+      static_cast<IdxT>(n_large_nodes),
+      static_cast<IdxT>(params.max_n_bins),
+      static_cast<IdxT>(params.min_samples_split),
+      static_cast<IdxT>(params.min_samples_leaf),
+      d_compute_split_debug.data(),
+      builder_stream);
+      std::cout << "here 2" << std::endl;
+
+    std::vector<unsigned long long> h_compute_split_debug(d_compute_split_debug.size());
+    raft::update_host(h_compute_split_debug.data(),
+                      d_compute_split_debug.data(),
+                      d_compute_split_debug.size(),
+                      builder_stream);
+                            std::cout << "here 3" << std::endl;
+
+    RAFT_CUDA_TRY(cudaStreamSynchronize(builder_stream));
+
+          std::cout << "here 4" << std::endl;
+
+
+    ASSERT(h_compute_split_debug[0] == 0,
+           "SPORF computeSplit input validation failed: code=%llu block_x=%llu block_y=%llu "
+           "nid=%llu large_nid=%llu range_start=%llu range_len=%llu value0=%llu value1=%llu "
+           "treeid=%d col=%d grid_x=%zu grid_y=%d n_work_items=%zu sampled_rows=%d input_rows=%d",
+           h_compute_split_debug[0],
+           h_compute_split_debug[1],
+           h_compute_split_debug[2],
+           h_compute_split_debug[3],
+           h_compute_split_debug[4],
+           h_compute_split_debug[5],
+           h_compute_split_debug[6],
+           h_compute_split_debug[7],
+           h_compute_split_debug[8],
+           treeid,
+           col,
+           n_blocks_dimx,
+           n_blocks_dimy,
+           n_work_items,
+           dataset.n_sampled_rows,
+           dataset.M);
     // create the objective function object
     ObjectiveT objective(dataset.num_outputs, params.min_samples_leaf);
     // call the computeSplitKernel
@@ -1047,6 +1261,7 @@ struct SPORFBuilder {
                                                                     treeid,
                                                                     workload_info,
                                                                     seed,
+                                                                    d_compute_split_debug.data(),
                                                                     grid,
                                                                     smem_size,
                                                                     builder_stream);

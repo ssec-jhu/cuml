@@ -211,6 +211,27 @@ class SPORF {
     // n_streams should not be less than n_trees
     if (this->rf_params.n_trees < n_streams) n_streams = this->rf_params.n_trees;
 
+    DT::SPORFDeviceBatchingPolicy device_batching_policy;
+    {
+      cudaDeviceProp prop;
+      RAFT_CUDA_TRY(cudaGetDeviceProperties(&prop, handle.get_device()));
+      device_batching_policy.num_sms            = prop.multiProcessorCount;
+      device_batching_policy.max_threads_per_sm = prop.maxThreadsPerMultiProcessor;
+      device_batching_policy.max_resident_threads =
+        static_cast<std::size_t>(device_batching_policy.num_sms) *
+        static_cast<std::size_t>(device_batching_policy.max_threads_per_sm);
+      device_batching_policy.target_rows_per_batch =
+        std::max<std::size_t>(1, device_batching_policy.max_resident_threads);
+      device_batching_policy.target_blocks_per_batch =
+        static_cast<std::size_t>(device_batching_policy.num_sms) * 4;
+    }
+
+    std::cout << "SPORF::fit device batching policy: num_sms=" << device_batching_policy.num_sms
+              << " max_threads_per_sm=" << device_batching_policy.max_threads_per_sm
+              << " max_resident_threads=" << device_batching_policy.max_resident_threads
+              << " target_rows_per_batch=" << device_batching_policy.target_rows_per_batch
+              << " target_blocks_per_batch=" << device_batching_policy.target_blocks_per_batch
+              << std::endl;
     // Select n_sampled_rows (with replacement) numbers from [0, n_rows) per tree.
     // selected_rows: randomly generated IDs for bootstrapped samples (w/ replacement); a device
     // ptr.
@@ -219,12 +240,20 @@ class SPORF {
     auto t_workspace_setup_start = clock_t::now();
     std::deque<rmm::device_uvector<int>> selected_rows;
     for (int i = 0; i < n_streams; i++) {
+      std::cout << "SPORF alloc request: name=selected_rows stream=" << i
+                << " elems=" << n_sampled_rows
+                << " bytes=" << (static_cast<std::size_t>(n_sampled_rows) * sizeof(int))
+                << std::endl;
       selected_rows.emplace_back(n_sampled_rows, handle.get_stream_from_stream_pool(i));
     }
 
     using TrainingWs = DT::SPORFTrainingProjectionWorkspace<T, L, int>;
     std::deque<TrainingWs> training_workspaces;
     for (int i = 0; i < n_streams; i++) {
+      std::cout << "SPORF alloc request: name=training_workspace stream=" << i
+                << " n_rows=" << n_rows
+                << " max_batch_size=" << this->rf_params.tree_params.max_batch_size
+                << std::endl;
       training_workspaces.emplace_back(
         static_cast<size_t>(n_rows),
         static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
@@ -268,7 +297,8 @@ class SPORF {
                                                     this->rf_params.tree_params,
                                                     this->rf_params.seed,
                                                     i,
-                                                    training_workspaces[stream_id]);
+                                                    training_workspaces[stream_id],
+                                                    device_batching_policy);
       auto tree_fit_ms = to_ms(clock_t::now() - t_tree_fit_start);
 #ifdef _OPENMP
 #pragma omp atomic
@@ -281,6 +311,157 @@ class SPORF {
     handle.sync_stream();
     t_final_sync += to_ms(clock_t::now() - t_final_sync_start);
     auto fit_wall_ms = to_ms(clock_t::now() - t_fit_wall_start);
+
+    std::size_t workspace_device_bytes_total = 0;
+    std::size_t selected_rows_device_bytes_total = 0;
+    for (int i = 0; i < n_streams; ++i) {
+      auto& ws = training_workspaces[i];
+      std::size_t workspace_device_bytes = 0;
+      workspace_device_bytes += ws.d_workspace.size() * sizeof(char);
+      workspace_device_bytes += ws.d_projection_matrices_storage.size() *
+                                sizeof(DT::ProjectionMatrix<T, int>);
+      workspace_device_bytes += ws.d_tree_projection_vectors_storage.size() *
+                                sizeof(DT::OffsetProjectionMatrix<int>);
+      workspace_device_bytes += ws.d_tree_projection_max_node_idx_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_tree_projection_indptr_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_tree_projection_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_tree_projection_coeffs_storage.size() * sizeof(T);
+      workspace_device_bytes += ws.d_tree_projection_winning_nnz_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_tree_projection_winning_offsets_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_generation_keep_mask_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_generation_dense_values_storage.size() * sizeof(T);
+      workspace_device_bytes += ws.d_generation_indptr_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_generation_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_generation_sparse_data_storage.size() * sizeof(T);
+      workspace_device_bytes += ws.d_generation_nnz_counter_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_sparse_sampling_component_counts_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_sparse_sampling_component_offsets_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_sparse_sampling_candidate_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_sparse_sampling_unique_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_sparse_sampling_unique_counts_storage.size() * sizeof(int);
+      workspace_device_bytes_total += workspace_device_bytes;
+      auto selected_rows_device_bytes = selected_rows[i].size() * sizeof(int);
+      selected_rows_device_bytes_total += selected_rows_device_bytes;
+      auto pct = [](std::size_t used, std::size_t cap) {
+        return cap > 0 ? (100.0 * static_cast<double>(used) / static_cast<double>(cap)) : 0.0;
+      };
+
+      std::cout << "SPORF::fit workspace capacity: stream=" << i
+                << " device_bytes=" << workspace_device_bytes
+                << " selected_rows_bytes=" << selected_rows_device_bytes
+                << " d_workspace_bytes=" << ws.d_workspace.size()
+                << " cap_work_items=" << ws.meta.projection.cap_work_items
+                << " peak_work_items=" << ws.peak_projection_work_items
+                << " slack_work_items="
+                << (static_cast<std::size_t>(ws.meta.projection.cap_work_items) >
+                        ws.peak_projection_work_items
+                      ? static_cast<std::size_t>(ws.meta.projection.cap_work_items) -
+                          ws.peak_projection_work_items
+                      : std::size_t{0})
+                << " util_work_items_pct="
+                << pct(ws.peak_projection_work_items,
+                       static_cast<std::size_t>(ws.meta.projection.cap_work_items))
+                << " cap_chunks=" << ws.meta.projection.cap_chunks
+                << " peak_projection_chunks=" << ws.peak_projection_chunks
+                << " peak_generation_chunks=" << ws.peak_generation_chunks
+                << " slack_chunks="
+                << (static_cast<std::size_t>(ws.meta.projection.cap_chunks) >
+                        std::max(ws.peak_projection_chunks, ws.peak_generation_chunks)
+                      ? static_cast<std::size_t>(ws.meta.projection.cap_chunks) -
+                          std::max(ws.peak_projection_chunks, ws.peak_generation_chunks)
+                      : std::size_t{0})
+                << " util_chunks_pct="
+                << pct(std::max(ws.peak_projection_chunks, ws.peak_generation_chunks),
+                       static_cast<std::size_t>(ws.meta.projection.cap_chunks))
+                << " cap_block_tasks=" << ws.meta.projection.cap_block_tasks
+                << " peak_projection_block_tasks=" << ws.peak_projection_block_tasks
+                << " peak_generation_block_tasks=" << ws.peak_generation_block_tasks
+                << " slack_block_tasks="
+                << (static_cast<std::size_t>(ws.meta.projection.cap_block_tasks) >
+                        std::max(ws.peak_projection_block_tasks, ws.peak_generation_block_tasks)
+                      ? static_cast<std::size_t>(ws.meta.projection.cap_block_tasks) -
+                          std::max(ws.peak_projection_block_tasks, ws.peak_generation_block_tasks)
+                      : std::size_t{0})
+                << " util_block_tasks_pct="
+                << pct(std::max(ws.peak_projection_block_tasks, ws.peak_generation_block_tasks),
+                       static_cast<std::size_t>(ws.meta.projection.cap_block_tasks))
+                << " cap_tree_projection_vectors=" << ws.meta.cap_tree_projection_vectors
+                << " peak_tree_projection_vectors=" << ws.peak_tree_projection_vectors
+                << " slack_tree_projection_vectors="
+                << (static_cast<std::size_t>(ws.meta.cap_tree_projection_vectors) >
+                        ws.peak_tree_projection_vectors
+                      ? static_cast<std::size_t>(ws.meta.cap_tree_projection_vectors) -
+                          ws.peak_tree_projection_vectors
+                      : std::size_t{0})
+                << " util_tree_projection_vectors_pct="
+                << pct(ws.peak_tree_projection_vectors,
+                       static_cast<std::size_t>(ws.meta.cap_tree_projection_vectors))
+                << " tree_projection_indptr=" << ws.d_tree_projection_indptr_storage.size()
+                << " tree_projection_indices=" << ws.d_tree_projection_indices_storage.size()
+                << " peak_tree_projection_payload_nnz="
+                << ws.peak_tree_projection_payload_nnz
+                << " slack_tree_projection_payload_nnz="
+                << (ws.d_tree_projection_indices_storage.size() >
+                        ws.peak_tree_projection_payload_nnz
+                      ? ws.d_tree_projection_indices_storage.size() -
+                          ws.peak_tree_projection_payload_nnz
+                      : std::size_t{0})
+                << " util_tree_projection_payload_pct="
+                << pct(ws.peak_tree_projection_payload_nnz,
+                       ws.d_tree_projection_indices_storage.size())
+                << " tree_projection_coeffs=" << ws.d_tree_projection_coeffs_storage.size()
+                << " tree_projection_winning_nnz="
+                << ws.d_tree_projection_winning_nnz_storage.size()
+                << " peak_tree_projection_batch_work_items="
+                << ws.peak_tree_projection_batch_work_items
+                << " slack_tree_projection_winning_nnz="
+                << (ws.d_tree_projection_winning_nnz_storage.size() >
+                        ws.peak_tree_projection_batch_work_items
+                      ? ws.d_tree_projection_winning_nnz_storage.size() -
+                          ws.peak_tree_projection_batch_work_items
+                      : std::size_t{0})
+                << " tree_projection_winning_offsets="
+                << ws.d_tree_projection_winning_offsets_storage.size()
+                << " generation_keep_mask=" << ws.d_generation_keep_mask_storage.size()
+                << " generation_dense_values=" << ws.d_generation_dense_values_storage.size()
+                << " peak_generation_dense_len=" << ws.peak_generation_dense_len
+                << " slack_generation_dense_len="
+                << (ws.d_generation_dense_values_storage.size() > ws.peak_generation_dense_len
+                      ? ws.d_generation_dense_values_storage.size() - ws.peak_generation_dense_len
+                      : std::size_t{0})
+                << " util_generation_dense_pct="
+                << pct(ws.peak_generation_dense_len, ws.d_generation_dense_values_storage.size())
+                << " generation_indptr=" << ws.d_generation_indptr_storage.size()
+                << " peak_generation_indptr_len=" << ws.peak_generation_indptr_len
+                << " slack_generation_indptr_len="
+                << (ws.d_generation_indptr_storage.size() > ws.peak_generation_indptr_len
+                      ? ws.d_generation_indptr_storage.size() - ws.peak_generation_indptr_len
+                      : std::size_t{0})
+                << " util_generation_indptr_pct="
+                << pct(ws.peak_generation_indptr_len, ws.d_generation_indptr_storage.size())
+                << " generation_indices=" << ws.d_generation_indices_storage.size()
+                << " generation_sparse_data=" << ws.d_generation_sparse_data_storage.size()
+                << " sparse_component_counts="
+                << ws.d_sparse_sampling_component_counts_storage.size()
+                << " peak_sparse_component_count="
+                << ws.peak_sparse_sampling_component_count
+                << " sparse_component_offsets="
+                << ws.d_sparse_sampling_component_offsets_storage.size()
+                << " sparse_candidate_indices="
+                << ws.d_sparse_sampling_candidate_indices_storage.size()
+                << " peak_sparse_candidate_count="
+                << ws.peak_sparse_sampling_candidate_count
+                << " sparse_unique_indices=" << ws.d_sparse_sampling_unique_indices_storage.size()
+                << " peak_sparse_unique_count=" << ws.peak_sparse_sampling_unique_count
+                << " sparse_unique_counts=" << ws.d_sparse_sampling_unique_counts_storage.size()
+                << std::endl;
+    }
+    std::cout << "SPORF::fit workspace capacity total: streams=" << n_streams
+              << " workspace_device_bytes=" << workspace_device_bytes_total
+              << " selected_rows_device_bytes=" << selected_rows_device_bytes_total
+              << " retained_device_bytes="
+              << (workspace_device_bytes_total + selected_rows_device_bytes_total)
+              << std::endl;
 
     std::cout << "SPORF::fit timings (ms): workspace_setup=" << t_workspace_setup
               << " row_sampling=" << t_row_sampling

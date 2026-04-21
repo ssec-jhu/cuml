@@ -79,6 +79,14 @@ struct OwnedProjectionMatrix {
 
 static constexpr int BLOCK_TASK_SIZE = 128; // heuristic for number of threads per block for GPU kernels
 
+struct SPORFDeviceBatchingPolicy {
+  int num_sms = 0;
+  int max_threads_per_sm = 0;
+  std::size_t max_resident_threads = 0;
+  std::size_t target_rows_per_batch = 65536;
+  std::size_t target_blocks_per_batch = 0;
+};
+
 template <typename IdxT = int>
 struct NodeWorkItemChunk {
   IdxT work_item_idx;      // index into the batch of work items for this level of the tree

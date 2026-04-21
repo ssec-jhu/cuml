@@ -348,6 +348,19 @@ struct SPORFTrainingProjectionWorkspace {
   TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers{};
   TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta{};
   SparseSamplingGenerationMeta<DataT, LabelT, IdxT> sparse_sampling_meta{};
+  std::size_t peak_projection_work_items = 0;
+  std::size_t peak_projection_chunks = 0;
+  std::size_t peak_projection_block_tasks = 0;
+  std::size_t peak_generation_chunks = 0;
+  std::size_t peak_generation_block_tasks = 0;
+  std::size_t peak_generation_dense_len = 0;
+  std::size_t peak_generation_indptr_len = 0;
+  std::size_t peak_tree_projection_vectors = 0;
+  std::size_t peak_tree_projection_payload_nnz = 0;
+  std::size_t peak_tree_projection_batch_work_items = 0;
+  std::size_t peak_sparse_sampling_component_count = 0;
+  std::size_t peak_sparse_sampling_candidate_count = 0;
+  std::size_t peak_sparse_sampling_unique_count = 0;
 
   SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
     : d_workspace(0, stream),
@@ -381,7 +394,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.projection.n_cols = 0;
     meta.projection.max_batch_size = static_cast<IdxT>(max_batch_size_);
     meta.projection.cap_work_items = static_cast<IdxT>(max_batch_size_);
-    meta.projection.cap_chunks = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
+    meta.projection.cap_chunks =
+      static_cast<IdxT>(std::max<size_t>(
+        1,
+        ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE)) + max_batch_size_));
     meta.projection.cap_block_tasks =
       static_cast<IdxT>(std::max<size_t>(1, ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE))));
     meta.projection.n_proj_components = 0;
@@ -416,10 +432,32 @@ struct SPORFTrainingProjectionWorkspace {
     workspace_bytes +=
       align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
 
+    std::cout << "SPORF alloc request: name=training_projection_d_workspace"
+              << " bytes=" << workspace_bytes
+              << " n_rows=" << n_rows_
+              << " cap_work_items=" << meta.projection.cap_work_items
+              << " cap_chunks=" << meta.projection.cap_chunks
+              << " cap_block_tasks=" << meta.projection.cap_block_tasks
+              << std::endl;
     d_workspace.resize(workspace_bytes, stream);
+    std::cout << "SPORF alloc request: name=projection_matrices_storage"
+              << " elems=" << meta.projection.cap_work_items
+              << " bytes=" << (static_cast<std::size_t>(meta.projection.cap_work_items) *
+                                sizeof(ProjectionMatrix<DataT, IdxT>))
+              << std::endl;
     d_projection_matrices_storage.resize(static_cast<size_t>(meta.projection.cap_work_items), stream);
+    std::cout << "SPORF alloc request: name=tree_projection_winning_nnz"
+              << " elems=" << meta.projection.cap_work_items
+              << " bytes=" << (static_cast<std::size_t>(meta.projection.cap_work_items) *
+                                sizeof(IdxT))
+              << std::endl;
     d_tree_projection_winning_nnz_storage.resize(static_cast<size_t>(meta.projection.cap_work_items),
                                                  stream);
+    std::cout << "SPORF alloc request: name=tree_projection_winning_offsets"
+              << " elems=" << (static_cast<std::size_t>(meta.projection.cap_work_items) + 1)
+              << " bytes=" << ((static_cast<std::size_t>(meta.projection.cap_work_items) + 1) *
+                                sizeof(IdxT))
+              << std::endl;
     d_tree_projection_winning_offsets_storage.resize(
       static_cast<size_t>(meta.projection.cap_work_items) + 1, stream);
 
@@ -452,6 +490,8 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_tree_projection_coeffs_storage = nullptr;
     pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
     pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
+    std::cout << "SPORF alloc request: name=generation_nnz_counter elems=1 bytes="
+              << sizeof(int) << std::endl;
     d_generation_nnz_counter_storage.resize(1, stream);
     pointers.d_generation_keep_mask = nullptr;
     pointers.d_generation_dense_values = nullptr;
@@ -506,6 +546,11 @@ struct SPORFTrainingProjectionWorkspace {
   void ensure_tree_projection_vector_capacity(size_t n_tree_projection_vectors, cudaStream_t stream)
   {
     if (d_tree_projection_vectors_storage.size() < n_tree_projection_vectors) {
+      std::cout << "SPORF alloc request: name=tree_projection_vectors"
+                << " elems=" << n_tree_projection_vectors
+                << " bytes=" << (n_tree_projection_vectors *
+                                  sizeof(OffsetProjectionMatrix<IdxT>))
+                << std::endl;
       d_tree_projection_vectors_storage.resize(n_tree_projection_vectors, stream);
       RAFT_CUDA_TRY(cudaMemsetAsync(
         d_tree_projection_vectors_storage.data(),
@@ -523,6 +568,8 @@ struct SPORFTrainingProjectionWorkspace {
     meta.tree_projection_max_node_idx = IdxT{-1};
     meta.tree_projection_payload_nnz = 0;
     if (d_tree_projection_max_node_idx_storage.size() < 1) {
+      std::cout << "SPORF alloc request: name=tree_projection_max_node_idx elems=1 bytes="
+                << sizeof(IdxT) << std::endl;
       d_tree_projection_max_node_idx_storage.resize(1, stream);
     }
     pointers.d_tree_projection_vectors = d_tree_projection_vectors_storage.data();
@@ -551,6 +598,16 @@ struct SPORFTrainingProjectionWorkspace {
                                               size_t payload_nnz,
                                               cudaStream_t stream)
   {
+    peak_tree_projection_vectors = std::max(peak_tree_projection_vectors, tree_projection_vectors);
+    peak_tree_projection_payload_nnz =
+      std::max(peak_tree_projection_payload_nnz, payload_nnz);
+    std::cout << "SPORF alloc request: name=tree_projection_payload"
+              << " vectors=" << tree_projection_vectors
+              << " payload_nnz=" << payload_nnz
+              << " indptr_bytes=" << (tree_projection_vectors * 2 * sizeof(IdxT))
+              << " indices_bytes=" << (payload_nnz * sizeof(IdxT))
+              << " coeffs_bytes=" << (payload_nnz * sizeof(DataT))
+              << std::endl;
     d_tree_projection_indptr_storage.resize(tree_projection_vectors * 2, stream);
     d_tree_projection_indices_storage.resize(payload_nnz, stream);
     d_tree_projection_coeffs_storage.resize(payload_nnz, stream);
@@ -563,10 +620,20 @@ struct SPORFTrainingProjectionWorkspace {
 
   void resize_tree_projection_batch_scratch(size_t n_work_items, cudaStream_t stream)
   {
+    peak_tree_projection_batch_work_items =
+      std::max(peak_tree_projection_batch_work_items, n_work_items);
     if (d_tree_projection_winning_nnz_storage.size() < n_work_items) {
+      std::cout << "SPORF alloc request: name=tree_projection_winning_nnz_resize"
+                << " elems=" << n_work_items
+                << " bytes=" << (n_work_items * sizeof(IdxT))
+                << std::endl;
       d_tree_projection_winning_nnz_storage.resize(n_work_items, stream);
     }
     if (d_tree_projection_winning_offsets_storage.size() < n_work_items + 1) {
+      std::cout << "SPORF alloc request: name=tree_projection_winning_offsets_resize"
+                << " elems=" << (n_work_items + 1)
+                << " bytes=" << ((n_work_items + 1) * sizeof(IdxT))
+                << std::endl;
       d_tree_projection_winning_offsets_storage.resize(n_work_items + 1, stream);
     }
 
@@ -578,6 +645,13 @@ struct SPORFTrainingProjectionWorkspace {
                                            IdxT n_generation_block_tasks_req,
                                            cudaStream_t stream)
   {
+    peak_generation_chunks =
+      std::max<std::size_t>(peak_generation_chunks,
+                            static_cast<std::size_t>(std::max<IdxT>(n_generation_chunks_req, 0)));
+    peak_generation_block_tasks =
+      std::max<std::size_t>(peak_generation_block_tasks,
+                            static_cast<std::size_t>(
+                              std::max<IdxT>(n_generation_block_tasks_req, 0)));
     if (n_generation_chunks_req <= meta.projection.cap_chunks &&
         n_generation_block_tasks_req <= meta.projection.cap_block_tasks) {
       return;
@@ -606,6 +680,12 @@ struct SPORFTrainingProjectionWorkspace {
     workspace_bytes +=
       align_bytes(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>));
 
+    std::cout << "SPORF alloc request: name=training_projection_d_workspace_resize"
+              << " bytes=" << workspace_bytes
+              << " cap_work_items=" << meta.projection.cap_work_items
+              << " cap_chunks=" << meta.projection.cap_chunks
+              << " cap_block_tasks=" << meta.projection.cap_block_tasks
+              << std::endl;
     d_workspace.resize(workspace_bytes, stream);
 
     auto* base = d_workspace.data();
@@ -632,6 +712,17 @@ struct SPORFTrainingProjectionWorkspace {
 
   void resize_generation_storage(size_t dense_len, size_t indptr_len, cudaStream_t stream)
   {
+    peak_generation_dense_len = std::max(peak_generation_dense_len, dense_len);
+    peak_generation_indptr_len = std::max(peak_generation_indptr_len, indptr_len);
+    std::cout << "SPORF alloc request: name=generation_storage"
+              << " dense_len=" << dense_len
+              << " indptr_len=" << indptr_len
+              << " keep_mask_bytes=" << (dense_len * sizeof(int))
+              << " dense_values_bytes=" << (dense_len * sizeof(DataT))
+              << " indptr_bytes=" << (indptr_len * sizeof(int))
+              << " indices_bytes=" << (dense_len * sizeof(int))
+              << " sparse_data_bytes=" << (dense_len * sizeof(DataT))
+              << std::endl;
     d_generation_keep_mask_storage.resize(dense_len, stream);
     d_generation_dense_values_storage.resize(dense_len, stream);
     d_generation_indptr_storage.resize(indptr_len, stream);
@@ -652,6 +743,21 @@ struct SPORFTrainingProjectionWorkspace {
                                       size_t unique_count,
                                       cudaStream_t stream)
   {
+    peak_sparse_sampling_component_count =
+      std::max(peak_sparse_sampling_component_count, component_count);
+    peak_sparse_sampling_candidate_count =
+      std::max(peak_sparse_sampling_candidate_count, candidate_count);
+    peak_sparse_sampling_unique_count = std::max(peak_sparse_sampling_unique_count, unique_count);
+    std::cout << "SPORF alloc request: name=sparse_sampling_storage"
+              << " component_count=" << component_count
+              << " candidate_count=" << candidate_count
+              << " unique_count=" << unique_count
+              << " component_counts_bytes=" << (component_count * sizeof(IdxT))
+              << " component_offsets_bytes=" << ((component_count + 1) * sizeof(IdxT))
+              << " candidate_indices_bytes=" << (candidate_count * sizeof(IdxT))
+              << " unique_indices_bytes=" << (unique_count * sizeof(IdxT))
+              << " unique_counts_bytes=" << (component_count * sizeof(IdxT))
+              << std::endl;
     d_sparse_sampling_component_counts_storage.resize(component_count, stream);
     d_sparse_sampling_component_offsets_storage.resize(component_count + 1, stream);
     d_sparse_sampling_candidate_indices_storage.resize(candidate_count, stream);
@@ -701,7 +807,10 @@ struct SPORFDecisionTreeWorkspace {
     meta.projection.n_cols = 0;
     meta.projection.max_batch_size = static_cast<IdxT>(max_batch_size_);
     meta.projection.cap_work_items = static_cast<IdxT>(max_batch_size_);
-    meta.projection.cap_chunks = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
+    meta.projection.cap_chunks =
+      static_cast<IdxT>(std::max<size_t>(
+        1,
+        ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE)) + max_batch_size_));
     meta.projection.cap_block_tasks =
       static_cast<IdxT>(std::max<size_t>(1, ceil_div(n_rows_, static_cast<size_t>(BLOCK_TASK_SIZE))));
     meta.cap_prediction_leaves = static_cast<IdxT>(std::max<size_t>(1, n_rows_));
@@ -842,7 +951,8 @@ class SPORFDecisionTree {
     int unique_labels,
     SPORFDecisionTreeParams params,
     uint64_t seed,
-    int treeid)
+    int treeid,
+    SPORFDeviceBatchingPolicy device_batching_policy = {})
   {
     using IdxT = int;
     SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT> projection_ws(
@@ -858,7 +968,8 @@ class SPORFDecisionTree {
                params,
                seed,
                treeid,
-               projection_ws);
+               projection_ws,
+               device_batching_policy);
   }
 
   template <class DataT, class LabelT>
@@ -874,7 +985,8 @@ class SPORFDecisionTree {
     SPORFDecisionTreeParams params,
     uint64_t seed,
     int treeid,
-    SPORFTrainingProjectionWorkspace<DataT, LabelT, int>& projection_ws)
+    SPORFTrainingProjectionWorkspace<DataT, LabelT, int>& projection_ws,
+    SPORFDeviceBatchingPolicy device_batching_policy = {})
   {
     auto t_tree_fit_wall_start = std::chrono::steady_clock::now();
     if (params.split_criterion ==
@@ -898,7 +1010,8 @@ class SPORFDecisionTree {
                                                                        ncols,
                                                                        row_ids,
                                                                        unique_labels,
-                                                                       projection_ws)
+                                                                       projection_ws,
+                                                                       device_batching_policy)
                .train();
     } else if (not std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::ENTROPY) {
@@ -913,7 +1026,8 @@ class SPORFDecisionTree {
                                                                           ncols,
                                                                           row_ids,
                                                                           unique_labels,
-                                                                          projection_ws)
+                                                                          projection_ws,
+                                                                          device_batching_policy)
                .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::MSE) {
       tree = SPORFBuilder<MSEObjectiveFunction<DataT, LabelT, IdxT>>(handle,
@@ -927,7 +1041,8 @@ class SPORFDecisionTree {
                                                                       ncols,
                                                                       row_ids,
                                                                       unique_labels,
-                                                                      projection_ws)
+                                                                      projection_ws,
+                                                                      device_batching_policy)
                .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::POISSON) {
@@ -942,7 +1057,8 @@ class SPORFDecisionTree {
                                                                           ncols,
                                                                           row_ids,
                                                                           unique_labels,
-                                                                          projection_ws)
+                                                                          projection_ws,
+                                                                          device_batching_policy)
                .train();
     } else if (std::is_same<DataT, LabelT>::value and params.split_criterion == CRITERION::GAMMA) {
       tree = SPORFBuilder<GammaObjectiveFunction<DataT, LabelT, IdxT>>(handle,
@@ -956,7 +1072,8 @@ class SPORFDecisionTree {
                                                                         ncols,
                                                                         row_ids,
                                                                         unique_labels,
-                                                                        projection_ws)
+                                                                        projection_ws,
+                                                                        device_batching_policy)
                .train();
     } else if (std::is_same<DataT, LabelT>::value and
                params.split_criterion == CRITERION::INVERSE_GAUSSIAN) {
@@ -971,7 +1088,8 @@ class SPORFDecisionTree {
                                                                                   ncols,
                                                                                   row_ids,
                                                                                   unique_labels,
-                                                                                  projection_ws)
+                                                                                  projection_ws,
+                                                                                  device_batching_policy)
                .train();
     } else {
       ASSERT(false, "Unknown split criterion.");

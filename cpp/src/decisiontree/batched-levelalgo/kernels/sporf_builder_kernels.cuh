@@ -394,9 +394,27 @@ void launchComputeSplitKernel(BinT* histograms,
                               IdxT treeid,
                               const WorkloadInfo<IdxT>* workload_info,
                               uint64_t seed,
+                              unsigned long long* debug,
                               dim3 grid,
                               size_t smem_size,
                               cudaStream_t builder_stream);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launchValidateComputeSplitInputsKernel(const DT::Dataset<DataT, LabelT, IdxT>& dataset,
+                                            const IdxT* quantile_indices,
+                                            const NodeWorkItem* work_items,
+                                            IdxT n_work_items,
+                                            IdxT colStart,
+                                            const IdxT* colids,
+                                            const WorkloadInfo<IdxT>* workload_info,
+                                            IdxT n_blocks_dimx,
+                                            IdxT n_blocks_dimy,
+                                            IdxT n_large_nodes,
+                                            IdxT max_n_bins,
+                                            IdxT min_samples_split,
+                                            IdxT min_samples_leaf,
+                                            unsigned long long* debug,
+                                            cudaStream_t builder_stream);
 
 }  // namespace SPORFDT
 }  // namespace ML

@@ -378,6 +378,33 @@ void SPORFDecisionTree::predict(const raft::handle_t& handle,
       });
 
       if (!block_tasks.empty()) {
+        if (ws.meta.projection.n_proj_components <= 0) {
+          std::cout << "SPORFDecisionTree::predict invalid projection batch:"
+                    << " batch=" << n_batches
+                    << " work_items=" << ws.meta.projection.n_work_items
+                    << " chunks=" << ws.meta.projection.n_chunks
+                    << " block_tasks=" << ws.meta.projection.n_block_tasks
+                    << " n_proj_components=" << ws.meta.projection.n_proj_components
+                    << " tree_nodes=" << tree.sparsetree.size()
+                    << " projection_vectors=" << tree.projection_vectors.size()
+                    << std::endl;
+          for (std::size_t i = 0; i < work_items.size() && i < 16; ++i) {
+            auto node_id = work_items[i].idx;
+            auto has_node = node_id < tree.sparsetree.size();
+            auto has_projection = node_id < tree.projection_vectors.size();
+            std::cout << "  predict_work_item:"
+                      << " item=" << i
+                      << " node=" << node_id
+                      << " depth=" << work_items[i].depth
+                      << " rows=" << work_items[i].instances.count
+                      << " is_leaf=" << (has_node ? tree.sparsetree[node_id].IsLeaf() : false)
+                      << " has_projection=" << has_projection
+                      << " node_proj_components="
+                      << (has_projection ? tree.projection_vectors[node_id].n_proj_components : -1)
+                      << std::endl;
+          }
+          ASSERT(false, "Predict batch has split work but no projection components");
+        }
         measure_gpu(ms_projection, [&]() {
           launch_batched_projection_kernel<DataT, LabelT, IdxT>(ws.pointers, ws.meta, stream);
         });
@@ -586,6 +613,18 @@ void launch_batched_projection_kernel(
   constexpr int TPB = BLOCK_TASK_SIZE;  // or 128
   dim3 block(TPB);
   dim3 grid(meta.projection.n_block_tasks, meta.projection.n_proj_components);
+  if (meta.projection.n_block_tasks <= 0 || meta.projection.n_proj_components <= 0) {
+    std::cout << "SPORF predict projection launch invalid:"
+              << " grid_x=" << meta.projection.n_block_tasks
+              << " grid_y=" << meta.projection.n_proj_components
+              << " block_x=" << TPB
+              << " work_items=" << meta.projection.n_work_items
+              << " chunks=" << meta.projection.n_chunks
+              << " n_rows=" << meta.projection.n_rows
+              << " n_cols=" << meta.projection.n_cols
+              << std::endl;
+    ASSERT(false, "Invalid SPORF predict projection launch dimensions");
+  }
   batched_projection_kernel<DataT, LabelT, IdxT><<<grid, block, 0, stream>>>(pointers, meta);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }

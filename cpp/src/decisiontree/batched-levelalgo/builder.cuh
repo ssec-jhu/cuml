@@ -31,6 +31,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <deque>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -255,13 +256,9 @@ struct Builder {
    */
   size_t maxNodes() const
   {
-    if (params.max_depth < 13) {
-      // Start with allocation for a dense tree for depth < 13
-      return pow(2, (params.max_depth + 1)) - 1;
-    } else {
-      // Start with fixed size allocation for depth >= 13
-      return 8191;
-    }
+    auto levels = static_cast<unsigned int>(params.max_depth + 1);
+    if (levels >= sizeof(size_t) * 8) { return std::numeric_limits<size_t>::max(); }
+    return (size_t{1} << levels) - 1;
   }
 
   /**
