@@ -29,6 +29,7 @@ from treelite import Model as TreeliteModel
 
 import cuml.internals
 import cuml.internals.nvtx as nvtx
+from cuml.internals import logger
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
@@ -403,6 +404,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         self._reset_forest_data()
         t_reset = time.perf_counter()
         current_stream = cp.cuda.get_current_stream()
+        cdef bint do_timing = logger.should_log_for(logger.level_enum.debug)
 
         if not isinstance(X, np.ndarray):
             raise TypeError(
@@ -491,7 +493,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             self.min_samples_split = \
                 max(2, math.ceil(self.min_samples_split * self.n_rows))
         t_scalar_setup = time.perf_counter()
-        if self.verbose:
+        if logger.should_log_for(logger.level_enum.debug):
             print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
                   f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
                   f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
@@ -514,34 +516,30 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         self._reset_forest_data()
         t_reset = time.perf_counter()
         current_stream = cp.cuda.get_current_stream()
+        cdef bint do_timing = logger.should_log_for(logger.level_enum.debug)
 
-        if not isinstance(X, np.ndarray):
+        if len(X.shape) != 2:
+            raise ValueError("The features `X` need to be a 2D array")
+        X_dtype = np.dtype(X.dtype)
+        convert_x_dtype = (
+            np.float32 if convert_dtype and X_dtype != np.dtype(np.float32)
+            else False
+        )
+        X_in = input_to_cuml_array(
+            X,
+            order='F',
+            convert_to_dtype=convert_x_dtype,
+        )
+        X_m = X_in.array
+        if X_in.dtype not in (np.float32, np.float64):
             raise TypeError(
-                "SPORFClassifier._dataset_setup_for_fit_fast expects X to be "
-                "a numpy.ndarray"
+                "The features `X` need to be of dtype `float32` or `float64`"
             )
-        if not isinstance(y, np.ndarray):
-            raise TypeError(
-                "SPORFClassifier._dataset_setup_for_fit_fast expects y to be "
-                "a numpy.ndarray"
-            )
-
-        if X.ndim != 2:
-            raise ValueError("The features `X` need to be a 2D numpy.ndarray")
-        if convert_dtype and X.dtype != np.float32:
-            X_host = np.asfortranarray(X, dtype=np.float32)
-        else:
-            if X.dtype not in (np.float32, np.float64):
-                raise TypeError(
-                    "The features `X` need to be of dtype `float32` or `float64`"
-                )
-            X_host = np.asfortranarray(X)
-        X_arr = cp.asarray(X_host)
-        current_stream.synchronize()
-        X_m = CumlArray.from_input(X_arr, order='F')
-        self.n_rows = X_host.shape[0]
-        self.n_cols = X_host.shape[1]
-        self.dtype = X_host.dtype
+        if do_timing:
+            current_stream.synchronize()
+        self.n_rows = X_in.n_rows
+        self.n_cols = X_in.n_cols
+        self.dtype = X_in.dtype
         t_x_input = time.perf_counter()
         if self.n_bins > self.n_rows:
             warnings.warn("The number of bins, `n_bins` is greater than "
@@ -549,9 +547,13 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                           "Changing `n_bins` to number of training samples.")
             self.n_bins = self.n_rows
 
-        if y.ndim > 2:
+        if len(y.shape) > 2:
             raise ValueError("The labels `y` need to be a 1D numpy.ndarray or column vector")
-        y_host = np.asarray(y).reshape(-1)
+        y_is_device = hasattr(y, "__cuda_array_interface__")
+        if y_is_device:
+            y_host = cp.asnumpy(y).reshape(-1)
+        else:
+            y_host = np.asarray(y).reshape(-1)
         if convert_dtype and y_host.dtype != np.int32:
             y_host = y_host.astype(np.int32, copy=False)
         if y_host.dtype != np.int32:
@@ -576,16 +578,22 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             y_host = np.searchsorted(classes_host, y_host).astype(np.int32, copy=False)
         t_label_remap = time.perf_counter()
 
-        y_arr = cp.asarray(y_host)
-        current_stream.synchronize()
-        y_m = CumlArray.from_input(y_arr, order='K')
+        if y_is_device and not self.use_monotonic and y.dtype == np.int32:
+            y_m = CumlArray.from_input(y, order='K')
+        else:
+            y_arr = cp.asarray(y_host)
+            if do_timing:
+                current_stream.synchronize()
+            y_m = CumlArray.from_input(y_arr, order='K')
         t_y_input = time.perf_counter()
 
-        current_stream.synchronize()
+        if do_timing:
+            current_stream.synchronize()
         t_label_classes_start = time.perf_counter()
         self.classes_ = cp.asarray(classes_host)
         t_label_classes_materialize = time.perf_counter()
-        current_stream.synchronize()
+        if do_timing:
+            current_stream.synchronize()
         t_label_classes_sync = time.perf_counter()
         t_label_setup = time.perf_counter()
 
@@ -603,7 +611,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             self.min_samples_split = \
                 max(2, math.ceil(self.min_samples_split * self.n_rows))
         t_scalar_setup = time.perf_counter()
-        if self.verbose:
+        if logger.should_log_for(logger.level_enum.debug):
             print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
                   f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
                   f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
@@ -848,9 +856,9 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         t_teardown_start = time.perf_counter()
         del X_m
         del y_m
-        t_teardown = time.perf_counter() - t_teardown_start
-        t_fit_wall = time.perf_counter() - t_fit_wall_start
-        if self.verbose:
+        if logger.should_log_for(logger.level_enum.debug):
+            t_teardown = time.perf_counter() - t_teardown_start
+            t_fit_wall = time.perf_counter() - t_fit_wall_start
             print("SPORFClassifier.fit timings (ms): "
                   f"dataset_setup={t_dataset_setup * 1000.0:.3f} "
                   f"native_fit={t_native_fit * 1000.0:.3f} "

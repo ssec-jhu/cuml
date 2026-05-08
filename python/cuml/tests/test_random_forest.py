@@ -356,7 +356,7 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         handle=handle,
         max_leaves=-1,
         max_depth=16,
-        # verbose=True,
+        verbose=False,
     )
     sporf_model.fit(X_train, y_train)
     sporf_train_time = time.perf_counter() - t_start
