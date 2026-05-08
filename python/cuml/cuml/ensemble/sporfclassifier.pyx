@@ -43,6 +43,7 @@ from cuml.prims.label.classlabels import check_labels, invert_labels, make_monot
 
 from libc.stdint cimport uint64_t, uintptr_t
 from libcpp cimport bool
+from libcpp.string cimport string
 from pylibraft.common.handle cimport handle_t
 
 from cuml.ensemble.randomforest_shared cimport *
@@ -100,7 +101,7 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
 #   SPORF_params rf_params;
 # };
 
-    cdef cppclass SPORF_params:
+    cdef struct SPORF_params:
         int n_trees
         bool bootstrap
         float max_samples
@@ -145,6 +146,11 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                                 int* unique_labels_out,
                                 int* n_unique_labels,
                                 bool* is_dense_zero_based) except +
+
+    cdef string serialize(const SPORFMetaData[float, int]* forest) except +
+    cdef string serialize(const SPORFMetaData[double, int]* forest) except +
+    cdef void deserialize(SPORFMetaData[float, int]* forest, const string& payload) except +
+    cdef void deserialize(SPORFMetaData[double, int]* forest, const string& payload) except +
 
     cdef void fit(handle_t& handle,
                   SPORFMetaData[float, int]*,
@@ -633,24 +639,30 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
     # https://github.com/rapidsai/cuml/issues/691
     def __getstate__(self):
         state = self.__dict__.copy()
-        
+        state["rf_forest"] = 0
+        state["rf_forest64"] = 0
+
         cdef size_t params_t
-        cdef RandomForestMetaData[float, int]* rf_forest
-        cdef RandomForestMetaData[double, int]* rf_forest64
+        cdef SPORFMetaData[float, int]* rf_forest
+        cdef SPORFMetaData[double, int]* rf_forest64
         cdef size_t params_t64
+        cdef string forest_bytes_cpp
+        cdef bytes forest_bytes_py
 
         if self.n_cols:
-            # only if model has been fit previously
-            self._serialize_treelite_bytes()  # Ensure we have this cached
-            if self.rf_forest:
+            if self.dtype == np.float32 and self.rf_forest:
                 params_t = <uintptr_t>self.rf_forest
-                rf_forest = <RandomForestMetaData[float, int]*>params_t
-                state["rf_params"] = rf_forest.rf_params
+                rf_forest = <SPORFMetaData[float, int]*>params_t
+                forest_bytes_cpp = serialize(rf_forest)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest_bytes"] = forest_bytes_py
 
-            if self.rf_forest64:
+            elif self.dtype == np.float64 and self.rf_forest64:
                 params_t64 = <uintptr_t> self.rf_forest64
-                rf_forest64 = <RandomForestMetaData[double, int]*>params_t64
-                state["rf_params64"] = rf_forest64.rf_params
+                rf_forest64 = <SPORFMetaData[double, int]*>params_t64
+                forest_bytes_cpp = serialize(rf_forest64)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest64_bytes"] = forest_bytes_py
 
         state["n_cols"] = self.n_cols
         state["_verbose"] = self._verbose
@@ -668,32 +680,67 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             handle=state["handle"],
             verbose=state["_verbose"])
 
-        cdef RandomForestMetaData[float, int] *rf_forest = new RandomForestMetaData[float, int]()
-        cdef RandomForestMetaData[double, int] *rf_forest64 = new RandomForestMetaData[double, int]()
-
-        self.n_cols = state['n_cols']
-        if self.n_cols:
-            rf_forest.rf_params = state["rf_params"]
-            # restore SPORF-specific tree params (density and histogram_method)
-            # if they were saved in the state (backwards-compatible)
-            try:
-                rf_forest.rf_params.tree_params.density = <float> state["density"]
-                rf_forest.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
-            except Exception:
-                # older pickles may not have these keys; ignore in that case
-                pass
-            state["rf_forest"] = <uintptr_t>rf_forest
-
-            rf_forest64.rf_params = state["rf_params64"]
-            try:
-                rf_forest64.rf_params.tree_params.density = <float> state["density"]
-                rf_forest64.rf_params.tree_params.histogram_method = <HISTOGRAM_METHOD> state["histogram_method"]
-            except Exception:
-                pass
-            state["rf_forest64"] = <uintptr_t>rf_forest64
+        cdef SPORFMetaData[float, int] *rf_forest = NULL
+        cdef SPORFMetaData[double, int] *rf_forest64 = NULL
+        cdef string forest_bytes_cpp
+        cdef uintptr_t seed_val
+        cdef float max_feature_val
+        cdef SPORF_params rf_params
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
         self.__dict__.update(state)
+        self.rf_forest = 0
+        self.rf_forest64 = 0
+
+        if self.n_cols:
+            max_feature_val = compute_max_features(self.max_features, self.n_cols)
+            if self.random_state is None:
+                seed_val = <uintptr_t>NULL
+            else:
+                seed_val = <uintptr_t>check_random_seed(self.random_state)
+
+            rf_params = set_sporf_params(<int> self.max_depth,
+                                         <int> self.max_leaves,
+                                         <float> max_feature_val,
+                                         <int> self.n_bins,
+                                         <int> self.min_samples_leaf,
+                                         <int> self.min_samples_split,
+                                         <float> self.min_impurity_decrease,
+                                         <bool> self.bootstrap,
+                                         <int> self.n_estimators,
+                                         <float> self.max_samples,
+                                         <uint64_t> seed_val,
+                                         <CRITERION> self.split_criterion,
+                                         <int> self.n_streams,
+                                         <int> self.max_batch_size,
+                                         <float> self.density,
+                                         <HISTOGRAM_METHOD> self.histogram_method)
+
+            if self.dtype == np.float32 and "sporf_forest_bytes" in state:
+                rf_forest = new SPORFMetaData[float, int]()
+                rf_forest.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest_bytes"]
+                deserialize(rf_forest, forest_bytes_cpp)
+                self.rf_forest = <uintptr_t>rf_forest
+
+            elif self.dtype == np.float64 and "sporf_forest64_bytes" in state:
+                rf_forest64 = new SPORFMetaData[double, int]()
+                rf_forest64.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest64_bytes"]
+                deserialize(rf_forest64, forest_bytes_cpp)
+                self.rf_forest64 = <uintptr_t>rf_forest64
+
+            else:
+                # Backwards-compatible shell restore for older pickles that did
+                # not carry serialized SPORF tree payloads.
+                if self.dtype == np.float32:
+                    rf_forest = new SPORFMetaData[float, int]()
+                    rf_forest.rf_params = rf_params
+                    self.rf_forest = <uintptr_t>rf_forest
+                elif self.dtype == np.float64:
+                    rf_forest64 = new SPORFMetaData[double, int]()
+                    rf_forest64.rf_params = rf_params
+                    self.rf_forest64 = <uintptr_t>rf_forest64
 
     def __del__(self):
         self._reset_forest_data()
