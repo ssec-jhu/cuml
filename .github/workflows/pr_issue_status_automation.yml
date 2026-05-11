@@ -8,8 +8,8 @@ on:
 
 jobs:
     get-project-id:
+      if: false
       uses: rapidsai/shared-workflows/.github/workflows/project-get-item-id.yaml@branch-25.10
-      if: github.event.pull_request.state == 'open'
       secrets:
         ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
       permissions:
@@ -20,8 +20,8 @@ jobs:
 
     update-status:
       # This job sets the PR and its linked issues to "In Progress" status
+      if: false
       uses: rapidsai/shared-workflows/.github/workflows/project-get-set-single-select-field.yaml@branch-25.10
-      if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
       needs: get-project-id
       secrets:
         ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
@@ -36,7 +36,7 @@ jobs:
         UPDATE_LINKED_ISSUES: true
 
     process-branch-name:
-      if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
+      if: false
       needs: get-project-id
       runs-on: ubuntu-latest
       outputs:
@@ -51,8 +51,8 @@ jobs:
 
     update-release:
       # This job sets the PR and its linked issues to the release they are targeting
+      if: false
       uses: rapidsai/shared-workflows/.github/workflows/project-get-set-single-select-field.yaml@branch-25.10
-      if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
       needs: [get-project-id, process-branch-name]
       secrets:
         ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
