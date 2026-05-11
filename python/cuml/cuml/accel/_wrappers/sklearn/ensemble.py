@@ -65,3 +65,52 @@ class RandomForestClassifier(ProxyBase):
 
     def __getitem__(self, index):
         return self._call_method("__getitem__", index)
+
+
+if hasattr(cuml.ensemble, "SPORFRegressor") and hasattr(cuml.ensemble, "SPORFClassifier"):
+    __all__.extend(["SPORFRegressor", "SPORFClassifier"])
+
+    class SPORFRegressor(ProxyBase):
+        _gpu_class = cuml.ensemble.SPORFRegressor
+
+        def _gpu_fit(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.fit(X, y)
+
+        def _gpu_score(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.score(X, y)
+
+        def __len__(self):
+            return self._call_method("__len__")
+
+        def __iter__(self):
+            return self._call_method("__iter__")
+
+        def __getitem__(self, index):
+            return self._call_method("__getitem__", index)
+
+
+    class SPORFClassifier(ProxyBase):
+        _gpu_class = cuml.ensemble.SPORFClassifier
+
+        def _gpu_fit(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.fit(X, y)
+
+        def _gpu_score(self, X, y, sample_weight=None):
+            if sample_weight is not None:
+                raise UnsupportedOnGPU("`sample_weight` is not supported")
+            return self._gpu.score(X, y)
+
+        def __len__(self):
+            return self._call_method("__len__")
+
+        def __iter__(self):
+            return self._call_method("__iter__")
+
+        def __getitem__(self, index):
+            return self._call_method("__getitem__", index)

@@ -349,7 +349,8 @@ if(BUILD_CUML_CPP_LIBRARY)
         src/decisiontree/batched-levelalgo/kernels/mse-float.cu
         src/decisiontree/batched-levelalgo/kernels/poisson-double.cu
         src/decisiontree/batched-levelalgo/kernels/poisson-float.cu
-        src/decisiontree/decisiontree.cu)
+        src/decisiontree/decisiontree.cu
+        src/decisiontree/sporfdecisiontree.cu)
   endif()
 
   if(all_algo OR explainer_algo)
@@ -502,7 +503,8 @@ if(BUILD_CUML_CPP_LIBRARY)
   if(all_algo OR randomforest_algo)
     target_sources(${CUML_CPP_TARGET}
       PRIVATE
-        src/randomforest/randomforest.cu)
+        src/randomforest/randomforest.cu
+        src/randomforest/sporf.cu)
   endif()
 
   if(all_algo OR randomprojection_algo)

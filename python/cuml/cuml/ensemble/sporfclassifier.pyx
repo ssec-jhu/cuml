@@ -1,4 +1,5 @@
-# randomforestclassifier.pyx
+#
+# sporfclassifier.pyx
 #
 # Copyright (c) 2019-2025, NVIDIA CORPORATION.
 #
@@ -16,54 +17,163 @@
 #
 # distutils: language = c++
 
+import math
 import numpy as np
+import time
+import typing
+import warnings
+import cupy as cp
+import cudf
+from numpy._core.multiarray import set_typeDict
 from treelite import Model as TreeliteModel
 
 import cuml.internals
 import cuml.internals.nvtx as nvtx
+from cuml.internals import logger
 from cuml.common import input_to_cuml_array
 from cuml.common.array_descriptor import CumlArrayDescriptor
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
-from cuml.ensemble.randomforest_common import BaseRandomForestModel
+from cuml.ensemble.randomforest_common import BaseRandomForestModel, compute_max_features
 from cuml.fil.fil import ForestInference
 from cuml.internals.array import CumlArray
 from cuml.internals.interop import UnsupportedOnGPU, to_cpu, to_gpu
 from cuml.internals.mixins import ClassifierMixin
 from cuml.internals.utils import check_random_seed
-from cuml.prims.label.classlabels import check_labels, invert_labels
+from cuml.prims.label.classlabels import check_labels, invert_labels, make_monotonic
 
 from libc.stdint cimport uint64_t, uintptr_t
 from libcpp cimport bool
+from libcpp.string cimport string
 from pylibraft.common.handle cimport handle_t
 
 from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
 
-cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
+
+# Declare SPORF-specific tree params and enums from ML::DT so we can
+# include them in the SPORF_params layout below. Matches
+# cpp/include/cuml/tree/sporfdecisiontree.hpp
+cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT":
+    cdef enum HISTOGRAM_METHOD:
+        HISTOGRAM_METHOD_EXACT
+        HISTOGRAM_METHOD_SAMPLED
+
+    cdef cppclass DecisionTreeParams:
+        int max_depth
+        int max_leaves
+        float max_features
+        int max_n_bins
+        int min_samples_leaf
+        int min_samples_split
+        CRITERION split_criterion
+        float min_impurity_decrease
+        int max_batch_size
+
+    cdef cppclass SPORFDecisionTreeParams(DecisionTreeParams):
+        float density
+        HISTOGRAM_METHOD histogram_method
+
+# Expose enum values as Python-level ints so they can be used as
+# default values in Python signatures and are pickle/JSON friendly.
+HISTOGRAM_METHOD_EXACT_PY = int(HISTOGRAM_METHOD_EXACT)
+HISTOGRAM_METHOD_SAMPLED_PY = int(HISTOGRAM_METHOD_SAMPLED)
+
+
+cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
+
+# defined in sporf.hpp
+#
+# struct SPORF_params {
+#   ... RF_params members ...
+#   int n_trees;
+#   bool bootstrap;
+#   float max_samples;
+#   uint64_t seed;
+#   int n_streams;
+#
+#   DT::SPORFDecisionTreeParams tree_params;
+# };
+#
+# template <class T, class L>
+# struct SPORFMetaData {
+#   std::vector<std::shared_ptr<DT::TreeMetaDataNode<T, L>>> trees;
+#   SPORF_params rf_params;
+# };
+
+    cdef struct SPORF_params:
+        int n_trees
+        bool bootstrap
+        float max_samples
+        uint64_t seed
+        int n_streams
+        SPORFDecisionTreeParams tree_params
+
+    cdef cppclass SPORFMetaData[T, L]:
+        void* trees
+        SPORF_params rf_params
+
+    # (the corresponding cdef for set_rf_params() is in randomforest_shared.pxd)
+    cdef SPORF_params set_sporf_params(int,
+                                        int,
+                                        float,
+                                        int,
+                                        int,
+                                        int,
+                                        float,
+                                        bool,
+                                        int,
+                                        float,
+                                        uint64_t,
+                                        CRITERION,
+                                        int,
+                                        int,
+                                        float,
+                                        HISTOGRAM_METHOD) except +
+
+    ctypedef SPORFMetaData[float, int] SPORFClassifierF
+    ctypedef SPORFMetaData[double, int] SPORFClassifierD
+
+    cdef void get_label_metadata(const handle_t& handle,
+                                 const int* labels,
+                                 int n_rows,
+                                 int* n_unique_labels,
+                                 bool* is_dense_zero_based) except +
+
+    cdef void get_unique_labels(const handle_t& handle,
+                                const int* labels,
+                                int n_rows,
+                                int* unique_labels_out,
+                                int* n_unique_labels,
+                                bool* is_dense_zero_based) except +
+
+    cdef string serialize(const SPORFMetaData[float, int]* forest) except +
+    cdef string serialize(const SPORFMetaData[double, int]* forest) except +
+    cdef void deserialize(SPORFMetaData[float, int]* forest, const string& payload) except +
+    cdef void deserialize(SPORFMetaData[double, int]* forest, const string& payload) except +
 
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[float, int]*,
+                  SPORFMetaData[float, int]*,
                   float*,
                   int,
                   int,
                   int*,
                   int,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[double, int]*,
+                  SPORFMetaData[double, int]*,
                   double*,
                   int,
                   int,
                   int*,
                   int,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[float, int] *,
+                      SPORFMetaData[float, int] *,
                       float*,
                       int,
                       int,
@@ -71,7 +181,7 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[double, int]*,
+                      SPORFMetaData[double, int]*,
                       double*,
                       int,
                       int,
@@ -79,24 +189,23 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[float, int]*,
+                          SPORFMetaData[float, int]*,
                           int*,
                           int,
                           int*,
                           level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[double, int]*,
+                          SPORFMetaData[double, int]*,
                           int*,
                           int,
                           int*,
                           level_enum) except +
 
-
-class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
+class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
     """
-    Implements a Random Forest classifier model which fits multiple decision
-    tree classifiers in an ensemble.
+    Implements a Sparse Projection Oblique Random Forest regressor model which fits
+    multiple decision trees in an ensemble.
 
     .. note:: Note that the underlying algorithm for tree node splits differs
       from that used in scikit-learn. By default, the cuML Random Forest uses a
@@ -115,7 +224,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     .. code-block:: python
 
         >>> import cupy as cp
-        >>> from cuml.ensemble import RandomForestClassifier as cuRFC
+        >>> from cuml.ensemble import SPORFClassifier as cuRFC
 
         >>> X = cp.random.normal(size=(10,4)).astype(cp.float32)
         >>> y = cp.asarray([0,1]*5, dtype=cp.int32)
@@ -124,7 +233,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         ...                    n_bins=8,
         ...                    n_estimators=40)
         >>> cuml_model.fit(X,y)
-        RandomForestClassifier()
+        SPORFClassifier()
         >>> cuml_predict = cuml_model.predict(X)
 
         >>> print("Predicted labels : ", cuml_predict)
@@ -238,7 +347,8 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     """
     classes_ = CumlArrayDescriptor()
 
-    _cpu_class_path = "sklearn.ensemble.RandomForestClassifier"
+    # TODO: FIGURE THIS OUT:
+    _cpu_class_path = "sklearn.ensemble.SPORFClassifier"
     RF_type = CLASSIFICATION
 
     @classmethod
@@ -263,7 +373,8 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         }
 
     def __init__(self, *, split_criterion=0, handle=None, verbose=False,
-                 output_type=None,
+                 output_type=None, density=0.5,
+                 histogram_method=HISTOGRAM_METHOD_SAMPLED_PY,
                  **kwargs):
         super().__init__(
             split_criterion=split_criterion,
@@ -272,59 +383,364 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             output_type=output_type,
             **kwargs)
 
+        # Store SPORF-specific tree params on the Python object so they
+        # are available for pickling via __getstate__ and passed into
+        # set_sporf_params() during fit(). Use an int for the enum so it's
+        # JSON/pickle friendly.
+        self.density = density
+        if histogram_method is None:
+            # default to the sampled histogram method
+            self.histogram_method = int(HISTOGRAM_METHOD_SAMPLED)
+        else:
+            # allow passing either the enum constant or an int
+            try:
+                self.histogram_method = int(histogram_method)
+            except Exception:
+                # fallback: store as-is (will likely raise later if invalid)
+                self.histogram_method = histogram_method
+
+    @cuml.internals.api_base_return_generic(set_output_type=True,
+                                            set_n_features_in=True,
+                                            get_output_type=False)
+
+    def _dataset_setup_for_fit_experimental(
+            self, X, y,
+            convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
+        t_dataset_setup_start = time.perf_counter()
+        self._reset_forest_data()
+        t_reset = time.perf_counter()
+        current_stream = cp.cuda.get_current_stream()
+        cdef bint do_timing = logger.should_log_for(logger.level_enum.debug)
+
+        if not isinstance(X, np.ndarray):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects X to be "
+                "a numpy.ndarray"
+            )
+        if not isinstance(y, np.ndarray):
+            raise TypeError(
+                "SPORFClassifier._dataset_setup_for_fit_fast expects y to be "
+                "a numpy.ndarray"
+            )
+
+        if X.ndim != 2:
+            raise ValueError("The features `X` need to be a 2D numpy.ndarray")
+        if convert_dtype:
+            X_arr = cp.asarray(X, dtype=cp.float32, order='F')
+        else:
+            if X.dtype not in (np.float32, np.float64):
+                raise TypeError(
+                    "The features `X` need to be of dtype `float32` or `float64`"
+                )
+            X_arr = cp.asarray(X, order='F')
+        current_stream.synchronize()
+        X_m = CumlArray.from_input(X_arr, order='F')
+        self.n_rows = X.shape[0]
+        self.n_cols = X.shape[1]
+        self.dtype = X_arr.dtype
+        t_x_input = time.perf_counter()
+        if self.n_bins > self.n_rows:
+            warnings.warn("The number of bins, `n_bins` is greater than "
+                          "the number of samples used for training. "
+                          "Changing `n_bins` to number of training samples.")
+            self.n_bins = self.n_rows
+
+        if y.ndim > 2:
+            raise ValueError("The labels `y` need to be a 1D numpy.ndarray or column vector")
+        y_host = np.asarray(y).reshape(-1)
+        if convert_dtype and y_host.dtype != np.int32:
+            y_host = y_host.astype(np.int32, copy=False)
+        if y_host.dtype != np.int32:
+            raise TypeError(
+                "The labels `y` need to be of dtype `int32`"
+            )
+        if y_host.shape[0] != self.n_rows:
+            raise ValueError(
+                "The labels `y` need to have the same number of rows as `X`"
+            )
+        classes_host = np.unique(y_host)
+        n_unique_labels = classes_host.shape[0]
+        is_dense_zero_based = (
+            n_unique_labels > 0 and classes_host[0] == 0 and classes_host[-1] == (n_unique_labels - 1)
+        )
+        t_label_metadata = time.perf_counter()
+
+        self.num_classes = self.n_classes_ = n_unique_labels
+        self.use_monotonic = not is_dense_zero_based
+        t_label_class_meta = time.perf_counter()
+        if self.use_monotonic:
+            y_host = np.searchsorted(classes_host, y_host).astype(np.int32, copy=False)
+        t_label_remap = time.perf_counter()
+
+        y_arr = cp.asarray(y_host)
+        current_stream.synchronize()
+        y_m = CumlArray.from_input(y_arr, order='K')
+        t_y_input = time.perf_counter()
+
+        current_stream.synchronize()
+        t_label_classes_start = time.perf_counter()
+        self.classes_ = cp.asarray(classes_host)
+        t_label_classes_materialize = time.perf_counter()
+        current_stream.synchronize()
+        t_label_classes_sync = time.perf_counter()
+        t_label_setup = time.perf_counter()
+
+        if len(y_m.shape) == 1:
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y_m.shape[1]
+        self.n_features_in_ = X_m.shape[1]
+
+        max_feature_val = compute_max_features(self.max_features, self.n_cols)
+        if isinstance(self.min_samples_leaf, float):
+            self.min_samples_leaf = \
+                math.ceil(self.min_samples_leaf * self.n_rows)
+        if isinstance(self.min_samples_split, float):
+            self.min_samples_split = \
+                max(2, math.ceil(self.min_samples_split * self.n_rows))
+        t_scalar_setup = time.perf_counter()
+        if logger.should_log_for(logger.level_enum.debug):
+            print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
+                  f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
+                  f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
+                  f"label_metadata={(t_label_metadata - t_x_input) * 1000.0:.3f} "
+                  f"class_meta={(t_label_class_meta - t_label_metadata) * 1000.0:.3f} "
+                  f"label_remap={(t_label_remap - t_label_class_meta) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_label_remap) * 1000.0:.3f} "
+                  f"class_materialize={(t_label_classes_materialize - t_label_classes_start) * 1000.0:.3f} "
+                  f"class_sync={(t_label_classes_sync - t_label_classes_materialize) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_x_input) * 1000.0:.3f} "
+                  f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
+                  f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
+        return X_m, y_m, max_feature_val
+
+
+    def _dataset_setup_for_fit_fast(
+            self, X, y,
+            convert_dtype) -> typing.Tuple[CumlArray, CumlArray, float]:
+        t_dataset_setup_start = time.perf_counter()
+        self._reset_forest_data()
+        t_reset = time.perf_counter()
+        current_stream = cp.cuda.get_current_stream()
+        cdef bint do_timing = logger.should_log_for(logger.level_enum.debug)
+
+        if len(X.shape) != 2:
+            raise ValueError("The features `X` need to be a 2D array")
+        X_dtype = np.dtype(X.dtype)
+        convert_x_dtype = (
+            np.float32 if convert_dtype and X_dtype != np.dtype(np.float32)
+            else False
+        )
+        X_in = input_to_cuml_array(
+            X,
+            order='F',
+            convert_to_dtype=convert_x_dtype,
+        )
+        X_m = X_in.array
+        if X_in.dtype not in (np.float32, np.float64):
+            raise TypeError(
+                "The features `X` need to be of dtype `float32` or `float64`"
+            )
+        if do_timing:
+            current_stream.synchronize()
+        self.n_rows = X_in.n_rows
+        self.n_cols = X_in.n_cols
+        self.dtype = X_in.dtype
+        t_x_input = time.perf_counter()
+        if self.n_bins > self.n_rows:
+            warnings.warn("The number of bins, `n_bins` is greater than "
+                          "the number of samples used for training. "
+                          "Changing `n_bins` to number of training samples.")
+            self.n_bins = self.n_rows
+
+        if len(y.shape) > 2:
+            raise ValueError("The labels `y` need to be a 1D numpy.ndarray or column vector")
+        y_is_device = hasattr(y, "__cuda_array_interface__")
+        if y_is_device:
+            y_host = cp.asnumpy(y).reshape(-1)
+        else:
+            y_host = np.asarray(y).reshape(-1)
+        if convert_dtype and y_host.dtype != np.int32:
+            y_host = y_host.astype(np.int32, copy=False)
+        if y_host.dtype != np.int32:
+            raise TypeError(
+                "The labels `y` need to be of dtype `int32`"
+            )
+        if y_host.shape[0] != self.n_rows:
+            raise ValueError(
+                "The labels `y` need to have the same number of rows as `X`"
+            )
+        classes_host = np.unique(y_host)
+        n_unique_labels = classes_host.shape[0]
+        is_dense_zero_based = (
+            n_unique_labels > 0 and classes_host[0] == 0 and classes_host[-1] == (n_unique_labels - 1)
+        )
+        t_label_metadata = time.perf_counter()
+
+        self.num_classes = self.n_classes_ = n_unique_labels
+        self.use_monotonic = not is_dense_zero_based
+        t_label_class_meta = time.perf_counter()
+        if self.use_monotonic:
+            y_host = np.searchsorted(classes_host, y_host).astype(np.int32, copy=False)
+        t_label_remap = time.perf_counter()
+
+        if y_is_device and not self.use_monotonic and y.dtype == np.int32:
+            y_m = CumlArray.from_input(y, order='K')
+        else:
+            y_arr = cp.asarray(y_host)
+            if do_timing:
+                current_stream.synchronize()
+            y_m = CumlArray.from_input(y_arr, order='K')
+        t_y_input = time.perf_counter()
+
+        if do_timing:
+            current_stream.synchronize()
+        t_label_classes_start = time.perf_counter()
+        self.classes_ = cp.asarray(classes_host)
+        t_label_classes_materialize = time.perf_counter()
+        if do_timing:
+            current_stream.synchronize()
+        t_label_classes_sync = time.perf_counter()
+        t_label_setup = time.perf_counter()
+
+        if len(y_m.shape) == 1:
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y_m.shape[1]
+        self.n_features_in_ = X_m.shape[1]
+
+        max_feature_val = compute_max_features(self.max_features, self.n_cols)
+        if isinstance(self.min_samples_leaf, float):
+            self.min_samples_leaf = \
+                math.ceil(self.min_samples_leaf * self.n_rows)
+        if isinstance(self.min_samples_split, float):
+            self.min_samples_split = \
+                max(2, math.ceil(self.min_samples_split * self.n_rows))
+        t_scalar_setup = time.perf_counter()
+        if logger.should_log_for(logger.level_enum.debug):
+            print("SPORFClassifier._dataset_setup_for_fit timings (ms): "
+                  f"reset={(t_reset - t_dataset_setup_start) * 1000.0:.3f} "
+                  f"x_input={(t_x_input - t_reset) * 1000.0:.3f} "
+                  f"label_metadata={(t_label_metadata - t_x_input) * 1000.0:.3f} "
+                  f"class_meta={(t_label_class_meta - t_label_metadata) * 1000.0:.3f} "
+                  f"label_remap={(t_label_remap - t_label_class_meta) * 1000.0:.3f} "
+                  f"y_input={(t_y_input - t_label_remap) * 1000.0:.3f} "
+                  f"class_materialize={(t_label_classes_materialize - t_label_classes_start) * 1000.0:.3f} "
+                  f"class_sync={(t_label_classes_sync - t_label_classes_materialize) * 1000.0:.3f} "
+                  f"label_setup={(t_label_setup - t_x_input) * 1000.0:.3f} "
+                  f"scalar_setup={(t_scalar_setup - t_label_setup) * 1000.0:.3f} "
+                  f"wall_total={(t_scalar_setup - t_dataset_setup_start) * 1000.0:.3f}")
+        return X_m, y_m, max_feature_val
+
+
     # TODO: Add the preprocess and postprocess functions in the cython code to
     # normalize the labels
     # Link to the above issue on github:
     # https://github.com/rapidsai/cuml/issues/691
     def __getstate__(self):
         state = self.__dict__.copy()
-        cdef size_t params_t
-        cdef  RandomForestMetaData[float, int] *rf_forest
-        cdef  RandomForestMetaData[double, int] *rf_forest64
-        cdef size_t params_t64
-        if self.n_cols:
-            # only if model has been fit previously
-            self._serialize_treelite_bytes()  # Ensure we have this cached
-            if self.rf_forest:
-                params_t = <uintptr_t> self.rf_forest
-                rf_forest = \
-                    <RandomForestMetaData[float, int]*>params_t
-                state["rf_params"] = rf_forest.rf_params
+        state["rf_forest"] = 0
+        state["rf_forest64"] = 0
 
-            if self.rf_forest64:
+        cdef size_t params_t
+        cdef SPORFMetaData[float, int]* rf_forest
+        cdef SPORFMetaData[double, int]* rf_forest64
+        cdef size_t params_t64
+        cdef string forest_bytes_cpp
+        cdef bytes forest_bytes_py
+
+        if self.n_cols:
+            if self.dtype == np.float32 and self.rf_forest:
+                params_t = <uintptr_t>self.rf_forest
+                rf_forest = <SPORFMetaData[float, int]*>params_t
+                forest_bytes_cpp = serialize(rf_forest)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest_bytes"] = forest_bytes_py
+
+            elif self.dtype == np.float64 and self.rf_forest64:
                 params_t64 = <uintptr_t> self.rf_forest64
-                rf_forest64 = \
-                    <RandomForestMetaData[double, int]*>params_t64
-                state["rf_params64"] = rf_forest64.rf_params
+                rf_forest64 = <SPORFMetaData[double, int]*>params_t64
+                forest_bytes_cpp = serialize(rf_forest64)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest64_bytes"] = forest_bytes_py
 
         state["n_cols"] = self.n_cols
         state["_verbose"] = self._verbose
         state["treelite_serialized_bytes"] = self.treelite_serialized_bytes
         state["split_criterion"] = self.split_criterion
         state["handle"] = self.handle
+        state["density"] = self.density
+        state["histogram_method"] = self.histogram_method
 
         return state
 
     def __setstate__(self, state):
-        super(RandomForestClassifier, self).__init__(
+        super(SPORFClassifier, self).__init__(
             split_criterion=state["split_criterion"],
             handle=state["handle"],
             verbose=state["_verbose"])
-        cdef  RandomForestMetaData[float, int] *rf_forest = \
-            new RandomForestMetaData[float, int]()
-        cdef  RandomForestMetaData[double, int] *rf_forest64 = \
-            new RandomForestMetaData[double, int]()
 
-        self.n_cols = state['n_cols']
-        if self.n_cols:
-            rf_forest.rf_params = state["rf_params"]
-            state["rf_forest"] = <uintptr_t>rf_forest
-
-            rf_forest64.rf_params = state["rf_params64"]
-            state["rf_forest64"] = <uintptr_t>rf_forest64
+        cdef SPORFMetaData[float, int] *rf_forest = NULL
+        cdef SPORFMetaData[double, int] *rf_forest64 = NULL
+        cdef string forest_bytes_cpp
+        cdef uintptr_t seed_val
+        cdef float max_feature_val
+        cdef SPORF_params rf_params
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
         self.__dict__.update(state)
+        self.rf_forest = 0
+        self.rf_forest64 = 0
+
+        if self.n_cols:
+            max_feature_val = compute_max_features(self.max_features, self.n_cols)
+            if self.random_state is None:
+                seed_val = <uintptr_t>NULL
+            else:
+                seed_val = <uintptr_t>check_random_seed(self.random_state)
+
+            rf_params = set_sporf_params(<int> self.max_depth,
+                                         <int> self.max_leaves,
+                                         <float> max_feature_val,
+                                         <int> self.n_bins,
+                                         <int> self.min_samples_leaf,
+                                         <int> self.min_samples_split,
+                                         <float> self.min_impurity_decrease,
+                                         <bool> self.bootstrap,
+                                         <int> self.n_estimators,
+                                         <float> self.max_samples,
+                                         <uint64_t> seed_val,
+                                         <CRITERION> self.split_criterion,
+                                         <int> self.n_streams,
+                                         <int> self.max_batch_size,
+                                         <float> self.density,
+                                         <HISTOGRAM_METHOD> self.histogram_method)
+
+            if self.dtype == np.float32 and "sporf_forest_bytes" in state:
+                rf_forest = new SPORFMetaData[float, int]()
+                rf_forest.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest_bytes"]
+                deserialize(rf_forest, forest_bytes_cpp)
+                self.rf_forest = <uintptr_t>rf_forest
+
+            elif self.dtype == np.float64 and "sporf_forest64_bytes" in state:
+                rf_forest64 = new SPORFMetaData[double, int]()
+                rf_forest64.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest64_bytes"]
+                deserialize(rf_forest64, forest_bytes_cpp)
+                self.rf_forest64 = <uintptr_t>rf_forest64
+
+            else:
+                # Backwards-compatible shell restore for older pickles that did
+                # not carry serialized SPORF tree payloads.
+                if self.dtype == np.float32:
+                    rf_forest = new SPORFMetaData[float, int]()
+                    rf_forest.rf_params = rf_params
+                    self.rf_forest = <uintptr_t>rf_forest
+                elif self.dtype == np.float64:
+                    rf_forest64 = new SPORFMetaData[double, int]()
+                    rf_forest64.rf_params = rf_params
+                    self.rf_forest64 = <uintptr_t>rf_forest64
 
     def __del__(self):
         self._reset_forest_data()
@@ -332,14 +748,10 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     def _reset_forest_data(self):
         """Free memory allocated by this instance and clear instance vars."""
         if hasattr(self, "rf_forest") and self.rf_forest:
-            delete_rf_metadata(
-                <RandomForestMetaData[float, int]*><uintptr_t>
-                self.rf_forest)
+            delete_rf_metadata( <RandomForestMetaData[float, int]*><uintptr_t>self.rf_forest )
             self.rf_forest = 0
         if hasattr(self, "rf_forest64") and self.rf_forest64:
-            delete_rf_metadata(
-                <RandomForestMetaData[double, int]*><uintptr_t>
-                self.rf_forest64)
+            delete_rf_metadata( <RandomForestMetaData[double, int]*><uintptr_t>self.rf_forest64 )
             self.rf_forest64 = 0
         self.treelite_serialized_bytes = None
         self.n_cols = None
@@ -397,7 +809,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         )
 
     @nvtx.annotate(
-        message="fit RF-Classifier @randomforestclassifier.pyx",
+        message="fit RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @generate_docstring(skip_parameters_heading=True,
                         y='dense_intdtype',
@@ -416,22 +828,20 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             y to be of dtype int32. This will increase memory used for
             the method.
         """
-        X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y, convert_dtype)
-        # Track the labels to see if update is necessary
-        self.update_labels = not check_labels(y_m, self.classes_)
+        t_fit_wall_start = time.perf_counter()
+        X_m, y_m, max_feature_val = self._dataset_setup_for_fit_fast(X, y, convert_dtype)
+        t_dataset_setup = time.perf_counter() - t_fit_wall_start
+        self.update_labels = self.use_monotonic
         cdef uintptr_t X_ptr, y_ptr
 
         X_ptr = X_m.ptr
         y_ptr = y_m.ptr
 
-        cdef handle_t* handle_ =\
-            <handle_t*><uintptr_t>self.handle.getHandle()
+        cdef handle_t* handle_ = <handle_t*><uintptr_t>self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            new RandomForestMetaData[float, int]()
+        cdef SPORFClassifierF* rf_forest = new SPORFMetaData[float, int]()
         self.rf_forest = <uintptr_t> rf_forest
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            new RandomForestMetaData[double, int]()
+        cdef SPORFClassifierD* rf_forest64 = new SPORFMetaData[double, int]()
         self.rf_forest64 = <uintptr_t> rf_forest64
 
         if self.random_state is None:
@@ -439,21 +849,24 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         else:
             seed_val = <uintptr_t>check_random_seed(self.random_state)
 
-        rf_params = set_rf_params(<int> self.max_depth,
-                                  <int> self.max_leaves,
-                                  <float> max_feature_val,
-                                  <int> self.n_bins,
-                                  <int> self.min_samples_leaf,
-                                  <int> self.min_samples_split,
-                                  <float> self.min_impurity_decrease,
-                                  <bool> self.bootstrap,
-                                  <int> self.n_estimators,
-                                  <float> self.max_samples,
-                                  <uint64_t> seed_val,
-                                  <CRITERION> self.split_criterion,
-                                  <int> self.n_streams,
-                                  <int> self.max_batch_size)
+        rf_params = set_sporf_params(<int> self.max_depth,
+                                     <int> self.max_leaves,
+                                     <float> max_feature_val,
+                                     <int> self.n_bins,
+                                     <int> self.min_samples_leaf,
+                                     <int> self.min_samples_split,
+                                     <float> self.min_impurity_decrease,
+                                     <bool> self.bootstrap,
+                                     <int> self.n_estimators,
+                                     <float> self.max_samples,
+                                     <uint64_t> seed_val,
+                                     <CRITERION> self.split_criterion,
+                                     <int> self.n_streams,
+                                     <int> self.max_batch_size,
+                                     <float> self.density,
+                                     <HISTOGRAM_METHOD> self.histogram_method)
 
+        t_native_fit_start = time.perf_counter()
         if self.dtype == np.float32:
             fit(handle_[0],
                 rf_forest,
@@ -481,11 +894,24 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
             raise TypeError("supports only np.float32 and np.float64 input,"
                             " but input of type '%s' passed."
                             % (str(self.dtype)))
+        t_native_fit = time.perf_counter() - t_native_fit_start
         # make sure that the `fit` is complete before the following delete
         # call happens
+        t_sync_start = time.perf_counter()
         self.handle.sync()
+        t_sync = time.perf_counter() - t_sync_start
+        t_teardown_start = time.perf_counter()
         del X_m
         del y_m
+        if logger.should_log_for(logger.level_enum.debug):
+            t_teardown = time.perf_counter() - t_teardown_start
+            t_fit_wall = time.perf_counter() - t_fit_wall_start
+            print("SPORFClassifier.fit timings (ms): "
+                  f"dataset_setup={t_dataset_setup * 1000.0:.3f} "
+                  f"native_fit={t_native_fit * 1000.0:.3f} "
+                  f"sync={t_sync * 1000.0:.3f} "
+                  f"teardown={t_teardown * 1000.0:.3f} "
+                  f"wall_total={t_fit_wall * 1000.0:.3f}")
         return self
 
     @cuml.internals.api_base_return_array(get_output_dtype=True)
@@ -496,7 +922,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
     ) -> CumlArray:
         cdef uintptr_t X_ptr
         X_m, n_rows, n_cols, _dtype = \
-            input_to_cuml_array(X, order='C',
+            input_to_cuml_array(X, order='F',
                                 convert_to_dtype=(self.dtype if convert_dtype
                                                   else None),
                                 check_cols=self.n_cols)
@@ -507,11 +933,11 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         cdef handle_t* handle_ = \
             <handle_t*> <uintptr_t> self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*> <uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*> <uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*> <uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*> <uintptr_t> self.rf_forest64
         if self.dtype == np.float32:
             predict(handle_[0],
                     rf_forest,
@@ -540,7 +966,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         return preds
 
     @nvtx.annotate(
-        message="predict RF-Classifier @randomforestclassifier.pyx",
+        message="predict RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @insert_into_docstring(parameters=[('dense', '(n_samples, n_features)')],
                            return_values=[('dense', '(n_samples, 1)')])
@@ -656,7 +1082,7 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         )
 
     @nvtx.annotate(
-        message="score RF-Classifier @randomforestclassifier.pyx",
+        message="score RF-Classifier @sporfclassifier.pyx",
         domain="cuml_python")
     @insert_into_docstring(parameters=[('dense', '(n_samples, n_features)'),
                                        ('dense_intdtype', '(n_samples, 1)')])
@@ -733,11 +1159,11 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         cdef handle_t* handle_ =\
             <handle_t*><uintptr_t>self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float32:
             self.stats = score(handle_[0],
@@ -767,11 +1193,9 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         """
         Obtain the text summary of the random forest model
         """
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef RandomForestMetaData[float, int] *rf_forest = <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef RandomForestMetaData[double, int] *rf_forest64 = <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float64:
             return get_rf_summary_text(rf_forest64).decode('utf-8')
@@ -782,11 +1206,9 @@ class RandomForestClassifier(BaseRandomForestModel, ClassifierMixin):
         """
         Obtain the detailed information for the random forest model, as text
         """
-        cdef RandomForestMetaData[float, int] *rf_forest = \
-            <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
+        cdef RandomForestMetaData[float, int] *rf_forest = <RandomForestMetaData[float, int]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, int] *rf_forest64 = \
-            <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
+        cdef RandomForestMetaData[double, int] *rf_forest64 = <RandomForestMetaData[double, int]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float64:
             return get_rf_detailed_text(rf_forest64).decode('utf-8')

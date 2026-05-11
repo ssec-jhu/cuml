@@ -114,7 +114,7 @@ def compute_max_features(
 class BaseRandomForestModel(Base, InteropMixin):
 
     @classmethod
-    def _get_param_names(cls):
+    def _get_param_names(cls):        
         return [
             *super()._get_param_names(),
             "split_criterion",

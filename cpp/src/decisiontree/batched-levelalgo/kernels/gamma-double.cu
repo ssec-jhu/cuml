@@ -32,3 +32,17 @@ using _NodeT      = SparseTreeNode<_DataT, _LabelT, _IdxT>;
 }  // namespace ML
 
 #include "builder_kernels_impl.cuh"
+
+namespace ML {
+namespace SPORFDT {
+using _DataT      = double;
+using _LabelT     = double;
+using _IdxT       = int;
+using _ObjectiveT = DT::GammaObjectiveFunction<_DataT, _LabelT, _IdxT>;
+using _BinT       = DT::AggregateBin;
+using _DatasetT   = DT::Dataset<_DataT, _LabelT, _IdxT>;
+using _NodeT      = SparseTreeNode<_DataT, _LabelT, _IdxT>;
+}  // namespace SPORFDT
+}  // namespace ML
+
+#include "sporf_builder_kernels_impl.cuh"

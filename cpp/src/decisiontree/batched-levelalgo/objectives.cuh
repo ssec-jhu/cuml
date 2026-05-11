@@ -84,13 +84,26 @@ class GiniObjectiveFunction {
 
   DI Split<DataT, IdxT> Gain(BinT* shist, DataT* squantiles, IdxT col, IdxT len, IdxT n_bins)
   {
-    Split<DataT, IdxT> sp;
+    IdxT iBefore = -1;
+    Split<DataT, IdxT> sp, before;
     for (IdxT i = threadIdx.x; i < n_bins; i += blockDim.x) {
       IdxT nLeft = 0;
       for (IdxT j = 0; j < nclasses; ++j) {
         nLeft += shist[n_bins * j + i].x;
       }
+      // if(col == 0 && i == 4) {
+      //   DataT gain = GainPerSplit(shist, i, n_bins, len, nLeft);
+      //   printf("Gain: bin=%d sp.col=%d col=%d\n      sp.nLeft=%d nLeft=%d\n      sp.nRight=%d nRight=%d\n      sp.best_metric_val=%f gain=%f\n\n",
+      //     i, sp.colid, col, sp.nLeft, nLeft, len - sp.nLeft, len - nLeft, sp.best_metric_val, gain);
+      // }
       sp.update({squantiles[i], col, GainPerSplit(shist, i, n_bins, len, nLeft), nLeft});
+
+      // if (col == 0 && sp.quesval != before.quesval) {
+      //   printf("Gain: bin %d -> %d\n      nLeft %d -> %d\n      nRight %d -> %d\n      quesval %f -> %f\n      gain %f -> %f\n\n",
+      //     iBefore, i, before.nLeft, nLeft, len - before.nLeft, len - sp.nLeft, before.quesval, sp.quesval, before.best_metric_val, sp.best_metric_val);
+      //   before = sp;
+      //   iBefore = i;
+      // }
     }
     return sp;
   }

@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+ /*** DOES THIS CHANGE PROPAGATE BACK TO THE GITHUB REPO? LET'S FIND OUT. ***/
+ /** THIS COMMENT WAS ADDED THROUGH THE GITHUB WEB UI. **/
+
 #include "randomforest.cuh"
 
 #include <cuml/common/logger.hpp>
-#include <cuml/ensemble/randomforest.hpp>
 #include <cuml/tree/flatnode.h>
 
 #include <raft/core/error.hpp>
@@ -352,7 +354,7 @@ void compare_trees(tl::Tree<T, L>& tree_from_concatenated_forest,
  * @param[in] labels: 1D array of target features (int only), with one label per
  *   training sample. Device pointer.
  *   Assumption: labels were preprocessed to map to ascending numbers from 0;
- *   needed for current gini impl. in decision tree
+ *   needed for current gini impl. in ecision tree
  * @param[in] n_unique_labels: #unique label values (known during preprocessing)
  * @param[in] rf_params: Random Forest training hyper parameter struct.
  * @param[in] verbosity: verbosity level for logging messages during execution

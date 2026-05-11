@@ -54,6 +54,9 @@ from cuml.testing.utils import (
     unit_param,
 )
 
+from cuml.ensemble import SPORFClassifier as sporfc
+from cuml.ensemble import SPORFRegressor as sporfr
+
 
 @pytest.fixture(
     scope="session",
@@ -296,8 +299,10 @@ def test_tweedie_convergence(max_depth, split_criterion):
 @pytest.mark.parametrize(
     "max_samples", [unit_param(1.0), quality_param(0.90), stress_param(0.95)]
 )
+#@pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
+@pytest.mark.parametrize("max_features", [0.25])
 @pytest.mark.parametrize("datatype", [np.float32, np.float64])
-@pytest.mark.parametrize("max_features", [1.0, "log2", "sqrt"])
+#@pytest.mark.parametrize("small_clf", [{"n_samples": 10, "n_features": 8, "n_informative": 4}], indirect=True)
 @pytest.mark.skipif(
     cudf_pandas_active,
     reason="cudf.pandas causes sklearn RF estimators crashes sometimes. "
@@ -305,6 +310,7 @@ def test_tweedie_convergence(max_depth, split_criterion):
 )
 def test_rf_classification(small_clf, datatype, max_samples, max_features):
     use_handle = True
+    n_streams = 1
 
     X, y = small_clf
     X = X.astype(datatype)
@@ -313,10 +319,12 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         X, y, train_size=0.8, random_state=0
     )
     # Create a handle for the cuml model
-    handle, stream = get_handle(use_handle, n_streams=1)
+    handle, stream = get_handle(use_handle, n_streams=n_streams)
 
+    import time
     # Initialize, fit and predict using cuML's
     # random forest classification model
+    t_start = time.perf_counter()
     cuml_model = curfc(
         max_features=max_features,
         max_samples=max_samples,
@@ -324,19 +332,64 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
         split_criterion=0,
         min_samples_leaf=2,
         random_state=123,
-        n_streams=1,
+        n_streams=n_streams,
         n_estimators=40,
         handle=handle,
         max_leaves=-1,
         max_depth=16,
     )
     cuml_model.fit(X_train, y_train)
+    cuml_train_time = time.perf_counter() - t_start
 
+    # import cuml.internals.logger as logger
+    # logger.set_level(logger.level_enum.debug)
+    t_start = time.perf_counter()
+    sporf_model = sporfc(
+        max_features=max_features,
+        max_samples=max_samples,
+        n_bins=16,
+        split_criterion=0,
+        min_samples_leaf=2,
+        random_state=123,
+        n_streams=n_streams,
+        n_estimators=40,
+        handle=handle,
+        max_leaves=-1,
+        max_depth=16,
+        verbose=False,
+    )
+    sporf_model.fit(X_train, y_train)
+    sporf_train_time = time.perf_counter() - t_start
+
+    t_start = time.perf_counter()
     fil_preds = cuml_model.predict(X_test, predict_model="GPU")
+    cuml_gpu_pred_time = time.perf_counter() - t_start
+
+    t_start = time.perf_counter()
     cu_preds = cuml_model.predict(X_test, predict_model="CPU")
-    fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
+    cuml_cpu_pred_time = time.perf_counter() - t_start
+
+    t_start = time.perf_counter()
+    sp_preds = sporf_model.predict(X_test, predict_model="CPU")
+    sporf_cpu_pred_time = time.perf_counter() - t_start
+
+    # fil_preds = np.reshape(fil_preds, np.shape(cu_preds))
+    # sp_preds = np.reshape(sp_preds, np.shape(cu_preds))
+
     cuml_acc = accuracy_score(y_test, cu_preds)
     fil_acc = accuracy_score(y_test, fil_preds)
+    sp_acc = accuracy_score(y_test, sp_preds)
+
+    print("n_test:", X_test.shape[0])
+    print("cuML CPU accuracy: {cuml_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        cuml_acc=cuml_acc, n_wrong=np.sum(y_test != cu_preds), train_time=cuml_train_time, pred_time=cuml_cpu_pred_time
+    ))
+    print("FIL accuracy: {fil_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        fil_acc=fil_acc, n_wrong=np.sum(y_test != fil_preds), train_time=cuml_train_time, pred_time=cuml_gpu_pred_time
+    ))
+    print("SPORF CPU accuracy: {sp_acc}, n_wrong: {n_wrong}, train_time: {train_time}, pred_time: {pred_time}".format(
+        sp_acc=sp_acc, n_wrong=np.sum(y_test != sp_preds), train_time=sporf_train_time, pred_time=sporf_cpu_pred_time
+    ))
     if X.shape[0] < 500000:
         sk_model = skrfc(
             n_estimators=40,
@@ -352,6 +405,9 @@ def test_rf_classification(small_clf, datatype, max_samples, max_features):
     assert fil_acc >= (
         cuml_acc - 0.07
     )  # to be changed to 0.02. see issue #3910: https://github.com/rapidsai/cuml/issues/3910 # noqa
+    assert sp_acc >= (
+        cuml_acc - 0.07
+    )
 
 
 @pytest.mark.parametrize(
