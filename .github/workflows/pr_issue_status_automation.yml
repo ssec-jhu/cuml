@@ -10,7 +10,8 @@ jobs:
     get-project-id:
       uses: rapidsai/shared-workflows/.github/workflows/project-get-item-id.yaml@branch-25.10
       if: github.event.pull_request.state == 'open'
-      secrets: inherit
+      secrets:
+        ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
       permissions:
         contents: read
       with:
@@ -22,6 +23,8 @@ jobs:
       uses: rapidsai/shared-workflows/.github/workflows/project-get-set-single-select-field.yaml@branch-25.10
       if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
       needs: get-project-id
+      secrets:
+        ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
       with:
         PROJECT_ID: "PVT_kwDOAp2shc4AA8lR"
         SINGLE_SELECT_FIELD_ID: "PVTSSF_lADOAp2shc4AA8lRzgAftsM"
@@ -31,7 +34,6 @@ jobs:
         ITEM_NODE_ID: "${{ github.event.pull_request.node_id }}"
         UPDATE_ITEM: true
         UPDATE_LINKED_ISSUES: true
-      secrets: inherit
 
     process-branch-name:
       if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
@@ -52,6 +54,8 @@ jobs:
       uses: rapidsai/shared-workflows/.github/workflows/project-get-set-single-select-field.yaml@branch-25.10
       if: ${{ github.event.pull_request.state == 'open' && needs.get-project-id.outputs.ITEM_PROJECT_ID != '' }}
       needs: [get-project-id, process-branch-name]
+      secrets:
+        ADD_TO_PROJECT_GITHUB_TOKEN: ${{ secrets.ADD_TO_PROJECT_GITHUB_TOKEN }}
       with:
         PROJECT_ID: "PVT_kwDOAp2shc4AA8lR"
         SINGLE_SELECT_FIELD_ID: "PVTSSF_lADOAp2shc4AA8lRzgFqH3Y"
@@ -61,4 +65,3 @@ jobs:
         ITEM_NODE_ID: "${{ github.event.pull_request.node_id }}"
         UPDATE_ITEM: true
         UPDATE_LINKED_ISSUES: true
-      secrets: inherit
