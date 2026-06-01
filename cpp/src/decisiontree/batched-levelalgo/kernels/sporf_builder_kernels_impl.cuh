@@ -234,7 +234,6 @@ static __global__ void computeSplitKernel(BinT* histograms,
                                           const IdxT* quantile_indices,
                                           const NodeWorkItem* work_items,
                                           IdxT colStart,
-                                          const IdxT* colids,
                                           int* done_count,
                                           int* mutex,
                                           volatile DT::Split<DataT, IdxT>* splits,
@@ -262,13 +261,7 @@ static __global__ void computeSplitKernel(BinT* histograms,
   IdxT num_blocks     = workload_info_cta.num_blocks;
 
   // obtaining the feature to test split on
-  IdxT colIndex = colStart + blockIdx.y;
-  IdxT col;
-  if (dataset.n_sampled_cols == dataset.N) {
-    col = colIndex;
-  } else {
-    col           = colids[nid * dataset.n_sampled_cols + colIndex];
-  }
+  IdxT col = colStart + blockIdx.y;
   std::size_t col_offset = std::size_t(col) * dataset.n_sampled_rows;
   // IdxT PRINTCOL = 0;
 
@@ -283,12 +276,13 @@ static __global__ void computeSplitKernel(BinT* histograms,
   auto* shared_done         = DT::alignPointer<int>(shared_quantiles + n_bins);
   IdxT stride               = blockDim.x * num_blocks;
   IdxT tid                  = threadIdx.x + offset_blockid * blockDim.x;
+  IdxT quantile_offset      = (nid * dataset.n_sampled_cols + col) * max_n_bins;
 
   // populating shared memory with initial values
   for (IdxT i = threadIdx.x; i < shared_histogram_len; i += blockDim.x)
     shared_histogram[i] = BinT();
   for (IdxT b = threadIdx.x; b < n_bins; b += blockDim.x) {
-    IdxT quantile_index = quantile_indices[(nid * dataset.n_sampled_cols + colIndex) * max_n_bins + b];
+    IdxT quantile_index = quantile_indices[quantile_offset + b];
     if (quantile_index < 0) { quantile_index = 0; }
     if (quantile_index >= range_len) { quantile_index = range_len - 1; }
     // IdxT pos = range_start + quantile_index;
@@ -408,7 +402,6 @@ void launchComputeSplitKernel(BinT* histograms,
                               // const DT::Quantiles<DataT, IdxT>& quantiles,
                               const NodeWorkItem* work_items,
                               IdxT colStart,
-                              const IdxT* colids,
                               int* done_count,
                               int* mutex,
                               volatile DT::Split<DataT, IdxT>* splits,
@@ -431,7 +424,6 @@ void launchComputeSplitKernel(BinT* histograms,
                                                        quantile_indices,
                                                        work_items,
                                                        colStart,
-                                                       colids,
                                                        done_count,
                                                        mutex,
                                                        splits,
@@ -475,7 +467,6 @@ template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEM
   const _IdxT* quantile_indices,
   const NodeWorkItem* work_items,
   _IdxT colStart,
-  const _IdxT* colids,
   int* done_count,
   int* mutex,
   volatile DT::Split<_DataT, _IdxT>* splits,

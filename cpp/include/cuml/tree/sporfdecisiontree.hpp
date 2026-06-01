@@ -131,63 +131,6 @@ struct ObliqueTreeMetaDataNode {
   std::vector<T> projection_coeffs_storage;
 };
 
-template <typename DataT, typename IdxT = int>
-void clone_column_to_column_vector(const OwnedProjectionMatrix<DataT, IdxT>& src,
-                                   int src_col_id,
-                                   OwnedProjectionMatrix<DataT, IdxT>& dst) {
-  if (src_col_id < 0 || src_col_id + 1 >= static_cast<int>(src.indptr.size())) {
-    throw std::runtime_error("clone_column_to_column_vector: source column index out of range");
-  }
-
-  IdxT col_ptrs[2]{0, 0};
-  raft::update_host(col_ptrs, src.indptr.data() + src_col_id, std::size_t(2), dst.stream);
-  if (cudaStreamSynchronize(dst.stream) != cudaSuccess) {
-    throw std::runtime_error("clone_column_to_column_vector: failed to synchronize stream");
-  }
-
-  IdxT start = col_ptrs[0];
-  IdxT end = col_ptrs[1];
-  IdxT n_nonzero = end - start;
-  if (n_nonzero < 0) { throw std::runtime_error("clone_column_to_column_vector: invalid CSC indptr"); }
-
-  dst.indptr = rmm::device_uvector<IdxT>(2, dst.stream);
-  dst.indices = rmm::device_uvector<IdxT>(n_nonzero, dst.stream);
-  dst.coeffs = rmm::device_uvector<DataT>(n_nonzero, dst.stream);
-
-  IdxT dst_col_ptrs[2]{0, n_nonzero};
-  raft::update_device(dst.indptr.data(), dst_col_ptrs, std::size_t(2), dst.stream);
-
-  if (n_nonzero > 0) {
-    raft::copy(dst.indices.data(), src.indices.data() + start, n_nonzero, dst.stream);
-    raft::copy(dst.coeffs.data(), src.coeffs.data() + start, n_nonzero, dst.stream);
-  }
-}
-
-template <typename DataT, typename IdxT = int>
-void copy_projection_matrix_to_owned(const ProjectionMatrix<DataT, IdxT>& src,
-                                     OwnedProjectionMatrix<DataT, IdxT>& dst) {
-  auto n_proj_components = src.n_proj_components;
-  auto indptr_len = static_cast<size_t>(n_proj_components + 1);
-  std::vector<IdxT> h_indptr(indptr_len, 0);
-  if (indptr_len > 0) {
-    raft::update_host(h_indptr.data(), src.d_proj_indptr, indptr_len, dst.stream);
-    if (cudaStreamSynchronize(dst.stream) != cudaSuccess) {
-      throw std::runtime_error("copy_projection_matrix_to_owned: failed to synchronize stream");
-    }
-  }
-  auto nnz = indptr_len > 0 ? static_cast<size_t>(h_indptr.back()) : 0;
-
-  dst.indptr = rmm::device_uvector<IdxT>(indptr_len, dst.stream);
-  dst.indices = rmm::device_uvector<IdxT>(nnz, dst.stream);
-  dst.coeffs = rmm::device_uvector<DataT>(nnz, dst.stream);
-
-  if (indptr_len > 0) { raft::copy(dst.indptr.data(), src.d_proj_indptr, indptr_len, dst.stream); }
-  if (nnz > 0) {
-    raft::copy(dst.indices.data(), src.d_proj_indices, nnz, dst.stream);
-    raft::copy(dst.coeffs.data(), src.d_proj_coeffs, nnz, dst.stream);
-  }
-}
-
 /***
  * TODO: maybe define alternate implementations for the following (defined in decisiontree.hpp):
  *        set_tree_params

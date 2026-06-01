@@ -1195,24 +1195,6 @@ PersistWinningTreeProjectionTimings persist_winning_tree_projection_vectors(
   cudaStream_t stream
 );
 
-template <typename DataT, typename LabelT, typename IdxT, int TPB>
-DI void partition_samples2(
-  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  NodeWorkItemChunk<IdxT>* d_chunks,
-  BlockTask<IdxT>* d_block_tasks,
-  IdxT n_block_tasks,
-  char* smem
-);
-
-template <typename DataT, typename LabelT, typename IdxT, int TPB>
-void launch_partition_samples2(
-  const DT::Dataset<DataT, LabelT, IdxT>& dataset,
-  NodeWorkItemChunk<IdxT>* d_chunks,
-  IdxT n_chunks,
-  BlockTask<IdxT>* d_block_tasks,
-  IdxT n_block_tasks,
-  cudaStream_t stream
-);
 // Class specializations
 /*template tl::Tree<float, float> build_treelite_tree<float, int>(
   const DT::TreeMetaDataNode<float, int>& rf_tree, unsigned int num_class);

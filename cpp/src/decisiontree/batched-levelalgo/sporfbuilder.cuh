@@ -388,8 +388,6 @@ struct SPORFBuilder {
   int n_blks_for_cols = 10;
   /** Memory alignment value */
   const size_t align_value = 512;
-  IdxT* d_colids;
-  IdxT* h_colids;
   /** rmm device workspace buffer */
   rmm::device_uvector<char> d_buff;
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws;
@@ -564,13 +562,11 @@ struct SPORFBuilder {
     d_wsize += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);           // d_work_Items
     d_wsize +=                                                                    // workload_info
       calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-    d_wsize += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);  // colids
 
     // all nodes in the tree
     h_wsize +=  // h_workload_info
       calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
-    h_wsize += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);  // colids
 
 
 
@@ -611,8 +607,6 @@ struct SPORFBuilder {
     d_wspace += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);
     workload_info = reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(d_wspace);
     d_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-    d_colids = reinterpret_cast<IdxT*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);
 
     RAFT_CUDA_TRY(
       cudaMemsetAsync(done_count, 0, sizeof(int) * max_batch * n_col_blks, builder_stream));
@@ -623,8 +617,6 @@ struct SPORFBuilder {
     h_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
     h_splits = reinterpret_cast<SplitT*>(h_wspace);
     h_wspace += calculateAlignedBytes(sizeof(SplitT) * max_batch);
-    h_colids = reinterpret_cast<IdxT*>(h_wspace);
-    h_wspace += calculateAlignedBytes(sizeof(IdxT) * max_batch * dataset.n_sampled_cols);
   }
 
   /**
@@ -829,11 +821,6 @@ struct SPORFBuilder {
     auto t_cpu = std::chrono::steady_clock::now();
     auto [n_blocks_dimx, n_large_nodes] = this->updateWorkloadInfo(work_items);
 
-    for(IdxT i = 0; i < params.max_batch_size; i++ ) {
-      for( IdxT c = 0; c < dataset.n_sampled_cols; c++ ) {
-        h_colids[i * dataset.n_sampled_cols + c] = c;
-      }
-    }
     stats.t_workload_info_cpu +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu).count();
 
@@ -901,7 +888,6 @@ struct SPORFBuilder {
     // get the current set of nodes to be worked upon
     raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
     raft::update_device(workload_info, h_workload_info, n_blocks_dimx, builder_stream);
-    raft::update_device(d_colids, h_colids, work_items.size() * dataset.n_sampled_cols, builder_stream);
     if (!work_items.empty()) {
       raft::update_device(projection_ws.pointers.projection.d_work_items,
                           work_items.data(),
@@ -1169,7 +1155,6 @@ struct SPORFBuilder {
                                                                     d_quantile_indices.data(),
                                                                     d_work_items,
                                                                     col,
-                                                                    d_colids,
                                                                     done_count,
                                                                     mutex,
                                                                     splits,
