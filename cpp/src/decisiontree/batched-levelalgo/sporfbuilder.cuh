@@ -582,6 +582,7 @@ struct SPORFBuilder {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_push).count();
     }
     auto tree = queue.GetTree();
+    tree->treeid = treeid;
 
     {
       auto t_tree_projection_finalize = std::chrono::steady_clock::now();
@@ -756,8 +757,12 @@ struct SPORFBuilder {
     projection_ws.meta.generation_n_features = dataset.N;
     projection_ws.meta.generation_min_samples_split = static_cast<IdxT>(params.min_samples_split);
     projection_ws.meta.generation_density = static_cast<DataT>(params.density);
+    auto generation_random_state = fnv1a32_basis;
+    generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed));
+    generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed >> 32));
+    generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(treeid));
     projection_ws.meta.generation_random_state =
-      static_cast<int>((seed + static_cast<uint64_t>(treeid)) & 0x7fffffffULL);
+      static_cast<int>(generation_random_state & 0x7fffffffU);
     projection_ws.pointers.d_input_col_major = dataset.data;
     projection_ws.pointers.d_row_ids = dataset.row_ids;
     projection_ws.ensure_generation_metadata_capacity(projection_ws.meta.n_generation_chunks,
@@ -947,10 +952,7 @@ struct SPORFBuilder {
       RAFT_CUDA_TRY(cudaEventCreate(&ev_kernel_stop));
       RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream));
     }
-    SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.max_depth,
-                                                                     params.min_samples_leaf,
-                                                                     params.min_samples_split,
-                                                                     params.max_leaves,
+    SPORFDT::launchNodeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(params.min_samples_leaf,
                                                                      params.min_impurity_decrease,
                                                                      dataset_proj,
                                                                      d_work_items,
@@ -1054,10 +1056,8 @@ struct SPORFBuilder {
     raft::common::nvtx::range kernel_scope("computeSplitKernel @sporfbuilder.cuh [batched-levelalgo]");
     launchComputeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT, ITEMS_PER_THREAD>(histograms,
                                                                     params.max_n_bins,
-                                                                    params.max_depth,
                                                                     params.min_samples_split,
                                                                     params.min_samples_leaf,
-                                                                    params.max_leaves,
                                                                     dataset,
                                                                     projection_ws.d_quantile_indices_storage.data(),
                                                                     d_work_items,
@@ -1066,9 +1066,7 @@ struct SPORFBuilder {
                                                                     mutex,
                                                                     splits,
                                                                     objective,
-                                                                    treeid,
                                                                     workload_info,
-                                                                    seed,
                                                                     grid,
                                                                     smem_size,
                                                                     builder_stream);

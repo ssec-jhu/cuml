@@ -99,10 +99,7 @@ DI void partitionSamples(const DT::Dataset<DataT, LabelT, IdxT>& dataset,
   }
 }
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
-static __global__ void nodeSplitKernel(const IdxT max_depth,
-                                       const IdxT min_samples_leaf,
-                                       const IdxT min_samples_split,
-                                       const IdxT max_leaves,
+static __global__ void nodeSplitKernel(const IdxT min_samples_leaf,
                                        const DataT min_impurity_decrease,
                                        const DT::Dataset<DataT, LabelT, IdxT> dataset,
                                        const NodeWorkItem* work_items,
@@ -119,10 +116,7 @@ static __global__ void nodeSplitKernel(const IdxT max_depth,
 }
 
 template <typename DataT, typename LabelT, typename IdxT, int TPB>
-void launchNodeSplitKernel(const IdxT max_depth,
-                           const IdxT min_samples_leaf,
-                           const IdxT min_samples_split,
-                           const IdxT max_leaves,
+void launchNodeSplitKernel(const IdxT min_samples_leaf,
                            const DataT min_impurity_decrease,
                            const DT::Dataset<DataT, LabelT, IdxT>& dataset,
                            const NodeWorkItem* work_items,
@@ -132,10 +126,7 @@ void launchNodeSplitKernel(const IdxT max_depth,
 {
   auto constexpr smem_size = 2 * sizeof(IdxT) * TPB;
   nodeSplitKernel<DataT, LabelT, IdxT, TPB>
-    <<<work_items_size, TPB, smem_size, builder_stream>>>(max_depth,
-                                                          min_samples_leaf,
-                                                          min_samples_split,
-                                                          max_leaves,
+    <<<work_items_size, TPB, smem_size, builder_stream>>>(min_samples_leaf,
                                                           min_impurity_decrease,
                                                           dataset,
                                                           work_items,
@@ -226,10 +217,8 @@ template <typename DataT,
           typename BinT>
 static __global__ void computeSplitKernel(BinT* histograms,
                                           IdxT max_n_bins,
-                                          IdxT max_depth, // remove?
                                           IdxT min_samples_split,
                                           IdxT min_samples_leaf,
-                                          IdxT max_leaves, // remove?
                                           const DT::Dataset<DataT, LabelT, IdxT> dataset,
                                           const IdxT* quantile_indices,
                                           const NodeWorkItem* work_items,
@@ -238,9 +227,7 @@ static __global__ void computeSplitKernel(BinT* histograms,
                                           int* mutex,
                                           volatile DT::Split<DataT, IdxT>* splits,
                                           ObjectiveT objective,
-                                          IdxT treeid,
-                                          const WorkloadInfo<IdxT>* workload_info,
-                                          uint64_t seed)
+                                          const WorkloadInfo<IdxT>* workload_info)
 {
   // dynamic shared memory
   extern __shared__ char smem[];
@@ -393,10 +380,8 @@ template <typename DataT,
           typename BinT>
 void launchComputeSplitKernel(BinT* histograms,
                               IdxT max_n_bins,
-                              IdxT max_depth,
                               IdxT min_samples_split,
                               IdxT min_samples_leaf,
-                              IdxT max_leaves,
                               const DT::Dataset<DataT, LabelT, IdxT>& dataset,
                               const IdxT* quantile_indices,
                               // const DT::Quantiles<DataT, IdxT>& quantiles,
@@ -406,9 +391,7 @@ void launchComputeSplitKernel(BinT* histograms,
                               int* mutex,
                               volatile DT::Split<DataT, IdxT>* splits,
                               ObjectiveT& objective,
-                              IdxT treeid,
                               const WorkloadInfo<IdxT>* workload_info,
-                              uint64_t seed,
                               dim3 grid,
                               size_t smem_size,
                               cudaStream_t builder_stream)
@@ -416,10 +399,8 @@ void launchComputeSplitKernel(BinT* histograms,
   computeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT, IPT>
     <<<grid, TPB_DEFAULT, smem_size, builder_stream>>>(histograms,
                                                        max_n_bins,
-                                                       max_depth,
                                                        min_samples_split,
                                                        min_samples_leaf,
-                                                       max_leaves,
                                                        dataset,
                                                        quantile_indices,
                                                        work_items,
@@ -428,17 +409,12 @@ void launchComputeSplitKernel(BinT* histograms,
                                                        mutex,
                                                        splits,
                                                        objective,
-                                                       treeid,
-                                                       workload_info,
-                                                       seed);
+                                                       workload_info);
 }
 
 #ifndef ML_SPORF_BUILDER_SKIP_EXPLICIT_INSTANTIATIONS
 template void launchNodeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT>(
-  const _IdxT max_depth,
   const _IdxT min_samples_leaf,
-  const _IdxT min_samples_split,
-  const _IdxT max_leaves,
   const _DataT min_impurity_decrease,
   const DT::Dataset<_DataT, _LabelT, _IdxT>& dataset,
   const NodeWorkItem* work_items,
@@ -459,10 +435,8 @@ template void launchLeafKernel<_DatasetT, _NodeT, _ObjectiveT, _DataT>(
 template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEMS_PER_THREAD, _ObjectiveT, _BinT>(
   _BinT* histograms,
   _IdxT max_n_bins,
-  _IdxT max_depth,
   _IdxT min_samples_split,
   _IdxT min_samples_leaf,
-  _IdxT max_leaves,
   const DT::Dataset<_DataT, _LabelT, _IdxT>& dataset,
   const _IdxT* quantile_indices,
   const NodeWorkItem* work_items,
@@ -471,9 +445,7 @@ template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEM
   int* mutex,
   volatile DT::Split<_DataT, _IdxT>* splits,
   _ObjectiveT& objective,
-  _IdxT treeid,
   const WorkloadInfo<_IdxT>* workload_info,
-  uint64_t seed,
   dim3 grid,
   size_t smem_size,
   cudaStream_t builder_stream);
