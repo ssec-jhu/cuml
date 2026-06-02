@@ -27,6 +27,7 @@
 #include <cublas_v2.h>
 
 #include <cuml/common/logger.hpp>
+#include <cuml/common/pinned_host_vector.hpp>
 #include <cuml/tree/flatnode.h>
 #include <cuml/tree/sporfdecisiontree.hpp>
 
@@ -345,6 +346,16 @@ struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<IdxT> d_sparse_sampling_candidate_indices_storage;
   rmm::device_uvector<IdxT> d_sparse_sampling_unique_indices_storage;
   rmm::device_uvector<IdxT> d_sparse_sampling_unique_counts_storage;
+  rmm::device_uvector<char> d_histogram_storage;
+  rmm::device_uvector<DataT> d_training_projection_values_storage;
+  rmm::device_uvector<IdxT> d_quantile_indices_storage;
+  rmm::device_uvector<IdxT> d_split_n_nodes_storage;
+  rmm::device_uvector<int> d_split_done_count_storage;
+  rmm::device_uvector<int> d_split_mutex_storage;
+  rmm::device_uvector<Split<DataT, IdxT>> d_split_storage;
+  rmm::device_uvector<SPORFDT::WorkloadInfo<IdxT>> d_workload_info_storage;
+  ML::pinned_host_vector<char> h_workload_info_storage;
+  ML::pinned_host_vector<char> h_split_storage;
   TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT> pointers{};
   TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT> meta{};
   SparseSamplingGenerationMeta<DataT, LabelT, IdxT> sparse_sampling_meta{};
@@ -361,6 +372,14 @@ struct SPORFTrainingProjectionWorkspace {
   std::size_t peak_sparse_sampling_component_count = 0;
   std::size_t peak_sparse_sampling_candidate_count = 0;
   std::size_t peak_sparse_sampling_unique_count = 0;
+  std::size_t peak_histogram_bytes = 0;
+  std::size_t peak_training_projection_values_len = 0;
+  std::size_t peak_quantile_indices_len = 0;
+  std::size_t peak_split_scratch_batch_size = 0;
+  std::size_t peak_split_scratch_done_count_len = 0;
+  std::size_t peak_workload_info_len = 0;
+  std::size_t peak_host_workload_info_len = 0;
+  std::size_t peak_host_split_len = 0;
 
   SPORFTrainingProjectionWorkspace(size_t n_rows_, size_t max_batch_size_, cudaStream_t stream)
     : d_workspace(0, stream),
@@ -382,7 +401,17 @@ struct SPORFTrainingProjectionWorkspace {
       d_sparse_sampling_component_offsets_storage(0, stream),
       d_sparse_sampling_candidate_indices_storage(0, stream),
       d_sparse_sampling_unique_indices_storage(0, stream),
-      d_sparse_sampling_unique_counts_storage(0, stream)
+      d_sparse_sampling_unique_counts_storage(0, stream),
+      d_histogram_storage(0, stream),
+      d_training_projection_values_storage(0, stream),
+      d_quantile_indices_storage(0, stream),
+      d_split_n_nodes_storage(0, stream),
+      d_split_done_count_storage(0, stream),
+      d_split_mutex_storage(0, stream),
+      d_split_storage(0, stream),
+      d_workload_info_storage(0, stream),
+      h_workload_info_storage(0),
+      h_split_storage(0)
   {
     auto align_bytes = [](size_t actual_size) {
       constexpr size_t align = 256;
@@ -480,6 +509,76 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.sparse_sampling.d_candidate_indices = nullptr;
     pointers.sparse_sampling.d_unique_indices = nullptr;
     pointers.sparse_sampling.d_unique_counts = nullptr;
+  }
+
+  void ensure_histogram_storage(size_t required_bytes, cudaStream_t stream)
+  {
+    auto align_bytes = [](size_t actual_size) {
+      constexpr size_t align = 256;
+      return raft::alignTo(actual_size, align);
+    };
+    required_bytes = align_bytes(required_bytes);
+    peak_histogram_bytes = std::max(peak_histogram_bytes, required_bytes);
+    if (d_histogram_storage.size() < required_bytes) {
+      d_histogram_storage.resize(required_bytes, stream);
+    }
+  }
+
+  void ensure_training_projection_values_storage(size_t required_len, cudaStream_t stream)
+  {
+    peak_training_projection_values_len =
+      std::max(peak_training_projection_values_len, required_len);
+    if (d_training_projection_values_storage.size() < required_len) {
+      d_training_projection_values_storage.resize(required_len, stream);
+    }
+    pointers.projection.d_trans = d_training_projection_values_storage.data();
+  }
+
+  void ensure_quantile_indices_storage(size_t required_len, cudaStream_t stream)
+  {
+    peak_quantile_indices_len = std::max(peak_quantile_indices_len, required_len);
+    if (d_quantile_indices_storage.size() < required_len) {
+      d_quantile_indices_storage.resize(required_len, stream);
+    }
+  }
+
+  void ensure_split_scratch_storage(size_t max_batch_size,
+                                    size_t n_col_blks,
+                                    size_t max_blocks_dimx,
+                                    cudaStream_t stream)
+  {
+    peak_split_scratch_batch_size =
+      std::max(peak_split_scratch_batch_size, max_batch_size);
+    peak_split_scratch_done_count_len =
+      std::max(peak_split_scratch_done_count_len, max_batch_size * n_col_blks);
+    peak_workload_info_len = std::max(peak_workload_info_len, max_blocks_dimx);
+
+    if (d_split_n_nodes_storage.size() < 1) { d_split_n_nodes_storage.resize(1, stream); }
+    if (d_split_done_count_storage.size() < max_batch_size * n_col_blks) {
+      d_split_done_count_storage.resize(max_batch_size * n_col_blks, stream);
+    }
+    if (d_split_mutex_storage.size() < max_batch_size) {
+      d_split_mutex_storage.resize(max_batch_size, stream);
+    }
+    if (d_split_storage.size() < max_batch_size) {
+      d_split_storage.resize(max_batch_size, stream);
+    }
+    if (d_workload_info_storage.size() < max_blocks_dimx) {
+      d_workload_info_storage.resize(max_blocks_dimx, stream);
+    }
+  }
+
+  void ensure_host_split_scratch_storage(size_t max_batch_size, size_t max_blocks_dimx)
+  {
+    size_t workload_info_bytes = max_blocks_dimx * sizeof(SPORFDT::WorkloadInfo<IdxT>);
+    size_t split_bytes = max_batch_size * sizeof(Split<DataT, IdxT>);
+    peak_host_workload_info_len =
+      std::max(peak_host_workload_info_len, workload_info_bytes);
+    peak_host_split_len = std::max(peak_host_split_len, split_bytes);
+    if (h_workload_info_storage.size() < workload_info_bytes) {
+      h_workload_info_storage.resize(workload_info_bytes);
+    }
+    if (h_split_storage.size() < split_bytes) { h_split_storage.resize(split_bytes); }
   }
 
   void reset(cudaStream_t stream)
@@ -918,6 +1017,8 @@ class SPORFDecisionTree {
     SPORFDeviceBatchingPolicy device_batching_policy = {})
   {
     auto t_tree_fit_wall_start = std::chrono::steady_clock::now();
+    ASSERT(params.histogram_method == HISTOGRAM_METHOD_SAMPLED,
+           "SPORF exact histogram method is not implemented. Use HISTOGRAM_METHOD_SAMPLED.");
     if (params.split_criterion ==
         CRITERION::CRITERION_END) {  // Set default to GINI (classification) or MSE (regression)
       CRITERION default_criterion =

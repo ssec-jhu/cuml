@@ -25,7 +25,6 @@
 
 #include <cublas_v2.h>
 
-#include <cuml/common/pinned_host_vector.hpp>
 #include <cuml/tree/decisiontree.hpp>
 #include <cuml/tree/sporfdecisiontree.hpp>
 #include <cuml/tree/flatnode.h>
@@ -386,15 +385,7 @@ struct SPORFBuilder {
   SplitT* h_splits;
   /** number of blocks used to parallelize column-wise computations */
   int n_blks_for_cols = 10;
-  /** Memory alignment value */
-  const size_t align_value = 512;
-  /** rmm device workspace buffer */
-  rmm::device_uvector<char> d_buff;
   SPORFTrainingProjectionWorkspace<DataT, LabelT, IdxT>& projection_ws;
-  /** pinned host buffer to store the trained nodes */
-  ML::pinned_host_vector<char> h_buff;
-  rmm::device_uvector<IdxT> d_quantile_indices;
-  rmm::device_uvector<DataT> d_trans;
   DT::SPORFDeviceBatchingPolicy device_batching_policy;
 
   struct Stats {
@@ -480,9 +471,6 @@ struct SPORFBuilder {
               n_classes
       },
       projection_ws(projection_ws_),
-      d_quantile_indices(0, builder_stream),
-      d_buff(0, builder_stream),
-      d_trans(0, builder_stream),
       device_batching_policy(device_batching_policy_),
       dataset_proj{
         0,
@@ -500,34 +488,33 @@ struct SPORFBuilder {
     ASSERT(TPB_DEFAULT * ITEMS_PER_THREAD >= params.max_n_bins,
       "max_n_bins must be <= 2048 for proper functioning of quantile sorting.");
 
-    size_t req_bytes     = size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * params.max_n_bins * sizeof(IdxT);
-    size_t aligned_bytes = calculateAlignedBytes(req_bytes);
-    size_t aligned_elems = aligned_bytes / sizeof(IdxT);
-    d_quantile_indices.resize(aligned_elems, builder_stream);
-
-    req_bytes     = size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols) * sizeof(DataT);
-    aligned_bytes = calculateAlignedBytes(req_bytes);
-    aligned_elems = aligned_bytes / sizeof(DataT);
-    d_trans.resize(aligned_elems, builder_stream);
-
     projection_ws.ensure_tree_projection_vector_capacity(this->maxNodes(), builder_stream);
     projection_ws.clear_tree_projection_state(builder_stream);
+    size_t max_len_histograms = size_t(params.max_batch_size) * size_t(params.max_n_bins) *
+                                size_t(n_blks_for_cols) * size_t(dataset.num_outputs);
+    projection_ws.ensure_histogram_storage(sizeof(BinT) * max_len_histograms, builder_stream);
+    projection_ws.ensure_training_projection_values_storage(
+      size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols), builder_stream);
+    projection_ws.ensure_quantile_indices_storage(
+      size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * size_t(params.max_n_bins),
+      builder_stream);
+    projection_ws.ensure_split_scratch_storage(size_t(params.max_batch_size),
+                                               size_t(n_blks_for_cols),
+                                               size_t(max_blocks_dimx),
+                                               builder_stream);
+    projection_ws.ensure_host_split_scratch_storage(size_t(params.max_batch_size),
+                                                    size_t(max_blocks_dimx));
 
-    auto [device_workspace_size, host_workspace_size] = workspaceSize();
-    d_buff.resize(device_workspace_size, builder_stream);
-    h_buff.resize(host_workspace_size);
-    assignWorkspace(d_buff.data(), h_buff.data());
-  }
-
-  /**
-   * @brief calculates nearest aligned size of input w.r.t an `align_value`.
-   *
-   * @param[in] actual_size actual size in bytes of input
-   * @return aligned size
-   */
-  size_t calculateAlignedBytes(const size_t actual_size) const
-  {
-    return raft::alignTo(actual_size, align_value);
+    n_nodes = projection_ws.d_split_n_nodes_storage.data();
+    histograms = reinterpret_cast<BinT*>(projection_ws.d_histogram_storage.data());
+    done_count = projection_ws.d_split_done_count_storage.data();
+    mutex = projection_ws.d_split_mutex_storage.data();
+    splits = projection_ws.d_split_storage.data();
+    d_work_items = projection_ws.pointers.projection.d_work_items;
+    workload_info = projection_ws.d_workload_info_storage.data();
+    h_workload_info =
+      reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(projection_ws.h_workload_info_storage.data());
+    h_splits = reinterpret_cast<SplitT*>(projection_ws.h_split_storage.data());
   }
 
   /**
@@ -539,84 +526,6 @@ struct SPORFBuilder {
     auto levels = static_cast<unsigned int>(params.max_depth + 1);
     if (levels >= sizeof(size_t) * 8) { return std::numeric_limits<size_t>::max(); }
     return (size_t{1} << levels) - 1;
-  }
-
-  /**
-   * @brief calculate the workspace size required
-   *
-   * @return a pair of device workspace and host workspace size requirements
-   */
-  auto workspaceSize() const
-  {
-    size_t d_wsize = 0, h_wsize = 0;
-    raft::common::nvtx::range fun_scope("SPORFBuilder::workspaceSize @sporfbuilder.cuh [batched-levelalgo]");
-    auto max_batch = params.max_batch_size;
-    size_t max_len_histograms =
-      max_batch * params.max_n_bins * n_blks_for_cols * dataset.num_outputs;
-
-    d_wsize += calculateAlignedBytes(sizeof(IdxT));                               // n_nodes
-    d_wsize += calculateAlignedBytes(sizeof(BinT) * max_len_histograms);          // histograms
-    d_wsize += calculateAlignedBytes(sizeof(int) * max_batch * n_blks_for_cols);  // done_count
-    d_wsize += calculateAlignedBytes(sizeof(int) * max_batch);                    // mutex
-    d_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);                 // splits
-    d_wsize += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);           // d_work_Items
-    d_wsize +=                                                                    // workload_info
-      calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-
-    // all nodes in the tree
-    h_wsize +=  // h_workload_info
-      calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-    h_wsize += calculateAlignedBytes(sizeof(SplitT) * max_batch);  // splits
-
-
-
-    //if( this->builder_stream == handle.get_stream_from_stream_pool(0) )
-  // printf( "SPORFBuilder::workspaceSize (%s line %d): d_wsize=%lu h_wsize=%lu\n", __FILE__, __LINE__, d_wsize, h_wsize );
-
-
-    return std::make_pair(d_wsize, h_wsize);
-  }
-
-  /**
-   * @brief assign workspace to the current state
-   *
-   * @param[in] d_wspace device buffer allocated by the user for the workspace.
-   *                     Its size should be at least workspaceSize()
-   * @param[in] h_wspace pinned host buffer needed to store the learned nodes
-   */
-  void assignWorkspace(char* d_wspace, char* h_wspace)
-  {
-    raft::common::nvtx::range fun_scope(
-      "SPORFBuilder::assignWorkspace @sporfbuilder.cuh [batched-levelalgo]");
-    auto max_batch  = params.max_batch_size;
-    auto n_col_blks = n_blks_for_cols;
-    size_t max_len_histograms =
-      max_batch * (params.max_n_bins) * n_blks_for_cols * dataset.num_outputs;
-    // device
-    n_nodes = reinterpret_cast<IdxT*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(IdxT));
-    histograms = reinterpret_cast<BinT*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(BinT) * max_len_histograms);
-    done_count = reinterpret_cast<int*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(int) * max_batch * n_col_blks);
-    mutex = reinterpret_cast<int*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(int) * max_batch);
-    splits = reinterpret_cast<SplitT*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(SplitT) * max_batch);
-    d_work_items = reinterpret_cast<SPORFDT::NodeWorkItem*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(SPORFDT::NodeWorkItem) * max_batch);
-    workload_info = reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-
-    RAFT_CUDA_TRY(
-      cudaMemsetAsync(done_count, 0, sizeof(int) * max_batch * n_col_blks, builder_stream));
-    RAFT_CUDA_TRY(cudaMemsetAsync(mutex, 0, sizeof(int) * max_batch, builder_stream));
-
-    // host
-    h_workload_info = reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(h_wspace);
-    h_wspace += calculateAlignedBytes(sizeof(SPORFDT::WorkloadInfo<IdxT>) * max_blocks_dimx);
-    h_splits = reinterpret_cast<SplitT*>(h_wspace);
-    h_wspace += calculateAlignedBytes(sizeof(SplitT) * max_batch);
   }
 
   /**
@@ -851,10 +760,12 @@ struct SPORFBuilder {
       static_cast<int>((seed + static_cast<uint64_t>(treeid)) & 0x7fffffffULL);
     projection_ws.pointers.d_input_col_major = dataset.data;
     projection_ws.pointers.d_row_ids = dataset.row_ids;
-    projection_ws.pointers.projection.d_trans = d_trans.data();
     projection_ws.ensure_generation_metadata_capacity(projection_ws.meta.n_generation_chunks,
                                                       projection_ws.meta.n_generation_block_tasks,
                                                       builder_stream);
+    projection_ws.ensure_training_projection_values_storage(
+      size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols), builder_stream);
+    d_work_items = projection_ws.pointers.projection.d_work_items;
     size_t dense_generation_len = static_cast<size_t>(work_items.size()) *
                                   static_cast<size_t>(std::max<IdxT>(1, dataset.n_sampled_cols)) *
                                   static_cast<size_t>(dataset.N);
@@ -886,14 +797,10 @@ struct SPORFBuilder {
 
     auto t_h2d = std::chrono::steady_clock::now();
     // get the current set of nodes to be worked upon
-    raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
-    raft::update_device(workload_info, h_workload_info, n_blocks_dimx, builder_stream);
     if (!work_items.empty()) {
-      raft::update_device(projection_ws.pointers.projection.d_work_items,
-                          work_items.data(),
-                          projection_ws.meta.projection.n_work_items,
-                          builder_stream);
+      raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
     }
+    raft::update_device(workload_info, h_workload_info, n_blocks_dimx, builder_stream);
     if (!projection_chunks.empty()) {
       raft::update_device(projection_ws.pointers.projection.d_chunks,
                           projection_chunks.data(),
@@ -960,7 +867,7 @@ struct SPORFBuilder {
     launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
       projection_ws.pointers,
       projection_ws.meta,
-      d_quantile_indices.data(),
+      projection_ws.d_quantile_indices_storage.data(),
       static_cast<IdxT>(params.max_n_bins),
       static_cast<IdxT>(params.min_samples_leaf),
       builder_stream);
@@ -974,7 +881,7 @@ struct SPORFBuilder {
       stats.t_quantile_sampling_kernel += static_cast<double>(stage_ms);
     }
 
-    dataset_proj.data = d_trans.data();
+    dataset_proj.data = projection_ws.pointers.projection.d_trans;
     t_kernel = std::chrono::steady_clock::now();
     if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream)); }
     // iterate through a batch of columns (to reduce the memory pressure) and
@@ -1119,7 +1026,7 @@ struct SPORFBuilder {
     // classes, features and (large)nodes.
     int len_histograms = n_bins * n_classes * n_blocks_dimy * n_large_nodes;
     auto max_len_histograms =
-      params.max_batch_size * params.max_n_bins * n_blks_for_cols * dataset.num_outputs;
+      projection_ws.d_histogram_storage.size() / sizeof(BinT);
     ASSERT(n_blocks_dimx <= static_cast<size_t>(max_blocks_dimx),
            "SPORF computeSplit workload_info overflow: n_blocks_dimx=%zu max_blocks_dimx=%d "
            "n_large_nodes=%zu",
@@ -1152,7 +1059,7 @@ struct SPORFBuilder {
                                                                     params.min_samples_leaf,
                                                                     params.max_leaves,
                                                                     dataset,
-                                                                    d_quantile_indices.data(),
+                                                                    projection_ws.d_quantile_indices_storage.data(),
                                                                     d_work_items,
                                                                     col,
                                                                     done_count,
