@@ -109,6 +109,8 @@ void validity_check(const SPORF_params rf_params)
   ASSERT((rf_params.max_samples > 0) && (rf_params.max_samples <= 1.0),
          "max_samples value %f outside permitted (0, 1] range",
          rf_params.max_samples);
+  ASSERT(rf_params.tree_params.histogram_method == DT::HISTOGRAM_METHOD_SAMPLED,
+         "SPORF exact histogram method is not implemented. Use HISTOGRAM_METHOD_SAMPLED.");
 }
 
 /*

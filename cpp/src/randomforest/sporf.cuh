@@ -307,10 +307,12 @@ class SPORF {
     auto fit_wall_ms = to_ms(clock_t::now() - t_fit_wall_start);
 
     std::size_t workspace_device_bytes_total = 0;
+    std::size_t workspace_host_bytes_total = 0;
     std::size_t selected_rows_device_bytes_total = 0;
     for (int i = 0; i < n_streams; ++i) {
       auto& ws = training_workspaces[i];
       std::size_t workspace_device_bytes = 0;
+      std::size_t workspace_host_bytes = 0;
       workspace_device_bytes += ws.d_workspace.size() * sizeof(char);
       workspace_device_bytes += ws.d_projection_matrices_storage.size() *
                                 sizeof(DT::ProjectionMatrix<T, int>);
@@ -333,7 +335,19 @@ class SPORF {
       workspace_device_bytes += ws.d_sparse_sampling_candidate_indices_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_sparse_sampling_unique_indices_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_sparse_sampling_unique_counts_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_histogram_storage.size() * sizeof(char);
+      workspace_device_bytes += ws.d_training_projection_values_storage.size() * sizeof(T);
+      workspace_device_bytes += ws.d_quantile_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_split_n_nodes_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_split_done_count_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_split_mutex_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_split_storage.size() * sizeof(DT::Split<T, int>);
+      workspace_device_bytes += ws.d_workload_info_storage.size() *
+                                sizeof(SPORFDT::WorkloadInfo<int>);
+      workspace_host_bytes += ws.h_workload_info_storage.size();
+      workspace_host_bytes += ws.h_split_storage.size();
       workspace_device_bytes_total += workspace_device_bytes;
+      workspace_host_bytes_total += workspace_host_bytes;
       auto selected_rows_device_bytes = selected_rows[i].size() * sizeof(int);
       selected_rows_device_bytes_total += selected_rows_device_bytes;
       auto pct = [](std::size_t used, std::size_t cap) {
@@ -343,6 +357,7 @@ class SPORF {
       if (ML::default_logger().should_log(rapids_logger::level_enum::debug)) {
         std::cout << "SPORF::fit workspace capacity: stream=" << i
                   << " device_bytes=" << workspace_device_bytes
+                  << " host_bytes=" << workspace_host_bytes
                   << " selected_rows_bytes=" << selected_rows_device_bytes
                   << " d_workspace_bytes=" << ws.d_workspace.size()
                   << " cap_work_items=" << ws.meta.projection.cap_work_items
@@ -449,12 +464,38 @@ class SPORF {
                   << " sparse_unique_indices=" << ws.d_sparse_sampling_unique_indices_storage.size()
                   << " peak_sparse_unique_count=" << ws.peak_sparse_sampling_unique_count
                   << " sparse_unique_counts=" << ws.d_sparse_sampling_unique_counts_storage.size()
+                  << " histogram_bytes=" << ws.d_histogram_storage.size()
+                  << " peak_histogram_bytes=" << ws.peak_histogram_bytes
+                  << " slack_histogram_bytes="
+                  << (ws.d_histogram_storage.size() > ws.peak_histogram_bytes
+                        ? ws.d_histogram_storage.size() - ws.peak_histogram_bytes
+                        : std::size_t{0})
+                  << " training_projection_values="
+                  << ws.d_training_projection_values_storage.size()
+                  << " peak_training_projection_values="
+                  << ws.peak_training_projection_values_len
+                  << " quantile_indices=" << ws.d_quantile_indices_storage.size()
+                  << " peak_quantile_indices=" << ws.peak_quantile_indices_len
+                  << " split_n_nodes=" << ws.d_split_n_nodes_storage.size()
+                  << " split_done_count=" << ws.d_split_done_count_storage.size()
+                  << " peak_split_done_count="
+                  << ws.peak_split_scratch_done_count_len
+                  << " split_mutex=" << ws.d_split_mutex_storage.size()
+                  << " split_storage=" << ws.d_split_storage.size()
+                  << " peak_split_batch=" << ws.peak_split_scratch_batch_size
+                  << " workload_info=" << ws.d_workload_info_storage.size()
+                  << " peak_workload_info=" << ws.peak_workload_info_len
+                  << " host_workload_info_bytes=" << ws.h_workload_info_storage.size()
+                  << " peak_host_workload_info_bytes=" << ws.peak_host_workload_info_len
+                  << " host_split_bytes=" << ws.h_split_storage.size()
+                  << " peak_host_split_bytes=" << ws.peak_host_split_len
                   << std::endl;
       }
     }
     if (ML::default_logger().should_log(rapids_logger::level_enum::debug)) {
       std::cout << "SPORF::fit workspace capacity total: streams=" << n_streams
                 << " workspace_device_bytes=" << workspace_device_bytes_total
+                << " workspace_host_bytes=" << workspace_host_bytes_total
                 << " selected_rows_device_bytes=" << selected_rows_device_bytes_total
                 << " retained_device_bytes="
                 << (workspace_device_bytes_total + selected_rows_device_bytes_total)

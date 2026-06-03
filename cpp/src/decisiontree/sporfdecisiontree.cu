@@ -27,17 +27,6 @@ void launch_batched_projection_kernel(const PredictWorkspacePointers<DataT, Labe
                                       cudaStream_t stream);
 
 template <typename DataT, typename LabelT, typename IdxT>
-__global__ void partition_kernel(const Dataset<DataT, LabelT, IdxT> dataset,
-                                 DataT split_quesval, IdxT split_colid, DataT split_best_metric_val,
-                                 const SPORFDT::NodeWorkItem work_item)
-{
-    Split<DataT, IdxT> split{
-      split_quesval, split_colid, split_best_metric_val, static_cast<IdxT>(work_item.nLeft)};
-    extern __shared__ char smem[];
-    SPORFDT::partitionSamples<DataT, LabelT, IdxT, TPB_DEFAULT>(dataset, split, work_item, smem);
-}
-
-template <typename DataT, typename LabelT, typename IdxT>
 __global__ void batched_partition_kernel(PredictWorkspacePointers<DataT, LabelT, IdxT> pointers,
                                          PredictWorkspaceMeta<DataT, LabelT, IdxT> meta)
 {
