@@ -2,11 +2,11 @@
 # Adapted from https://github.com/rapidsai/cuml/blob/main/.github/CODEOWNERS
 # Labels culled from https://github.com/rapidsai/cuml/labels
 
-Cython / Python:
+Cython-Python:
   - 'python/**'
   - 'notebooks/**'
 
-CUDA/C++:
+CUDA-C++:
   - 'cpp/**'
 
 CMake:
