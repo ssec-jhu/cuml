@@ -269,6 +269,10 @@ struct TrainingProjectionWorkspaceMeta {
   IdxT n_generation_block_tasks;
   IdxT generation_n_features;
   IdxT generation_min_samples_split;
+  IdxT generation_nnz_per_component;
+  IdxT generation_total_proj_components;
+  IdxT generation_projection_offset;
+  bool generation_fixed_capacity;
   DataT generation_density;
   int generation_random_state;
 };
@@ -305,12 +309,15 @@ struct TrainingProjectionWorkspacePointers {
   IdxT*                                d_tree_projection_winning_offsets;
   NodeWorkItemChunk<IdxT>*             d_generation_chunks;
   BlockTask<IdxT>*                     d_generation_block_tasks;
-  int*                                 d_generation_keep_mask;
-  DataT*                               d_generation_dense_values;
   int*                                 d_generation_indptr;
   int*                                 d_generation_indices;
   DataT*                               d_generation_sparse_data;
+  int*                                 d_generation_keep_mask;
+  DataT*                               d_generation_dense_values;
   int*                                 d_generation_nnz_counter;
+  int*                                 d_best_projection_indptr;
+  int*                                 d_best_projection_indices;
+  DataT*                               d_best_projection_sparse_data;
   SparseSamplingGenerationPointers<DataT, LabelT, IdxT> sparse_sampling;
 };
 
@@ -335,12 +342,15 @@ struct SPORFTrainingProjectionWorkspace {
   rmm::device_uvector<DataT> d_tree_projection_coeffs_storage;
   rmm::device_uvector<IdxT> d_tree_projection_winning_nnz_storage;
   rmm::device_uvector<IdxT> d_tree_projection_winning_offsets_storage;
-  rmm::device_uvector<int> d_generation_keep_mask_storage;
-  rmm::device_uvector<DataT> d_generation_dense_values_storage;
   rmm::device_uvector<int> d_generation_indptr_storage;
   rmm::device_uvector<int> d_generation_indices_storage;
   rmm::device_uvector<DataT> d_generation_sparse_data_storage;
+  rmm::device_uvector<int> d_generation_keep_mask_storage;
+  rmm::device_uvector<DataT> d_generation_dense_values_storage;
   rmm::device_uvector<int> d_generation_nnz_counter_storage;
+  rmm::device_uvector<int> d_best_projection_indptr_storage;
+  rmm::device_uvector<int> d_best_projection_indices_storage;
+  rmm::device_uvector<DataT> d_best_projection_sparse_data_storage;
   rmm::device_uvector<IdxT> d_sparse_sampling_component_counts_storage;
   rmm::device_uvector<IdxT> d_sparse_sampling_component_offsets_storage;
   rmm::device_uvector<IdxT> d_sparse_sampling_candidate_indices_storage;
@@ -364,8 +374,11 @@ struct SPORFTrainingProjectionWorkspace {
   std::size_t peak_projection_block_tasks = 0;
   std::size_t peak_generation_chunks = 0;
   std::size_t peak_generation_block_tasks = 0;
+  std::size_t peak_generation_sparse_len = 0;
   std::size_t peak_generation_dense_len = 0;
   std::size_t peak_generation_indptr_len = 0;
+  std::size_t peak_best_projection_sparse_len = 0;
+  std::size_t peak_best_projection_indptr_len = 0;
   std::size_t peak_tree_projection_vectors = 0;
   std::size_t peak_tree_projection_payload_nnz = 0;
   std::size_t peak_tree_projection_batch_work_items = 0;
@@ -391,12 +404,15 @@ struct SPORFTrainingProjectionWorkspace {
       d_tree_projection_coeffs_storage(0, stream),
       d_tree_projection_winning_nnz_storage(0, stream),
       d_tree_projection_winning_offsets_storage(0, stream),
-      d_generation_keep_mask_storage(0, stream),
-      d_generation_dense_values_storage(0, stream),
       d_generation_indptr_storage(0, stream),
       d_generation_indices_storage(0, stream),
       d_generation_sparse_data_storage(0, stream),
+      d_generation_keep_mask_storage(0, stream),
+      d_generation_dense_values_storage(0, stream),
       d_generation_nnz_counter_storage(0, stream),
+      d_best_projection_indptr_storage(0, stream),
+      d_best_projection_indices_storage(0, stream),
+      d_best_projection_sparse_data_storage(0, stream),
       d_sparse_sampling_component_counts_storage(0, stream),
       d_sparse_sampling_component_offsets_storage(0, stream),
       d_sparse_sampling_candidate_indices_storage(0, stream),
@@ -441,6 +457,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.n_generation_block_tasks = 0;
     meta.generation_n_features = 0;
     meta.generation_min_samples_split = 0;
+    meta.generation_nnz_per_component = 0;
+    meta.generation_total_proj_components = 0;
+    meta.generation_projection_offset = 0;
+    meta.generation_fixed_capacity = false;
     meta.generation_density = DataT(0);
     meta.generation_random_state = 0;
     sparse_sampling_meta.oversampling_factor = 0;
@@ -497,13 +517,15 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_tree_projection_coeffs_storage = nullptr;
     pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
     pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
-    d_generation_nnz_counter_storage.resize(1, stream);
-    pointers.d_generation_keep_mask = nullptr;
-    pointers.d_generation_dense_values = nullptr;
     pointers.d_generation_indptr = nullptr;
     pointers.d_generation_indices = nullptr;
     pointers.d_generation_sparse_data = nullptr;
-    pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
+    pointers.d_generation_keep_mask = nullptr;
+    pointers.d_generation_dense_values = nullptr;
+    pointers.d_generation_nnz_counter = nullptr;
+    pointers.d_best_projection_indptr = nullptr;
+    pointers.d_best_projection_indices = nullptr;
+    pointers.d_best_projection_sparse_data = nullptr;
     pointers.sparse_sampling.d_component_counts = nullptr;
     pointers.sparse_sampling.d_component_offsets = nullptr;
     pointers.sparse_sampling.d_candidate_indices = nullptr;
@@ -595,6 +617,10 @@ struct SPORFTrainingProjectionWorkspace {
     meta.n_generation_chunks = 0;
     meta.n_generation_block_tasks = 0;
     meta.generation_n_features = 0;
+    meta.generation_nnz_per_component = 0;
+    meta.generation_total_proj_components = 0;
+    meta.generation_projection_offset = 0;
+    meta.generation_fixed_capacity = false;
     meta.generation_density = DataT(0);
     meta.generation_random_state = 0;
     sparse_sampling_meta.oversampling_factor = 0;
@@ -615,7 +641,6 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_tree_projection_coeffs_storage = d_tree_projection_coeffs_storage.data();
     pointers.d_tree_projection_winning_nnz = d_tree_projection_winning_nnz_storage.data();
     pointers.d_tree_projection_winning_offsets = d_tree_projection_winning_offsets_storage.data();
-    if (d_generation_nnz_counter_storage.size() < 1) { d_generation_nnz_counter_storage.resize(1, stream); }
   }
 
   void ensure_tree_projection_vector_capacity(size_t n_tree_projection_vectors, cudaStream_t stream)
@@ -757,16 +782,32 @@ struct SPORFTrainingProjectionWorkspace {
       carve(static_cast<size_t>(meta.projection.cap_block_tasks) * sizeof(BlockTask<IdxT>)));
   }
 
-  void resize_generation_storage(size_t dense_len, size_t indptr_len, cudaStream_t stream)
+  void resize_generation_storage(size_t sparse_len, size_t indptr_len, cudaStream_t stream)
+  {
+    peak_generation_sparse_len = std::max(peak_generation_sparse_len, sparse_len);
+    peak_generation_indptr_len = std::max(peak_generation_indptr_len, indptr_len);
+    d_generation_indptr_storage.resize(indptr_len, stream);
+    d_generation_indices_storage.resize(sparse_len, stream);
+    d_generation_sparse_data_storage.resize(sparse_len, stream);
+
+    pointers.d_generation_indptr = d_generation_indptr_storage.data();
+    pointers.d_generation_indices = d_generation_indices_storage.data();
+    pointers.d_generation_sparse_data = d_generation_sparse_data_storage.data();
+  }
+
+  void resize_dense_generation_storage(size_t dense_len, size_t indptr_len, cudaStream_t stream)
   {
     peak_generation_dense_len = std::max(peak_generation_dense_len, dense_len);
+    peak_generation_sparse_len = std::max(peak_generation_sparse_len, dense_len);
     peak_generation_indptr_len = std::max(peak_generation_indptr_len, indptr_len);
     d_generation_keep_mask_storage.resize(dense_len, stream);
     d_generation_dense_values_storage.resize(dense_len, stream);
     d_generation_indptr_storage.resize(indptr_len, stream);
     d_generation_indices_storage.resize(dense_len, stream);
     d_generation_sparse_data_storage.resize(dense_len, stream);
-    if (d_generation_nnz_counter_storage.size() < 1) { d_generation_nnz_counter_storage.resize(1, stream); }
+    if (d_generation_nnz_counter_storage.size() < 1) {
+      d_generation_nnz_counter_storage.resize(1, stream);
+    }
 
     pointers.d_generation_keep_mask = d_generation_keep_mask_storage.data();
     pointers.d_generation_dense_values = d_generation_dense_values_storage.data();
@@ -774,6 +815,19 @@ struct SPORFTrainingProjectionWorkspace {
     pointers.d_generation_indices = d_generation_indices_storage.data();
     pointers.d_generation_sparse_data = d_generation_sparse_data_storage.data();
     pointers.d_generation_nnz_counter = d_generation_nnz_counter_storage.data();
+  }
+
+  void resize_best_projection_storage(size_t sparse_len, size_t indptr_len, cudaStream_t stream)
+  {
+    peak_best_projection_sparse_len = std::max(peak_best_projection_sparse_len, sparse_len);
+    peak_best_projection_indptr_len = std::max(peak_best_projection_indptr_len, indptr_len);
+    d_best_projection_indptr_storage.resize(indptr_len, stream);
+    d_best_projection_indices_storage.resize(sparse_len, stream);
+    d_best_projection_sparse_data_storage.resize(sparse_len, stream);
+
+    pointers.d_best_projection_indptr = d_best_projection_indptr_storage.data();
+    pointers.d_best_projection_indices = d_best_projection_indices_storage.data();
+    pointers.d_best_projection_sparse_data = d_best_projection_sparse_data_storage.data();
   }
 
   void resize_sparse_sampling_storage(size_t component_count,
@@ -1265,7 +1319,13 @@ void launch_batched_training_projection_kernel(
 );
 
 template <typename DataT, typename LabelT, typename IdxT>
-void launch_batched_training_random_matrix_bernoulli_kernel(
+void launch_batched_training_random_matrix_sparse_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream
+);
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_random_matrix_dense_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream
@@ -1277,6 +1337,22 @@ void launch_batched_training_quantile_sampling_kernel(
   IdxT* d_quantile_indices,
   IdxT max_n_bins,
   IdxT min_samples_leaf,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_capture_best_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  const Split<DataT, IdxT>* d_splits,
+  cudaStream_t stream
+);
+
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_restore_best_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  Split<DataT, IdxT>* d_splits,
   cudaStream_t stream
 );
 

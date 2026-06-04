@@ -59,7 +59,12 @@ void launch_batched_training_projection_kernel(
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream);
 template <typename DataT, typename LabelT, typename IdxT>
-void launch_batched_training_random_matrix_bernoulli_kernel(
+void launch_batched_training_random_matrix_sparse_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_batched_training_random_matrix_dense_kernel(
   const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
   const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
   cudaStream_t stream);
@@ -70,6 +75,18 @@ void launch_batched_training_quantile_sampling_kernel(
   IdxT* d_quantile_indices,
   IdxT max_n_bins,
   IdxT min_samples_leaf,
+  cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_capture_best_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  const Split<DataT, IdxT>* d_splits,
+  cudaStream_t stream);
+template <typename DataT, typename LabelT, typename IdxT>
+void launch_restore_best_training_projection_kernel(
+  const TrainingProjectionWorkspacePointers<DataT, LabelT, IdxT>& pointers,
+  const TrainingProjectionWorkspaceMeta<DataT, LabelT, IdxT>& meta,
+  Split<DataT, IdxT>* d_splits,
   cudaStream_t stream);
 template <typename DataT, typename LabelT, typename IdxT>
 void launch_store_winning_tree_projection_vectors_kernel(
@@ -493,10 +510,11 @@ struct SPORFBuilder {
     size_t max_len_histograms = size_t(params.max_batch_size) * size_t(params.max_n_bins) *
                                 size_t(n_blks_for_cols) * size_t(dataset.num_outputs);
     projection_ws.ensure_histogram_storage(sizeof(BinT) * max_len_histograms, builder_stream);
+    constexpr IdxT projection_tile_size = IdxT{4};
     projection_ws.ensure_training_projection_values_storage(
-      size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols), builder_stream);
+      size_t(dataset.n_sampled_rows) * size_t(projection_tile_size), builder_stream);
     projection_ws.ensure_quantile_indices_storage(
-      size_t(params.max_batch_size) * size_t(dataset.n_sampled_cols) * size_t(params.max_n_bins),
+      size_t(params.max_batch_size) * size_t(projection_tile_size) * size_t(params.max_n_bins),
       builder_stream);
     projection_ws.ensure_split_scratch_storage(size_t(params.max_batch_size),
                                                size_t(n_blks_for_cols),
@@ -750,13 +768,20 @@ struct SPORFBuilder {
       std::max(projection_ws.peak_projection_block_tasks, projection_block_tasks.size());
     // In the SPORF builder, `n_sampled_cols` is reused as the random-projection
     // output dimensionality, i.e. the number of projection components per node.
-    projection_ws.meta.projection.n_proj_components = dataset.n_sampled_cols;
+    IdxT total_proj_components = dataset.n_sampled_cols;
+    bool use_dense_generation =
+      useDenseProjectionGeneration(work_items.size(), total_proj_components);
+    IdxT projection_tile_size = use_dense_generation ? total_proj_components : IdxT{4};
+    projection_ws.meta.projection.n_proj_components = projection_tile_size;
     projection_ws.meta.n_generation_chunks = static_cast<IdxT>(projection_matrix_chunks.size());
     projection_ws.meta.n_generation_block_tasks =
       static_cast<IdxT>(projection_matrix_block_tasks.size());
     projection_ws.meta.generation_n_features = dataset.N;
     projection_ws.meta.generation_min_samples_split = static_cast<IdxT>(params.min_samples_split);
     projection_ws.meta.generation_density = static_cast<DataT>(params.density);
+    projection_ws.meta.generation_nnz_per_component = dataset.N;
+    projection_ws.meta.generation_total_proj_components = total_proj_components;
+    projection_ws.meta.generation_fixed_capacity = !use_dense_generation;
     auto generation_random_state = fnv1a32_basis;
     generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed));
     generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed >> 32));
@@ -769,15 +794,26 @@ struct SPORFBuilder {
                                                       projection_ws.meta.n_generation_block_tasks,
                                                       builder_stream);
     projection_ws.ensure_training_projection_values_storage(
-      size_t(dataset.n_sampled_rows) * size_t(dataset.n_sampled_cols), builder_stream);
+      size_t(dataset.n_sampled_rows) * size_t(projection_tile_size), builder_stream);
+    projection_ws.ensure_quantile_indices_storage(
+      size_t(work_items.size()) * size_t(projection_tile_size) * size_t(params.max_n_bins),
+      builder_stream);
     d_work_items = projection_ws.pointers.projection.d_work_items;
-    size_t dense_generation_len = static_cast<size_t>(work_items.size()) *
-                                  static_cast<size_t>(std::max<IdxT>(1, dataset.n_sampled_cols)) *
-                                  static_cast<size_t>(dataset.N);
+    size_t generation_len = static_cast<size_t>(work_items.size()) *
+                            static_cast<size_t>(projection_tile_size) *
+                            static_cast<size_t>(dataset.N);
     size_t generation_indptr_len = static_cast<size_t>(work_items.size()) *
-                                   static_cast<size_t>(std::max<IdxT>(1, dataset.n_sampled_cols) + 1);
+                                   static_cast<size_t>(projection_tile_size + 1);
 
-    projection_ws.resize_generation_storage(dense_generation_len, generation_indptr_len, builder_stream);
+    if (use_dense_generation) {
+      projection_ws.resize_dense_generation_storage(generation_len, generation_indptr_len, builder_stream);
+    } else {
+      projection_ws.resize_generation_storage(generation_len, generation_indptr_len, builder_stream);
+      projection_ws.resize_best_projection_storage(static_cast<size_t>(work_items.size()) *
+                                                     static_cast<size_t>(dataset.N),
+                                                   static_cast<size_t>(work_items.size()) * 2,
+                                                   builder_stream);
+    }
     stats.t_generation_storage_setup +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                 t_generation_storage_setup)
@@ -841,59 +877,62 @@ struct SPORFBuilder {
 
     t_kernel = std::chrono::steady_clock::now();
     if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream)); }
-    launch_batched_training_random_matrix_bernoulli_kernel<DataT, LabelT, IdxT>(
-      projection_ws.pointers, projection_ws.meta, builder_stream);
-    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream)); }
-    stats.t_kernels +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
-    if (do_timing) {
-      RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
-      float stage_ms = 0.0f;
-      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
-      stats.t_random_matrix_kernel += static_cast<double>(stage_ms);
-    }
-
-    t_kernel = std::chrono::steady_clock::now();
-    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream)); }
-    launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
-      projection_ws.pointers, projection_ws.meta, builder_stream);
-    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream)); }
-    stats.t_kernels +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
-    if (do_timing) {
-      RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
-      float stage_ms = 0.0f;
-      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
-      stats.t_training_projection_kernel += static_cast<double>(stage_ms);
-    }
-
-    t_kernel = std::chrono::steady_clock::now();
-    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream)); }
-    launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
-      projection_ws.pointers,
-      projection_ws.meta,
-      projection_ws.d_quantile_indices_storage.data(),
-      static_cast<IdxT>(params.max_n_bins),
-      static_cast<IdxT>(params.min_samples_leaf),
-      builder_stream);
-    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_stop, builder_stream)); }
-    stats.t_kernels +=
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
-    if (do_timing) {
-      RAFT_CUDA_TRY(cudaEventSynchronize(ev_kernel_stop));
-      float stage_ms = 0.0f;
-      RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
-      stats.t_quantile_sampling_kernel += static_cast<double>(stage_ms);
-    }
-
     dataset_proj.data = projection_ws.pointers.projection.d_trans;
+    dataset_proj.N = projection_tile_size;
+    dataset_proj.n_sampled_cols = projection_tile_size;
     t_kernel = std::chrono::steady_clock::now();
     if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_kernel_start, builder_stream)); }
-    // iterate through a batch of columns (to reduce the memory pressure) and
-    // compute the best split at the end
-    for (IdxT c = 0; c < dataset.n_sampled_cols; c += n_blks_for_cols) {
-      computeSplit(c, dataset_proj, n_blocks_dimx, n_large_nodes, work_items.size());
-      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    if (use_dense_generation) {
+      projection_ws.meta.generation_projection_offset = IdxT{0};
+      projection_ws.meta.projection.n_proj_components = total_proj_components;
+      dataset_proj.N = total_proj_components;
+      dataset_proj.n_sampled_cols = total_proj_components;
+      launch_batched_training_random_matrix_dense_kernel<DataT, LabelT, IdxT>(
+        projection_ws.pointers, projection_ws.meta, builder_stream);
+      launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
+        projection_ws.pointers, projection_ws.meta, builder_stream);
+      launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
+        projection_ws.pointers,
+        projection_ws.meta,
+        projection_ws.d_quantile_indices_storage.data(),
+        static_cast<IdxT>(params.max_n_bins),
+        static_cast<IdxT>(params.min_samples_leaf),
+        builder_stream);
+      for (IdxT c = 0; c < total_proj_components; c += n_blks_for_cols) {
+        RAFT_CUDA_TRY(cudaMemsetAsync(done_count,
+                                      0,
+                                      sizeof(int) * params.max_batch_size * n_blks_for_cols,
+                                      builder_stream));
+        computeSplit(c, c, dataset_proj, n_blocks_dimx, n_large_nodes, work_items.size());
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+      }
+    } else {
+      for (IdxT c = 0; c < total_proj_components; c += projection_tile_size) {
+        auto current_tile_size = std::min<IdxT>(projection_tile_size, total_proj_components - c);
+        projection_ws.meta.projection.n_proj_components = current_tile_size;
+        dataset_proj.N = current_tile_size;
+        dataset_proj.n_sampled_cols = current_tile_size;
+        projection_ws.meta.generation_projection_offset = c;
+        RAFT_CUDA_TRY(cudaMemsetAsync(done_count,
+                                      0,
+                                      sizeof(int) * params.max_batch_size * n_blks_for_cols,
+                                      builder_stream));
+        launch_batched_training_random_matrix_sparse_kernel<DataT, LabelT, IdxT>(
+          projection_ws.pointers, projection_ws.meta, builder_stream);
+        launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
+          projection_ws.pointers, projection_ws.meta, builder_stream);
+        launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
+          projection_ws.pointers,
+          projection_ws.meta,
+          projection_ws.d_quantile_indices_storage.data(),
+          static_cast<IdxT>(params.max_n_bins),
+          static_cast<IdxT>(params.min_samples_leaf),
+          builder_stream);
+        computeSplit(IdxT{0}, c, dataset_proj, n_blocks_dimx, n_large_nodes, work_items.size());
+        launch_capture_best_training_projection_kernel<DataT, LabelT, IdxT>(
+          projection_ws.pointers, projection_ws.meta, splits, builder_stream);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+      }
     }
     stats.t_kernels +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_kernel).count();
@@ -903,6 +942,17 @@ struct SPORFBuilder {
       float stage_ms = 0.0f;
       RAFT_CUDA_TRY(cudaEventElapsedTime(&stage_ms, ev_kernel_start, ev_kernel_stop));
       stats.t_compute_split_kernel += static_cast<double>(stage_ms);
+    }
+
+    if (!use_dense_generation) {
+      projection_ws.meta.generation_fixed_capacity = false;
+      projection_ws.meta.projection.n_proj_components = IdxT{1};
+      dataset_proj.N = IdxT{1};
+      dataset_proj.n_sampled_cols = IdxT{1};
+      launch_restore_best_training_projection_kernel<DataT, LabelT, IdxT>(
+        projection_ws.pointers, projection_ws.meta, splits, builder_stream);
+      launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
+        projection_ws.pointers, projection_ws.meta, builder_stream);
     }
 
     if (do_timing) {
@@ -1008,7 +1058,38 @@ struct SPORFBuilder {
     return smem_size;
   }
 
+  bool useDenseProjectionGeneration(std::size_t n_work_items, IdxT total_proj_components) const
+  {
+    if (n_work_items == 0 || total_proj_components <= 0 || dataset.N <= 0) { return false; }
+
+    auto dense_len = static_cast<long double>(n_work_items) *
+                     static_cast<long double>(total_proj_components) *
+                     static_cast<long double>(dataset.N);
+    auto dense_required =
+      dense_len * static_cast<long double>(sizeof(int) + sizeof(DataT) + sizeof(int) + sizeof(DataT));
+    dense_required += static_cast<long double>(dataset.n_sampled_rows) *
+                      static_cast<long double>(total_proj_components) *
+                      static_cast<long double>(sizeof(DataT));
+    dense_required += static_cast<long double>(n_work_items) *
+                      static_cast<long double>(total_proj_components) *
+                      static_cast<long double>(params.max_n_bins) *
+                      static_cast<long double>(sizeof(IdxT));
+
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    RAFT_CUDA_TRY(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+    auto stream_count = std::max<std::size_t>(std::size_t{1}, handle.get_stream_pool_size());
+    constexpr long double dense_fraction = 0.10L;
+    constexpr long double max_dense_budget = 1024.0L * 1024.0L * 1024.0L;
+    auto budget = std::min(static_cast<long double>(total_bytes) * dense_fraction /
+                             static_cast<long double>(stream_count),
+                           max_dense_budget);
+    return dense_required <= budget;
+  }
+
   void computeSplit(IdxT col,
+                    IdxT split_col,
                     DatasetT& dataset,
                     size_t n_blocks_dimx,
                     size_t n_large_nodes,
@@ -1062,6 +1143,7 @@ struct SPORFBuilder {
                                                                     projection_ws.d_quantile_indices_storage.data(),
                                                                     d_work_items,
                                                                     col,
+                                                                    split_col,
                                                                     done_count,
                                                                     mutex,
                                                                     splits,

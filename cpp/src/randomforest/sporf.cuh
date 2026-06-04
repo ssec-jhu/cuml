@@ -324,12 +324,15 @@ class SPORF {
       workspace_device_bytes += ws.d_tree_projection_coeffs_storage.size() * sizeof(T);
       workspace_device_bytes += ws.d_tree_projection_winning_nnz_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_tree_projection_winning_offsets_storage.size() * sizeof(int);
-      workspace_device_bytes += ws.d_generation_keep_mask_storage.size() * sizeof(int);
-      workspace_device_bytes += ws.d_generation_dense_values_storage.size() * sizeof(T);
       workspace_device_bytes += ws.d_generation_indptr_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_generation_indices_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_generation_sparse_data_storage.size() * sizeof(T);
+      workspace_device_bytes += ws.d_generation_keep_mask_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_generation_dense_values_storage.size() * sizeof(T);
       workspace_device_bytes += ws.d_generation_nnz_counter_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_best_projection_indptr_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_best_projection_indices_storage.size() * sizeof(int);
+      workspace_device_bytes += ws.d_best_projection_sparse_data_storage.size() * sizeof(T);
       workspace_device_bytes += ws.d_sparse_sampling_component_counts_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_sparse_sampling_component_offsets_storage.size() * sizeof(int);
       workspace_device_bytes += ws.d_sparse_sampling_candidate_indices_storage.size() * sizeof(int);
@@ -432,15 +435,14 @@ class SPORF {
                         : std::size_t{0})
                   << " tree_projection_winning_offsets="
                   << ws.d_tree_projection_winning_offsets_storage.size()
-                  << " generation_keep_mask=" << ws.d_generation_keep_mask_storage.size()
-                  << " generation_dense_values=" << ws.d_generation_dense_values_storage.size()
-                  << " peak_generation_dense_len=" << ws.peak_generation_dense_len
-                  << " slack_generation_dense_len="
-                  << (ws.d_generation_dense_values_storage.size() > ws.peak_generation_dense_len
-                        ? ws.d_generation_dense_values_storage.size() - ws.peak_generation_dense_len
+                  << " generation_sparse_len=" << ws.d_generation_sparse_data_storage.size()
+                  << " peak_generation_sparse_len=" << ws.peak_generation_sparse_len
+                  << " slack_generation_sparse_len="
+                  << (ws.d_generation_sparse_data_storage.size() > ws.peak_generation_sparse_len
+                        ? ws.d_generation_sparse_data_storage.size() - ws.peak_generation_sparse_len
                         : std::size_t{0})
-                  << " util_generation_dense_pct="
-                  << pct(ws.peak_generation_dense_len, ws.d_generation_dense_values_storage.size())
+                  << " util_generation_sparse_pct="
+                  << pct(ws.peak_generation_sparse_len, ws.d_generation_sparse_data_storage.size())
                   << " generation_indptr=" << ws.d_generation_indptr_storage.size()
                   << " peak_generation_indptr_len=" << ws.peak_generation_indptr_len
                   << " slack_generation_indptr_len="
@@ -451,6 +453,14 @@ class SPORF {
                   << pct(ws.peak_generation_indptr_len, ws.d_generation_indptr_storage.size())
                   << " generation_indices=" << ws.d_generation_indices_storage.size()
                   << " generation_sparse_data=" << ws.d_generation_sparse_data_storage.size()
+                  << " generation_keep_mask=" << ws.d_generation_keep_mask_storage.size()
+                  << " generation_dense_values=" << ws.d_generation_dense_values_storage.size()
+                  << " peak_generation_dense_len=" << ws.peak_generation_dense_len
+                  << " best_projection_indptr=" << ws.d_best_projection_indptr_storage.size()
+                  << " peak_best_projection_indptr_len=" << ws.peak_best_projection_indptr_len
+                  << " best_projection_indices=" << ws.d_best_projection_indices_storage.size()
+                  << " best_projection_sparse_data=" << ws.d_best_projection_sparse_data_storage.size()
+                  << " peak_best_projection_sparse_len=" << ws.peak_best_projection_sparse_len
                   << " sparse_component_counts="
                   << ws.d_sparse_sampling_component_counts_storage.size()
                   << " peak_sparse_component_count="
