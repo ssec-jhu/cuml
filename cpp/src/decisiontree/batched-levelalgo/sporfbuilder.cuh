@@ -39,9 +39,11 @@
 
 #include <algorithm>
 #include <deque>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace ML {
 namespace DT {
@@ -458,7 +460,51 @@ struct SPORFBuilder {
         pop_max_rows(0)
     {
     }
-  } stats;
+  };
+
+  struct HyperparameterDiagnostics {
+    bool enabled = false;
+
+    double density_specified = 0.0;
+    double density_used      = 0.0;
+    double expected_nnz      = 0.0;
+    double max_features_rate = 0.0;
+
+    IdxT projections_specified = 0;
+
+    std::size_t nnz_count = 0;
+    std::size_t nnz_sum   = 0;
+    IdxT nnz_min          = std::numeric_limits<IdxT>::max();
+    IdxT nnz_max          = 0;
+
+    std::size_t projection_node_count  = 0;
+    std::size_t projection_attempt_sum = 0;
+    IdxT projection_attempt_min        = std::numeric_limits<IdxT>::max();
+    IdxT projection_attempt_max        = 0;
+    std::vector<IdxT> nnz_values;
+    std::vector<IdxT> projection_attempt_values;
+
+    void recordNnz(IdxT nnz)
+    {
+      nnz_count++;
+      nnz_sum += static_cast<std::size_t>(nnz);
+      nnz_min = std::min(nnz_min, nnz);
+      nnz_max = std::max(nnz_max, nnz);
+      nnz_values.push_back(nnz);
+    }
+
+    void recordProjectionAttempts(IdxT n_attempts)
+    {
+      projection_node_count++;
+      projection_attempt_sum += static_cast<std::size_t>(n_attempts);
+      projection_attempt_min = std::min(projection_attempt_min, n_attempts);
+      projection_attempt_max = std::max(projection_attempt_max, n_attempts);
+      projection_attempt_values.push_back(n_attempts);
+    }
+  };
+
+  Stats stats;
+  HyperparameterDiagnostics hparam_debug;
 
   SPORFBuilder(const raft::handle_t& handle,
           cudaStream_t s,
@@ -533,6 +579,15 @@ struct SPORFBuilder {
     h_workload_info =
       reinterpret_cast<SPORFDT::WorkloadInfo<IdxT>*>(projection_ws.h_workload_info_storage.data());
     h_splits = reinterpret_cast<SplitT*>(projection_ws.h_split_storage.data());
+
+    hparam_debug.enabled =
+      ML::default_logger().should_log(rapids_logger::level_enum::debug);
+    hparam_debug.density_specified = static_cast<double>(params.density);
+    hparam_debug.density_used      = static_cast<double>(params.density);
+    hparam_debug.expected_nnz =
+      static_cast<double>(dataset.N) * static_cast<double>(params.density);
+    hparam_debug.max_features_rate      = static_cast<double>(params.max_features);
+    hparam_debug.projections_specified  = dataset.n_sampled_cols;
   }
 
   /**
@@ -701,6 +756,7 @@ struct SPORFBuilder {
         " ms, wall_total: " << train_wall_ms <<
         " ms, wall_doSplit: " << t_doSplit_wall <<
         " ms" << std::endl;
+      printHyperparameterDiagnostics();
     }
 
 
@@ -782,6 +838,7 @@ struct SPORFBuilder {
     projection_ws.meta.generation_nnz_per_component = dataset.N;
     projection_ws.meta.generation_total_proj_components = total_proj_components;
     projection_ws.meta.generation_fixed_capacity = !use_dense_generation;
+    recordProjectionAttemptDiagnostics(work_items, total_proj_components);
     auto generation_random_state = fnv1a32_basis;
     generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed));
     generation_random_state = fnv1a32(generation_random_state, static_cast<uint32_t>(seed >> 32));
@@ -889,6 +946,7 @@ struct SPORFBuilder {
       dataset_proj.n_sampled_cols = total_proj_components;
       launch_batched_training_random_matrix_dense_kernel<DataT, LabelT, IdxT>(
         projection_ws.pointers, projection_ws.meta, builder_stream);
+      recordGeneratedNnzDiagnostics(work_items, total_proj_components, false);
       launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
         projection_ws.pointers, projection_ws.meta, builder_stream);
       launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
@@ -919,6 +977,7 @@ struct SPORFBuilder {
                                       builder_stream));
         launch_batched_training_random_matrix_sparse_kernel<DataT, LabelT, IdxT>(
           projection_ws.pointers, projection_ws.meta, builder_stream);
+        recordGeneratedNnzDiagnostics(work_items, current_tile_size, true);
         launch_batched_training_projection_kernel<DataT, LabelT, IdxT>(
           projection_ws.pointers, projection_ws.meta, builder_stream);
         launch_batched_training_quantile_sampling_kernel<DataT, LabelT, IdxT>(
@@ -1086,6 +1145,116 @@ struct SPORFBuilder {
                              static_cast<long double>(stream_count),
                            max_dense_budget);
     return dense_required <= budget;
+  }
+
+  void recordProjectionAttemptDiagnostics(const std::vector<SPORFDT::NodeWorkItem>& work_items,
+                                          IdxT n_attempts)
+  {
+    if (!hparam_debug.enabled) { return; }
+
+    for (std::size_t i = 0; i < work_items.size(); ++i) {
+      ASSERT(n_attempts == hparam_debug.projections_specified,
+             "SPORF projection-attempt diagnostic failed: treeid=%d node=%zu depth=%d "
+             "attempted=%d specified=%d",
+             static_cast<int>(treeid),
+             static_cast<std::size_t>(work_items[i].idx),
+             static_cast<int>(work_items[i].depth),
+             static_cast<int>(n_attempts),
+             static_cast<int>(hparam_debug.projections_specified));
+      hparam_debug.recordProjectionAttempts(n_attempts);
+    }
+  }
+
+  void recordGeneratedNnzDiagnostics(const std::vector<SPORFDT::NodeWorkItem>& work_items,
+                                     IdxT n_components,
+                                     bool fixed_capacity)
+  {
+    if (!hparam_debug.enabled || work_items.empty() || n_components <= 0) { return; }
+
+    auto indptr_stride = static_cast<std::size_t>(n_components + 1);
+    auto indptr_len    = work_items.size() * indptr_stride;
+    std::vector<int> h_generation_indptr(indptr_len);
+    raft::update_host(h_generation_indptr.data(),
+                      projection_ws.pointers.d_generation_indptr,
+                      h_generation_indptr.size(),
+                      builder_stream);
+    handle.sync_stream(builder_stream);
+
+    for (std::size_t work_item_idx = 0; work_item_idx < work_items.size(); ++work_item_idx) {
+      if (static_cast<IdxT>(work_items[work_item_idx].instances.count) <
+          static_cast<IdxT>(params.min_samples_split)) {
+        continue;
+      }
+
+      auto const* indptr = h_generation_indptr.data() + work_item_idx * indptr_stride;
+      for (IdxT comp = 0; comp < n_components; ++comp) {
+        auto nnz = fixed_capacity ? indptr[comp + 1] : indptr[comp + 1] - indptr[comp];
+        ASSERT(nnz >= 0,
+               "SPORF NNZ diagnostic failed: treeid=%d node=%zu component=%d nnz=%d",
+               static_cast<int>(treeid),
+               static_cast<std::size_t>(work_items[work_item_idx].idx),
+               static_cast<int>(comp),
+               static_cast<int>(nnz));
+        hparam_debug.recordNnz(static_cast<IdxT>(nnz));
+      }
+    }
+  }
+
+  void printHyperparameterDiagnostics() const
+  {
+    if (!hparam_debug.enabled) { return; }
+
+    auto nnz_mean =
+      hparam_debug.nnz_count > 0
+        ? static_cast<double>(hparam_debug.nnz_sum) / static_cast<double>(hparam_debug.nnz_count)
+        : 0.0;
+    auto nnz_min = hparam_debug.nnz_count > 0 ? hparam_debug.nnz_min : IdxT{0};
+    auto attempts_mean = hparam_debug.projection_node_count > 0
+                           ? static_cast<double>(hparam_debug.projection_attempt_sum) /
+                               static_cast<double>(hparam_debug.projection_node_count)
+                           : 0.0;
+    auto attempts_min =
+      hparam_debug.projection_node_count > 0 ? hparam_debug.projection_attempt_min : IdxT{0};
+
+    auto sorted_nnz = hparam_debug.nnz_values;
+    std::sort(sorted_nnz.begin(), sorted_nnz.end());
+    auto sorted_attempts = hparam_debug.projection_attempt_values;
+    std::sort(sorted_attempts.begin(), sorted_attempts.end());
+    auto quantile = [](const std::vector<IdxT>& values, double q) {
+      if (values.empty()) { return IdxT{0}; }
+      auto idx = static_cast<std::size_t>(q * static_cast<double>(values.size() - 1));
+      return values[idx];
+    };
+
+    std::cout << "SPORF hyperparameter diagnostics: treeid=" << treeid
+              << ", density_specified=" << hparam_debug.density_specified
+              << ", density_used=" << hparam_debug.density_used
+              << ", expected_nnz=" << hparam_debug.expected_nnz
+              << ", nnz_observations=" << hparam_debug.nnz_count
+              << ", nnz_min=" << nnz_min
+              << ", nnz_q01=" << quantile(sorted_nnz, 0.01)
+              << ", nnz_q05=" << quantile(sorted_nnz, 0.05)
+              << ", nnz_q25=" << quantile(sorted_nnz, 0.25)
+              << ", nnz_q50=" << quantile(sorted_nnz, 0.50)
+              << ", nnz_q75=" << quantile(sorted_nnz, 0.75)
+              << ", nnz_q95=" << quantile(sorted_nnz, 0.95)
+              << ", nnz_q99=" << quantile(sorted_nnz, 0.99)
+              << ", nnz_mean=" << nnz_mean
+              << ", nnz_max=" << hparam_debug.nnz_max
+              << ", max_features_rate_specified=" << hparam_debug.max_features_rate
+              << ", projections_per_node_specified=" << hparam_debug.projections_specified
+              << ", projection_nodes_observed=" << hparam_debug.projection_node_count
+              << ", projection_attempts_min=" << attempts_min
+              << ", projection_attempts_q01=" << quantile(sorted_attempts, 0.01)
+              << ", projection_attempts_q05=" << quantile(sorted_attempts, 0.05)
+              << ", projection_attempts_q25=" << quantile(sorted_attempts, 0.25)
+              << ", projection_attempts_q50=" << quantile(sorted_attempts, 0.50)
+              << ", projection_attempts_q75=" << quantile(sorted_attempts, 0.75)
+              << ", projection_attempts_q95=" << quantile(sorted_attempts, 0.95)
+              << ", projection_attempts_q99=" << quantile(sorted_attempts, 0.99)
+              << ", projection_attempts_mean=" << attempts_mean
+              << ", projection_attempts_max=" << hparam_debug.projection_attempt_max
+              << std::endl;
   }
 
   void computeSplit(IdxT col,
