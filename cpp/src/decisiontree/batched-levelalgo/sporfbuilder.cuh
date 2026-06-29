@@ -582,7 +582,7 @@ struct SPORFBuilder {
 
     hparam_debug.enabled =
       ML::default_logger().should_log(rapids_logger::level_enum::debug);
-    hparam_debug.density_specified = static_cast<double>(params.density);
+    hparam_debug.density_specified = static_cast<double>(params.density_specified);
     hparam_debug.density_used      = static_cast<double>(params.density);
     hparam_debug.expected_nnz =
       static_cast<double>(dataset.N) * static_cast<double>(params.density);
@@ -1139,11 +1139,14 @@ struct SPORFBuilder {
     RAFT_CUDA_TRY(cudaMemGetInfo(&free_bytes, &total_bytes));
 
     auto stream_count = std::max<std::size_t>(std::size_t{1}, handle.get_stream_pool_size());
-    constexpr long double dense_fraction = 0.10L;
-    constexpr long double max_dense_budget = 1024.0L * 1024.0L * 1024.0L;
-    auto budget = std::min(static_cast<long double>(total_bytes) * dense_fraction /
-                             static_cast<long double>(stream_count),
-                           max_dense_budget);
+    constexpr long double dense_total_fraction = 0.02L;
+    constexpr long double dense_free_fraction  = 0.05L;
+    constexpr long double max_dense_budget     = 512.0L * 1024.0L * 1024.0L;
+    auto total_budget = static_cast<long double>(total_bytes) * dense_total_fraction /
+                        static_cast<long double>(stream_count);
+    auto free_budget = static_cast<long double>(free_bytes) * dense_free_fraction /
+                       static_cast<long double>(stream_count);
+    auto budget = std::min({total_budget, free_budget, max_dense_budget});
     return dense_required <= budget;
   }
 

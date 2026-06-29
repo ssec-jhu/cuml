@@ -346,6 +346,24 @@ SPORF_params set_sporf_params(int max_depth,
                               int cfg_n_streams,
                               int max_batch_size,
                               float density,                // SPORF paramsters
+                              float density_specified,
+                              DT::HISTOGRAM_METHOD histogram_method );
+
+SPORF_params set_sporf_params(int max_depth,
+                              int max_leaves,               // base RF parameters
+                              float max_features,
+                              int max_n_bins,
+                              int min_samples_leaf,
+                              int min_samples_split,
+                              float min_impurity_decrease,
+                              bool bootstrap,
+                              int n_trees,
+                              float max_samples,
+                              uint64_t seed,
+                              CRITERION split_criterion,
+                              int cfg_n_streams,
+                              int max_batch_size,
+                              float density,                // SPORF paramsters
                               DT::HISTOGRAM_METHOD histogram_method );
 
 // ----------------------------- Regression ----------------------------------- //

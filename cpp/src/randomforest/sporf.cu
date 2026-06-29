@@ -109,6 +109,11 @@ void validity_check(const SPORF_params rf_params)
   ASSERT((rf_params.max_samples > 0) && (rf_params.max_samples <= 1.0),
          "max_samples value %f outside permitted (0, 1] range",
          rf_params.max_samples);
+  ASSERT((rf_params.tree_params.density > 0.0f) && (rf_params.tree_params.density <= 1.0f),
+         "SPORF density value %f outside permitted (0, 1] range. Python callers may pass "
+         "an int absolute expected NNZ or a float fraction; C++ callers must pass a "
+         "normalized fraction.",
+         rf_params.tree_params.density);
   ASSERT(rf_params.tree_params.histogram_method == DT::HISTOGRAM_METHOD_SAMPLED,
          "SPORF exact histogram method is not implemented. Use HISTOGRAM_METHOD_SAMPLED.");
 }
@@ -133,6 +138,7 @@ SPORF_params set_sporf_params(int max_depth,
                               int cfg_n_streams,
                               int max_batch_size,
                               float density,                // SPORF-specific parameters
+                              float density_specified,
                               DT::HISTOGRAM_METHOD histogram_method )
 {
   DT::SPORFDecisionTreeParams tree_params;
@@ -149,6 +155,7 @@ SPORF_params set_sporf_params(int max_depth,
 
   // initialize SPORF-specific members in the SPORFDecisionTreeParams struct
   tree_params.density = density;
+  tree_params.density_specified = density_specified;
   tree_params.histogram_method = histogram_method;
   
   // initialize RF_params members
@@ -163,6 +170,42 @@ SPORF_params set_sporf_params(int max_depth,
   rf_params.tree_params = tree_params;
   validity_check(rf_params);
   return rf_params;
+}
+
+SPORF_params set_sporf_params(int max_depth,
+                              int max_leaves,               // base RF parameters
+                              float max_features,
+                              int max_n_bins,
+                              int min_samples_leaf,
+                              int min_samples_split,
+                              float min_impurity_decrease,
+                              bool bootstrap,
+                              int n_trees,
+                              float max_samples,
+                              uint64_t seed,
+                              CRITERION split_criterion,
+                              int cfg_n_streams,
+                              int max_batch_size,
+                              float density,                // SPORF-specific parameters
+                              DT::HISTOGRAM_METHOD histogram_method )
+{
+  return set_sporf_params(max_depth,
+                          max_leaves,
+                          max_features,
+                          max_n_bins,
+                          min_samples_leaf,
+                          min_samples_split,
+                          min_impurity_decrease,
+                          bootstrap,
+                          n_trees,
+                          max_samples,
+                          seed,
+                          split_criterion,
+                          cfg_n_streams,
+                          max_batch_size,
+                          density,
+                          density,
+                          histogram_method);
 }
 
 /*

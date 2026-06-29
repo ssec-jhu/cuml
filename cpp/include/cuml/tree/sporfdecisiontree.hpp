@@ -113,6 +113,7 @@ struct SPORFDecisionTreeParams : DecisionTreeParams {
    * Additional parameter(s) required for SPORF
    */
   float density;
+  float density_specified;
   HISTOGRAM_METHOD histogram_method;
 };
 
