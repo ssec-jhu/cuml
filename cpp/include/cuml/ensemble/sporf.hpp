@@ -29,6 +29,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -62,6 +63,108 @@ struct SPORFMetaData {
   std::vector<std::shared_ptr<DT::ObliqueTreeMetaDataNode<T, L>>> trees;
   SPORF_params rf_params;
 };
+
+template <typename T, typename L>
+std::string get_sporf_diagnostics_csv(const SPORFMetaData<T, L>* forest)
+{
+  if (forest == nullptr) { throw std::runtime_error("Cannot diagnose null SPORF forest"); }
+
+  std::ostringstream oss;
+  oss << "tree_index,treeid,depth,n_nodes,n_split_nodes,n_leaf_nodes,leaf_counter,"
+         "training_observation_count,weighted_training_path_depth,"
+         "min_training_leaf_depth,max_training_leaf_depth,"
+         "train_time_ms,num_outputs,n_projection_slots,n_populated_projection_vectors,"
+         "projection_indptr_size,projection_indices_size,projection_coeffs_size,"
+         "projection_payload_nnz,projection_payload_bytes,leaf_vector_size,"
+         "leaf_vector_bytes\n";
+
+  for (std::size_t tree_idx = 0; tree_idx < forest->trees.size(); ++tree_idx) {
+    const auto& tree_ptr = forest->trees[tree_idx];
+    if (!tree_ptr) {
+      oss << tree_idx << ",-1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+      continue;
+    }
+
+    const auto& tree = *tree_ptr;
+    std::size_t n_split_nodes = 0;
+    std::size_t n_leaf_nodes  = 0;
+    std::size_t training_observation_count = 0;
+    double weighted_depth_sum = 0.0;
+    std::size_t min_training_leaf_depth = 0;
+    std::size_t max_training_leaf_depth = 0;
+    bool saw_training_leaf = false;
+
+    std::vector<std::pair<std::size_t, std::size_t>> stack;
+    if (!tree.sparsetree.empty()) { stack.emplace_back(std::size_t{0}, std::size_t{0}); }
+    while (!stack.empty()) {
+      auto [node_idx, depth] = stack.back();
+      stack.pop_back();
+      if (node_idx >= tree.sparsetree.size()) { continue; }
+
+      const auto& node = tree.sparsetree[node_idx];
+      if (node.IsLeaf()) {
+        auto count = static_cast<std::size_t>(node.InstanceCount());
+        if (count > 0) {
+          training_observation_count += count;
+          weighted_depth_sum += static_cast<double>(depth) * static_cast<double>(count);
+          min_training_leaf_depth =
+            saw_training_leaf ? std::min(min_training_leaf_depth, depth) : depth;
+          max_training_leaf_depth =
+            saw_training_leaf ? std::max(max_training_leaf_depth, depth) : depth;
+          saw_training_leaf = true;
+        }
+      } else {
+        auto left_child_id = node.LeftChildId();
+        auto right_child_id = node.RightChildId();
+        if (right_child_id >= 0) {
+          stack.emplace_back(static_cast<std::size_t>(right_child_id), depth + 1);
+        }
+        if (left_child_id >= 0) {
+          stack.emplace_back(static_cast<std::size_t>(left_child_id), depth + 1);
+        }
+      }
+    }
+
+    auto weighted_training_path_depth =
+      training_observation_count > 0
+        ? weighted_depth_sum / static_cast<double>(training_observation_count)
+        : 0.0;
+
+    for (const auto& node : tree.sparsetree) {
+      if (node.IsLeaf()) {
+        n_leaf_nodes++;
+      } else {
+        n_split_nodes++;
+      }
+    }
+
+    std::size_t n_populated_projection_vectors = 0;
+    for (const auto& projection : tree.projection_vectors) {
+      if (projection.n_proj_components > 0) { n_populated_projection_vectors++; }
+    }
+
+    auto projection_payload_nnz = tree.projection_indices_storage.size();
+    auto projection_payload_bytes =
+      tree.projection_indptr_storage.size() * sizeof(int) +
+      tree.projection_indices_storage.size() * sizeof(int) +
+      tree.projection_coeffs_storage.size() * sizeof(T);
+    auto leaf_vector_bytes = tree.vector_leaf.size() * sizeof(T);
+
+    oss << tree_idx << "," << tree.treeid << "," << tree.depth_counter << ","
+        << tree.sparsetree.size() << "," << n_split_nodes << "," << n_leaf_nodes << ","
+        << tree.leaf_counter << "," << training_observation_count << ","
+        << weighted_training_path_depth << "," << min_training_leaf_depth << ","
+        << max_training_leaf_depth << "," << tree.train_time << "," << tree.num_outputs << ","
+        << tree.projection_vectors.size() << "," << n_populated_projection_vectors << ","
+        << tree.projection_indptr_storage.size() << ","
+        << tree.projection_indices_storage.size() << ","
+        << tree.projection_coeffs_storage.size() << "," << projection_payload_nnz << ","
+        << projection_payload_bytes << "," << tree.vector_leaf.size() << ","
+        << leaf_vector_bytes << "\n";
+  }
+
+  return oss.str();
+}
 
 namespace detail {
 
@@ -346,12 +449,50 @@ SPORF_params set_sporf_params(int max_depth,
                               int cfg_n_streams,
                               int max_batch_size,
                               float density,                // SPORF paramsters
+                              float density_specified,
+                              DT::HISTOGRAM_METHOD histogram_method );
+
+SPORF_params set_sporf_params(int max_depth,
+                              int max_leaves,               // base RF parameters
+                              float max_features,
+                              int max_n_bins,
+                              int min_samples_leaf,
+                              int min_samples_split,
+                              float min_impurity_decrease,
+                              bool bootstrap,
+                              int n_trees,
+                              float max_samples,
+                              uint64_t seed,
+                              CRITERION split_criterion,
+                              int cfg_n_streams,
+                              int max_batch_size,
+                              float density,                // SPORF paramsters
                               DT::HISTOGRAM_METHOD histogram_method );
 
 // ----------------------------- Regression ----------------------------------- //
 
 typedef SPORFMetaData<float, float> SPORFRegressorF;
 typedef SPORFMetaData<double, double> SPORFRegressorD;
+
+inline std::string serialize(const SPORFRegressorF* forest)
+{
+  return detail::serialize_sporf_forest_impl(forest);
+}
+
+inline std::string serialize(const SPORFRegressorD* forest)
+{
+  return detail::serialize_sporf_forest_impl(forest);
+}
+
+inline void deserialize(SPORFRegressorF* forest, const std::string& payload)
+{
+  detail::deserialize_sporf_forest_impl(forest, payload);
+}
+
+inline void deserialize(SPORFRegressorD* forest, const std::string& payload)
+{
+  detail::deserialize_sporf_forest_impl(forest, payload);
+}
 
 void fit(const raft::handle_t& user_handle,
          SPORFRegressorF*& forest,

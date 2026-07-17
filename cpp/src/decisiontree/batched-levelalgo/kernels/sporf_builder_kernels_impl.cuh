@@ -223,6 +223,7 @@ static __global__ void computeSplitKernel(BinT* histograms,
                                           const IdxT* quantile_indices,
                                           const NodeWorkItem* work_items,
                                           IdxT colStart,
+                                          IdxT splitColStart,
                                           int* done_count,
                                           int* mutex,
                                           volatile DT::Split<DataT, IdxT>* splits,
@@ -362,6 +363,7 @@ static __global__ void computeSplitKernel(BinT* histograms,
   // corresponding information gain for splitting
   DT::Split<DataT, IdxT> sp =
     objective.Gain(shared_histogram, shared_quantiles, col, range_len, n_bins);
+  sp.colid += splitColStart - colStart;
 
   __syncthreads();
 
@@ -387,6 +389,7 @@ void launchComputeSplitKernel(BinT* histograms,
                               // const DT::Quantiles<DataT, IdxT>& quantiles,
                               const NodeWorkItem* work_items,
                               IdxT colStart,
+                              IdxT splitColStart,
                               int* done_count,
                               int* mutex,
                               volatile DT::Split<DataT, IdxT>* splits,
@@ -405,6 +408,7 @@ void launchComputeSplitKernel(BinT* histograms,
                                                        quantile_indices,
                                                        work_items,
                                                        colStart,
+                                                       splitColStart,
                                                        done_count,
                                                        mutex,
                                                        splits,
@@ -441,6 +445,7 @@ template void launchComputeSplitKernel<_DataT, _LabelT, _IdxT, TPB_DEFAULT, ITEM
   const _IdxT* quantile_indices,
   const NodeWorkItem* work_items,
   _IdxT colStart,
+  _IdxT splitColStart,
   int* done_count,
   int* mutex,
   volatile DT::Split<_DataT, _IdxT>* splits,

@@ -109,6 +109,11 @@ void validity_check(const SPORF_params rf_params)
   ASSERT((rf_params.max_samples > 0) && (rf_params.max_samples <= 1.0),
          "max_samples value %f outside permitted (0, 1] range",
          rf_params.max_samples);
+  ASSERT((rf_params.tree_params.density > 0.0f) && (rf_params.tree_params.density <= 1.0f),
+         "SPORF density value %f outside permitted (0, 1] range. Python callers may pass "
+         "an int absolute expected NNZ or a float fraction; C++ callers must pass a "
+         "normalized fraction.",
+         rf_params.tree_params.density);
   ASSERT(rf_params.tree_params.histogram_method == DT::HISTOGRAM_METHOD_SAMPLED,
          "SPORF exact histogram method is not implemented. Use HISTOGRAM_METHOD_SAMPLED.");
 }
@@ -133,6 +138,7 @@ SPORF_params set_sporf_params(int max_depth,
                               int cfg_n_streams,
                               int max_batch_size,
                               float density,                // SPORF-specific parameters
+                              float density_specified,
                               DT::HISTOGRAM_METHOD histogram_method )
 {
   DT::SPORFDecisionTreeParams tree_params;
@@ -149,6 +155,7 @@ SPORF_params set_sporf_params(int max_depth,
 
   // initialize SPORF-specific members in the SPORFDecisionTreeParams struct
   tree_params.density = density;
+  tree_params.density_specified = density_specified;
   tree_params.histogram_method = histogram_method;
   
   // initialize RF_params members
@@ -163,6 +170,42 @@ SPORF_params set_sporf_params(int max_depth,
   rf_params.tree_params = tree_params;
   validity_check(rf_params);
   return rf_params;
+}
+
+SPORF_params set_sporf_params(int max_depth,
+                              int max_leaves,               // base RF parameters
+                              float max_features,
+                              int max_n_bins,
+                              int min_samples_leaf,
+                              int min_samples_split,
+                              float min_impurity_decrease,
+                              bool bootstrap,
+                              int n_trees,
+                              float max_samples,
+                              uint64_t seed,
+                              CRITERION split_criterion,
+                              int cfg_n_streams,
+                              int max_batch_size,
+                              float density,                // SPORF-specific parameters
+                              DT::HISTOGRAM_METHOD histogram_method )
+{
+  return set_sporf_params(max_depth,
+                          max_leaves,
+                          max_features,
+                          max_n_bins,
+                          min_samples_leaf,
+                          min_samples_split,
+                          min_impurity_decrease,
+                          bootstrap,
+                          n_trees,
+                          max_samples,
+                          seed,
+                          split_criterion,
+                          cfg_n_streams,
+                          max_batch_size,
+                          density,
+                          density,
+                          histogram_method);
 }
 
 /*
@@ -307,6 +350,98 @@ RF_metrics score(const raft::handle_t& user_handle,
   RF_metrics classification_score = SPORF<double, int>::score(
     user_handle, ref_labels, n_rows, predictions, verbosity, RF_type::CLASSIFICATION);
   return classification_score;
+}
+
+void fit(const raft::handle_t& user_handle,
+         SPORFRegressorF*& forest,
+         float* input,
+         int n_rows,
+         int n_cols,
+         float* labels,
+         SPORF_params rf_params,
+         rapids_logger::level_enum verbosity)
+{
+  raft::common::nvtx::range fun_scope("SPORFRegressorF::fit @sporf.cu");
+  ML::default_logger().set_level(verbosity);
+  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
+  forest->trees.resize(rf_params.n_trees);
+  forest->rf_params = rf_params;
+
+  std::shared_ptr<SPORF<float, float>> rf_regressor =
+    std::make_shared<SPORF<float, float>>(rf_params, RF_type::REGRESSION);
+  rf_regressor->fit(user_handle, input, n_rows, n_cols, labels, 1, forest);
+}
+
+void fit(const raft::handle_t& user_handle,
+         SPORFRegressorD*& forest,
+         double* input,
+         int n_rows,
+         int n_cols,
+         double* labels,
+         SPORF_params rf_params,
+         rapids_logger::level_enum verbosity)
+{
+  raft::common::nvtx::range fun_scope("SPORFRegressorD::fit @sporf.cu");
+  ML::default_logger().set_level(verbosity);
+  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
+  forest->trees.resize(rf_params.n_trees);
+  forest->rf_params = rf_params;
+
+  std::shared_ptr<SPORF<double, double>> rf_regressor =
+    std::make_shared<SPORF<double, double>>(rf_params, RF_type::REGRESSION);
+  rf_regressor->fit(user_handle, input, n_rows, n_cols, labels, 1, forest);
+}
+
+void predict(const raft::handle_t& user_handle,
+             const SPORFRegressorF* forest,
+             const float* input,
+             int n_rows,
+             int n_cols,
+             float* predictions,
+             rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<float, float>> rf_regressor =
+    std::make_shared<SPORF<float, float>>(forest->rf_params, RF_type::REGRESSION);
+  rf_regressor->predict(user_handle, input, n_rows, n_cols, predictions, forest, verbosity);
+}
+
+void predict(const raft::handle_t& user_handle,
+             const SPORFRegressorD* forest,
+             const double* input,
+             int n_rows,
+             int n_cols,
+             double* predictions,
+             rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<double, double>> rf_regressor =
+    std::make_shared<SPORF<double, double>>(forest->rf_params, RF_type::REGRESSION);
+  rf_regressor->predict(user_handle, input, n_rows, n_cols, predictions, forest, verbosity);
+}
+
+RF_metrics score(const raft::handle_t& user_handle,
+                 const SPORFRegressorF* forest,
+                 const float* ref_labels,
+                 int n_rows,
+                 const float* predictions,
+                 rapids_logger::level_enum verbosity)
+{
+  RF_metrics regression_score = SPORF<float, float>::score(
+    user_handle, ref_labels, n_rows, predictions, verbosity, RF_type::REGRESSION);
+  return regression_score;
+}
+
+RF_metrics score(const raft::handle_t& user_handle,
+                 const SPORFRegressorD* forest,
+                 const double* ref_labels,
+                 int n_rows,
+                 const double* predictions,
+                 rapids_logger::level_enum verbosity)
+{
+  RF_metrics regression_score = SPORF<double, double>::score(
+    user_handle, ref_labels, n_rows, predictions, verbosity, RF_type::REGRESSION);
+  return regression_score;
 }
 
 }  // End namespace ML

@@ -50,6 +50,30 @@ from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
 
+def compute_sporf_density(density, n_cols):
+    if density is True or density is False or isinstance(density, np.bool_):
+        raise ValueError("Expected `density` to be an int absolute expected NNZ "
+                         "or a float fraction in (0, 1]. Got bool instead.")
+    if isinstance(density, (int, np.integer)):
+        if density < 1 or density > n_cols:
+            raise ValueError(
+                f"Integer `density` must be in [1, n_features]. Got "
+                f"density={density!r}, n_features={n_cols}."
+            )
+        return float(density) / float(n_cols)
+    if isinstance(density, (float, np.floating)):
+        if not (density > 0.0 and density <= 1.0):
+            raise ValueError(
+                f"Float `density` must be a fraction in (0, 1]. Got "
+                f"density={density!r}."
+            )
+        return float(density)
+    raise ValueError(
+        f"Expected `density` to be an int absolute expected NNZ or a float "
+        f"fraction in (0, 1]. Got {density!r} instead."
+    )
+
+
 
 # Declare SPORF-specific tree params and enums from ML::DT so we can
 # include them in the SPORF_params layout below. Matches
@@ -72,6 +96,7 @@ cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT":
 
     cdef cppclass SPORFDecisionTreeParams(DecisionTreeParams):
         float density
+        float density_specified
         HISTOGRAM_METHOD histogram_method
 
 # Expose enum values as Python-level ints so they can be used as
@@ -129,6 +154,7 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                                         int,
                                         int,
                                         float,
+                                        float,
                                         HISTOGRAM_METHOD) except +
 
     ctypedef SPORFMetaData[float, int] SPORFClassifierF
@@ -151,6 +177,8 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
     cdef string serialize(const SPORFMetaData[double, int]* forest) except +
     cdef void deserialize(SPORFMetaData[float, int]* forest, const string& payload) except +
     cdef void deserialize(SPORFMetaData[double, int]* forest, const string& payload) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[float, int]* forest) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[double, int]* forest) except +
 
     cdef void fit(handle_t& handle,
                   SPORFMetaData[float, int]*,
@@ -285,6 +313,13 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         Maximum number of bins used by the split algorithm per feature.
         For large problems, particularly those with highly-skewed input data,
         increasing the number of bins may improve accuracy.
+    density : int or float (default = 0.5)
+        Sparse random projection density per projection vector.
+
+        * If an int then ``density`` is the absolute expected number of
+          nonzero projection coefficients.
+        * If a float then ``density`` is used as a fraction of
+          ``n_features`` and must be in ``(0, 1]``.
     n_streams : int (default = 4)
         Number of parallel streams used for forest building.
         For nearly reproducible results, set ``n_streams=1``. If ``n_streams``
@@ -685,6 +720,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         cdef string forest_bytes_cpp
         cdef uintptr_t seed_val
         cdef float max_feature_val
+        cdef float density_val
+        cdef float density_specified_val
         cdef SPORF_params rf_params
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
@@ -694,6 +731,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
 
         if self.n_cols:
             max_feature_val = compute_max_features(self.max_features, self.n_cols)
+            density_val = compute_sporf_density(self.density, self.n_cols)
+            density_specified_val = <float>float(self.density)
             if self.random_state is None:
                 seed_val = <uintptr_t>NULL
             else:
@@ -713,7 +752,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                          <CRITERION> self.split_criterion,
                                          <int> self.n_streams,
                                          <int> self.max_batch_size,
-                                         <float> self.density,
+                                         density_val,
+                                         density_specified_val,
                                          <HISTOGRAM_METHOD> self.histogram_method)
 
             if self.dtype == np.float32 and "sporf_forest_bytes" in state:
@@ -830,6 +870,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         """
         t_fit_wall_start = time.perf_counter()
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit_fast(X, y, convert_dtype)
+        cdef float density_val = compute_sporf_density(self.density, self.n_cols)
+        cdef float density_specified_val = <float>float(self.density)
         t_dataset_setup = time.perf_counter() - t_fit_wall_start
         self.update_labels = self.use_monotonic
         cdef uintptr_t X_ptr, y_ptr
@@ -863,7 +905,8 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
                                      <CRITERION> self.split_criterion,
                                      <int> self.n_streams,
                                      <int> self.max_batch_size,
-                                     <float> self.density,
+                                     density_val,
+                                     density_specified_val,
                                      <HISTOGRAM_METHOD> self.histogram_method)
 
         t_native_fit_start = time.perf_counter()
@@ -1201,6 +1244,20 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             return get_rf_summary_text(rf_forest64).decode('utf-8')
         else:
             return get_rf_summary_text(rf_forest).decode('utf-8')
+
+    def get_diagnostics_csv(self):
+        """
+        Return per-tree SPORF metadata diagnostics as CSV.
+        """
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*><uintptr_t> self.rf_forest
+
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*><uintptr_t> self.rf_forest64
+
+        if self.dtype == np.float64:
+            return get_sporf_diagnostics_csv(rf_forest64).decode('utf-8')
+        return get_sporf_diagnostics_csv(rf_forest).decode('utf-8')
 
     def get_detailed_text(self):
         """
