@@ -177,6 +177,8 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
     cdef string serialize(const SPORFMetaData[double, int]* forest) except +
     cdef void deserialize(SPORFMetaData[float, int]* forest, const string& payload) except +
     cdef void deserialize(SPORFMetaData[double, int]* forest, const string& payload) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[float, int]* forest) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[double, int]* forest) except +
 
     cdef void fit(handle_t& handle,
                   SPORFMetaData[float, int]*,
@@ -1242,6 +1244,20 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             return get_rf_summary_text(rf_forest64).decode('utf-8')
         else:
             return get_rf_summary_text(rf_forest).decode('utf-8')
+
+    def get_diagnostics_csv(self):
+        """
+        Return per-tree SPORF metadata diagnostics as CSV.
+        """
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*><uintptr_t> self.rf_forest
+
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*><uintptr_t> self.rf_forest64
+
+        if self.dtype == np.float64:
+            return get_sporf_diagnostics_csv(rf_forest64).decode('utf-8')
+        return get_sporf_diagnostics_csv(rf_forest).decode('utf-8')
 
     def get_detailed_text(self):
         """

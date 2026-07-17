@@ -352,4 +352,96 @@ RF_metrics score(const raft::handle_t& user_handle,
   return classification_score;
 }
 
+void fit(const raft::handle_t& user_handle,
+         SPORFRegressorF*& forest,
+         float* input,
+         int n_rows,
+         int n_cols,
+         float* labels,
+         SPORF_params rf_params,
+         rapids_logger::level_enum verbosity)
+{
+  raft::common::nvtx::range fun_scope("SPORFRegressorF::fit @sporf.cu");
+  ML::default_logger().set_level(verbosity);
+  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
+  forest->trees.resize(rf_params.n_trees);
+  forest->rf_params = rf_params;
+
+  std::shared_ptr<SPORF<float, float>> rf_regressor =
+    std::make_shared<SPORF<float, float>>(rf_params, RF_type::REGRESSION);
+  rf_regressor->fit(user_handle, input, n_rows, n_cols, labels, 1, forest);
+}
+
+void fit(const raft::handle_t& user_handle,
+         SPORFRegressorD*& forest,
+         double* input,
+         int n_rows,
+         int n_cols,
+         double* labels,
+         SPORF_params rf_params,
+         rapids_logger::level_enum verbosity)
+{
+  raft::common::nvtx::range fun_scope("SPORFRegressorD::fit @sporf.cu");
+  ML::default_logger().set_level(verbosity);
+  ASSERT(forest->trees.empty(), "Cannot fit an existing forest.");
+  forest->trees.resize(rf_params.n_trees);
+  forest->rf_params = rf_params;
+
+  std::shared_ptr<SPORF<double, double>> rf_regressor =
+    std::make_shared<SPORF<double, double>>(rf_params, RF_type::REGRESSION);
+  rf_regressor->fit(user_handle, input, n_rows, n_cols, labels, 1, forest);
+}
+
+void predict(const raft::handle_t& user_handle,
+             const SPORFRegressorF* forest,
+             const float* input,
+             int n_rows,
+             int n_cols,
+             float* predictions,
+             rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<float, float>> rf_regressor =
+    std::make_shared<SPORF<float, float>>(forest->rf_params, RF_type::REGRESSION);
+  rf_regressor->predict(user_handle, input, n_rows, n_cols, predictions, forest, verbosity);
+}
+
+void predict(const raft::handle_t& user_handle,
+             const SPORFRegressorD* forest,
+             const double* input,
+             int n_rows,
+             int n_cols,
+             double* predictions,
+             rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<double, double>> rf_regressor =
+    std::make_shared<SPORF<double, double>>(forest->rf_params, RF_type::REGRESSION);
+  rf_regressor->predict(user_handle, input, n_rows, n_cols, predictions, forest, verbosity);
+}
+
+RF_metrics score(const raft::handle_t& user_handle,
+                 const SPORFRegressorF* forest,
+                 const float* ref_labels,
+                 int n_rows,
+                 const float* predictions,
+                 rapids_logger::level_enum verbosity)
+{
+  RF_metrics regression_score = SPORF<float, float>::score(
+    user_handle, ref_labels, n_rows, predictions, verbosity, RF_type::REGRESSION);
+  return regression_score;
+}
+
+RF_metrics score(const raft::handle_t& user_handle,
+                 const SPORFRegressorD* forest,
+                 const double* ref_labels,
+                 int n_rows,
+                 const double* predictions,
+                 rapids_logger::level_enum verbosity)
+{
+  RF_metrics regression_score = SPORF<double, double>::score(
+    user_handle, ref_labels, n_rows, predictions, verbosity, RF_type::REGRESSION);
+  return regression_score;
+}
+
 }  // End namespace ML

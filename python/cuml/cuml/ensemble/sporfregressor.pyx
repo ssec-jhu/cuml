@@ -17,14 +17,21 @@
 #
 # distutils: language = c++
 
+import math
 import numpy as np
+import time
+import typing
+import warnings
+import cupy as cp
+import cudf
 from treelite import Model as TreeliteModel
 
 import cuml.internals
 import cuml.internals.nvtx as nvtx
+from cuml.internals import logger
 from cuml.common import input_to_cuml_array
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
-from cuml.ensemble.randomforest_common import BaseRandomForestModel
+from cuml.ensemble.randomforest_common import BaseRandomForestModel, compute_max_features
 from cuml.fil.fil import ForestInference
 from cuml.internals.array import CumlArray
 from cuml.internals.mixins import RegressorMixin
@@ -32,34 +39,124 @@ from cuml.internals.utils import check_random_seed
 
 from libc.stdint cimport uint64_t, uintptr_t
 from libcpp cimport bool
+from libcpp.string cimport string
 from pylibraft.common.handle cimport handle_t
 
 from cuml.ensemble.randomforest_shared cimport *
 from cuml.internals.logger cimport level_enum
 
 
+def compute_sporf_density(density, n_cols):
+    if density is True or density is False or isinstance(density, np.bool_):
+        raise ValueError("Expected `density` to be an int absolute expected NNZ "
+                         "or a float fraction in (0, 1]. Got bool instead.")
+    if isinstance(density, (int, np.integer)):
+        if density < 1 or density > n_cols:
+            raise ValueError(
+                f"Integer `density` must be in [1, n_features]. Got "
+                f"density={density!r}, n_features={n_cols}."
+            )
+        return float(density) / float(n_cols)
+    if isinstance(density, (float, np.floating)):
+        if not (density > 0.0 and density <= 1.0):
+            raise ValueError(
+                f"Float `density` must be a fraction in (0, 1]. Got "
+                f"density={density!r}."
+            )
+        return float(density)
+    raise ValueError(
+        f"Expected `density` to be an int absolute expected NNZ or a float "
+        f"fraction in (0, 1]. Got {density!r} instead."
+    )
+
+
+cdef extern from "cuml/tree/sporfdecisiontree.hpp" namespace "ML::DT":
+    cdef enum HISTOGRAM_METHOD:
+        HISTOGRAM_METHOD_EXACT
+        HISTOGRAM_METHOD_SAMPLED
+
+    cdef cppclass DecisionTreeParams:
+        int max_depth
+        int max_leaves
+        float max_features
+        int max_n_bins
+        int min_samples_leaf
+        int min_samples_split
+        CRITERION split_criterion
+        float min_impurity_decrease
+        int max_batch_size
+
+    cdef cppclass SPORFDecisionTreeParams(DecisionTreeParams):
+        float density
+        float density_specified
+        HISTOGRAM_METHOD histogram_method
+
+HISTOGRAM_METHOD_EXACT_PY = int(HISTOGRAM_METHOD_EXACT)
+HISTOGRAM_METHOD_SAMPLED_PY = int(HISTOGRAM_METHOD_SAMPLED)
+
+
 cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
 
+    cdef struct SPORF_params:
+        int n_trees
+        bool bootstrap
+        float max_samples
+        uint64_t seed
+        int n_streams
+        SPORFDecisionTreeParams tree_params
+
+    cdef cppclass SPORFMetaData[T, L]:
+        void* trees
+        SPORF_params rf_params
+
+    cdef SPORF_params set_sporf_params(int,
+                                        int,
+                                        float,
+                                        int,
+                                        int,
+                                        int,
+                                        float,
+                                        bool,
+                                        int,
+                                        float,
+                                        uint64_t,
+                                        CRITERION,
+                                        int,
+                                        int,
+                                        float,
+                                        float,
+                                        HISTOGRAM_METHOD) except +
+
+    ctypedef SPORFMetaData[float, float] SPORFRegressorF
+    ctypedef SPORFMetaData[double, double] SPORFRegressorD
+
+    cdef string serialize(const SPORFMetaData[float, float]* forest) except +
+    cdef string serialize(const SPORFMetaData[double, double]* forest) except +
+    cdef void deserialize(SPORFMetaData[float, float]* forest, const string& payload) except +
+    cdef void deserialize(SPORFMetaData[double, double]* forest, const string& payload) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[float, float]* forest) except +
+    cdef string get_sporf_diagnostics_csv(const SPORFMetaData[double, double]* forest) except +
+
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[float, float]*,
+                  SPORFMetaData[float, float]*,
                   float*,
                   int,
                   int,
                   float*,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void fit(handle_t& handle,
-                  RandomForestMetaData[double, double]*,
+                  SPORFMetaData[double, double]*,
                   double*,
                   int,
                   int,
                   double*,
-                  RF_params,
+                  SPORF_params,
                   level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[float, float] *,
+                      SPORFMetaData[float, float] *,
                       float*,
                       int,
                       int,
@@ -67,7 +164,7 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef void predict(handle_t& handle,
-                      RandomForestMetaData[double, double]*,
+                      SPORFMetaData[double, double]*,
                       double*,
                       int,
                       int,
@@ -75,14 +172,14 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                       level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[float, float]*,
+                          SPORFMetaData[float, float]*,
                           float*,
                           int,
                           float*,
                           level_enum) except +
 
     cdef RF_metrics score(handle_t& handle,
-                          RandomForestMetaData[double, double]*,
+                          SPORFMetaData[double, double]*,
                           double*,
                           int,
                           double*,
@@ -170,6 +267,13 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
         Maximum number of bins used by the split algorithm per feature.
         For large problems, particularly those with highly-skewed input data,
         increasing the number of bins may improve accuracy.
+    density : int or float (default = 0.5)
+        Sparse random projection density per projection vector.
+
+        * If an int then ``density`` is the absolute expected number of
+          nonzero projection coefficients.
+        * If a float then ``density`` is used as a fraction of
+          ``n_features`` and must be in ``(0, 1]``.
     n_streams : int (default = 4 )
         Number of parallel streams used for forest building
         For nearly reproducible results, set ``n_streams=1``. If ``n_streams``
@@ -251,6 +355,8 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
                  handle=None,
                  verbose=False,
                  output_type=None,
+                 density=0.5,
+                 histogram_method=HISTOGRAM_METHOD_SAMPLED_PY,
                  **kwargs):
         self.accuracy_metric = accuracy_metric
         super().__init__(
@@ -260,34 +366,48 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
             verbose=verbose,
             output_type=output_type,
             **kwargs)
+        self.density = density
+        if histogram_method is None:
+            self.histogram_method = int(HISTOGRAM_METHOD_SAMPLED)
+        else:
+            try:
+                self.histogram_method = int(histogram_method)
+            except Exception:
+                self.histogram_method = histogram_method
 
-    # TODO: Add the preprocess and postprocess functions in the cython code to
-    # normalize the labels
     def __getstate__(self):
         state = self.__dict__.copy()
+        state["rf_forest"] = 0
+        state["rf_forest64"] = 0
+
         cdef size_t params_t
-        cdef  RandomForestMetaData[float, float] *rf_forest
-        cdef  RandomForestMetaData[double, double] *rf_forest64
+        cdef SPORFMetaData[float, float]* rf_forest
+        cdef SPORFMetaData[double, double]* rf_forest64
         cdef size_t params_t64
+        cdef string forest_bytes_cpp
+        cdef bytes forest_bytes_py
+
         if self.n_cols:
-            # only if model has been fit previously
-            self._serialize_treelite_bytes()  # Ensure we have this cached
-            if self.rf_forest:
+            if self.dtype == np.float32 and self.rf_forest:
                 params_t = <uintptr_t> self.rf_forest
-                rf_forest = \
-                    <RandomForestMetaData[float, float]*>params_t
-                state["rf_params"] = rf_forest.rf_params
+                rf_forest = <SPORFMetaData[float, float]*>params_t
+                forest_bytes_cpp = serialize(rf_forest)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest_bytes"] = forest_bytes_py
 
-            if self.rf_forest64:
+            elif self.dtype == np.float64 and self.rf_forest64:
                 params_t64 = <uintptr_t> self.rf_forest64
-                rf_forest64 = \
-                    <RandomForestMetaData[double, double]*>params_t64
-                state["rf_params64"] = rf_forest64.rf_params
+                rf_forest64 = <SPORFMetaData[double, double]*>params_t64
+                forest_bytes_cpp = serialize(rf_forest64)
+                forest_bytes_py = forest_bytes_cpp
+                state["sporf_forest64_bytes"] = forest_bytes_py
 
-        state['n_cols'] = self.n_cols
+        state["n_cols"] = self.n_cols
         state["_verbose"] = self._verbose
         state["treelite_serialized_bytes"] = self.treelite_serialized_bytes
-        state['handle'] = self.handle
+        state["handle"] = self.handle
+        state["density"] = self.density
+        state["histogram_method"] = self.histogram_method
         state["split_criterion"] = self.split_criterion
 
         return state
@@ -296,21 +416,71 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
         super(SPORFRegressor, self).__init__(
             split_criterion=state["split_criterion"],
             handle=state["handle"], verbose=state['_verbose'])
-        cdef  RandomForestMetaData[float, float] *rf_forest = \
-            new RandomForestMetaData[float, float]()
-        cdef  RandomForestMetaData[double, double] *rf_forest64 = \
-            new RandomForestMetaData[double, double]()
 
-        self.n_cols = state['n_cols']
-        if self.n_cols:
-            rf_forest.rf_params = state["rf_params"]
-            state["rf_forest"] = <uintptr_t>rf_forest
-
-            rf_forest64.rf_params = state["rf_params64"]
-            state["rf_forest64"] = <uintptr_t>rf_forest64
+        cdef SPORFMetaData[float, float] *rf_forest = NULL
+        cdef SPORFMetaData[double, double] *rf_forest64 = NULL
+        cdef string forest_bytes_cpp
+        cdef uintptr_t seed_val
+        cdef float max_feature_val
+        cdef float density_val
+        cdef float density_specified_val
+        cdef SPORF_params rf_params
 
         self.treelite_serialized_bytes = state["treelite_serialized_bytes"]
         self.__dict__.update(state)
+        self.rf_forest = 0
+        self.rf_forest64 = 0
+
+        if self.n_cols:
+            max_feature_val = compute_max_features(self.max_features, self.n_cols)
+            density_val = compute_sporf_density(self.density, self.n_cols)
+            density_specified_val = <float>float(self.density)
+            if self.random_state is None:
+                seed_val = <uintptr_t>NULL
+            else:
+                seed_val = <uintptr_t>check_random_seed(self.random_state)
+
+            rf_params = set_sporf_params(<int> self.max_depth,
+                                         <int> self.max_leaves,
+                                         <float> max_feature_val,
+                                         <int> self.n_bins,
+                                         <int> self.min_samples_leaf,
+                                         <int> self.min_samples_split,
+                                         <float> self.min_impurity_decrease,
+                                         <bool> self.bootstrap,
+                                         <int> self.n_estimators,
+                                         <float> self.max_samples,
+                                         <uint64_t> seed_val,
+                                         <CRITERION> self.split_criterion,
+                                         <int> self.n_streams,
+                                         <int> self.max_batch_size,
+                                         density_val,
+                                         density_specified_val,
+                                         <HISTOGRAM_METHOD> self.histogram_method)
+
+            if self.dtype == np.float32 and "sporf_forest_bytes" in state:
+                rf_forest = new SPORFMetaData[float, float]()
+                rf_forest.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest_bytes"]
+                deserialize(rf_forest, forest_bytes_cpp)
+                self.rf_forest = <uintptr_t>rf_forest
+
+            elif self.dtype == np.float64 and "sporf_forest64_bytes" in state:
+                rf_forest64 = new SPORFMetaData[double, double]()
+                rf_forest64.rf_params = rf_params
+                forest_bytes_cpp = state["sporf_forest64_bytes"]
+                deserialize(rf_forest64, forest_bytes_cpp)
+                self.rf_forest64 = <uintptr_t>rf_forest64
+
+            else:
+                if self.dtype == np.float32:
+                    rf_forest = new SPORFMetaData[float, float]()
+                    rf_forest.rf_params = rf_params
+                    self.rf_forest = <uintptr_t>rf_forest
+                elif self.dtype == np.float64:
+                    rf_forest64 = new SPORFMetaData[double, double]()
+                    rf_forest64.rf_params = rf_params
+                    self.rf_forest64 = <uintptr_t>rf_forest64
 
     def __del__(self):
         self._reset_forest_data()
@@ -395,6 +565,8 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
 
         X_m, y_m, max_feature_val = self._dataset_setup_for_fit(X, y,
                                                                 convert_dtype)
+        cdef float density_val = compute_sporf_density(self.density, self.n_cols)
+        cdef float density_specified_val = <float>float(self.density)
 
         # Reset the old tree data for new fit call
         cdef uintptr_t X_ptr, y_ptr
@@ -403,32 +575,36 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
 
         cdef handle_t* handle_ =\
             <handle_t*><uintptr_t>self.handle.getHandle()
+        cdef uintptr_t seed_val
+        cdef SPORF_params rf_params
+        cdef SPORF_params rf_params64
 
-        cdef RandomForestMetaData[float, float] *rf_forest = \
-            new RandomForestMetaData[float, float]()
+        cdef SPORFRegressorF* rf_forest = new SPORFMetaData[float, float]()
         self.rf_forest = <uintptr_t> rf_forest
-        cdef RandomForestMetaData[double, double] *rf_forest64 = \
-            new RandomForestMetaData[double, double]()
+        cdef SPORFRegressorD* rf_forest64 = new SPORFMetaData[double, double]()
         self.rf_forest64 = <uintptr_t> rf_forest64
         if self.random_state is None:
             seed_val = <uintptr_t>NULL
         else:
             seed_val = <uintptr_t>check_random_seed(self.random_state)
 
-        rf_params = set_rf_params(<int> self.max_depth,
-                                  <int> self.max_leaves,
-                                  <float> max_feature_val,
-                                  <int> self.n_bins,
-                                  <int> self.min_samples_leaf,
-                                  <int> self.min_samples_split,
-                                  <float> self.min_impurity_decrease,
-                                  <bool> self.bootstrap,
-                                  <int> self.n_estimators,
-                                  <float> self.max_samples,
-                                  <uint64_t> seed_val,
-                                  <CRITERION> self.split_criterion,
-                                  <int> self.n_streams,
-                                  <int> self.max_batch_size)
+        rf_params = set_sporf_params(<int> self.max_depth,
+                                     <int> self.max_leaves,
+                                     <float> max_feature_val,
+                                     <int> self.n_bins,
+                                     <int> self.min_samples_leaf,
+                                     <int> self.min_samples_split,
+                                     <float> self.min_impurity_decrease,
+                                     <bool> self.bootstrap,
+                                     <int> self.n_estimators,
+                                     <float> self.max_samples,
+                                     <uint64_t> seed_val,
+                                     <CRITERION> self.split_criterion,
+                                     <int> self.n_streams,
+                                     <int> self.max_batch_size,
+                                     density_val,
+                                     density_specified_val,
+                                     <HISTOGRAM_METHOD> self.histogram_method)
 
         if self.dtype == np.float32:
             fit(handle_[0],
@@ -464,10 +640,8 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
     ) -> CumlArray:
         cdef uintptr_t X_ptr
 
-        # TODO: Regressor wrapper still uses order='C' and needs coordinated migration (to order='F')
-        # to match SPORF C++ predict column-major expectation.
         X_m, n_rows, n_cols, dtype = \
-            input_to_cuml_array(X, order='C',
+            input_to_cuml_array(X, order='F',
                                 convert_to_dtype=(self.dtype if convert_dtype
                                                   else None),
                                 check_cols=self.n_cols)
@@ -479,11 +653,11 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
         cdef handle_t* handle_ = \
             <handle_t*> <uintptr_t> self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, float] *rf_forest = \
-            <RandomForestMetaData[float, float] *> <uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, float] *rf_forest = \
+            <SPORFMetaData[float, float] *> <uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, double] *rf_forest64 = \
-            <RandomForestMetaData[double, double] *> <uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, double] *rf_forest64 = \
+            <SPORFMetaData[double, double] *> <uintptr_t> self.rf_forest64
         if self.dtype == np.float32:
             predict(handle_[0],
                     rf_forest,
@@ -667,11 +841,11 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
         cdef handle_t* handle_ =\
             <handle_t*><uintptr_t>self.handle.getHandle()
 
-        cdef RandomForestMetaData[float, float] *rf_forest = \
-            <RandomForestMetaData[float, float]*><uintptr_t> self.rf_forest
+        cdef SPORFMetaData[float, float] *rf_forest = \
+            <SPORFMetaData[float, float]*><uintptr_t> self.rf_forest
 
-        cdef RandomForestMetaData[double, double] *rf_forest64 = \
-            <RandomForestMetaData[double, double]*><uintptr_t> self.rf_forest64
+        cdef SPORFMetaData[double, double] *rf_forest64 = \
+            <SPORFMetaData[double, double]*><uintptr_t> self.rf_forest64
 
         if self.dtype == np.float32:
             self.temp_stats = score(handle_[0],
@@ -715,6 +889,20 @@ class SPORFRegressor(BaseRandomForestModel, RegressorMixin):
             return get_rf_summary_text(rf_forest64).decode('utf-8')
         else:
             return get_rf_summary_text(rf_forest).decode('utf-8')
+
+    def get_diagnostics_csv(self):
+        """
+        Return per-tree SPORF metadata diagnostics as CSV.
+        """
+        cdef SPORFMetaData[float, float] *rf_forest = \
+            <SPORFMetaData[float, float]*><uintptr_t> self.rf_forest
+
+        cdef SPORFMetaData[double, double] *rf_forest64 = \
+            <SPORFMetaData[double, double]*><uintptr_t> self.rf_forest64
+
+        if self.dtype == np.float64:
+            return get_sporf_diagnostics_csv(rf_forest64).decode('utf-8')
+        return get_sporf_diagnostics_csv(rf_forest).decode('utf-8')
 
     def get_detailed_text(self):
         """
