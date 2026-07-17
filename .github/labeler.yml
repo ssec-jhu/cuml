@@ -4,27 +4,27 @@
 
 Cython-Python:
   - changed-files:
-      - any-glob-to-any-file:
-          - 'python/**'
-          - 'notebooks/**'
+      any-glob-to-any-file:
+        - 'python/**'
+        - 'notebooks/**'
 
 CUDA-C++:
   - changed-files:
-      - any-glob-to-any-file:
-          - 'cpp/**'
+      any-glob-to-any-file:
+        - 'cpp/**'
 
 CMake:
   - changed-files:
-      - any-glob-to-any-file:
-          - '**/CMakeLists.txt'
-          - '**/cmake/**'
+      any-glob-to-any-file:
+        - '**/CMakeLists.txt'
+        - '**/cmake/**'
 
 ci:
   - changed-files:
-      - any-glob-to-any-file:
-          - 'ci/**'
+      any-glob-to-any-file:
+        - 'ci/**'
 
 conda:
   - changed-files:
-      - any-glob-to-any-file:
-          - 'conda/**'
+      any-glob-to-any-file:
+        - 'conda/**'
