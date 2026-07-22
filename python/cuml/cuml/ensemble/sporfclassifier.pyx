@@ -216,6 +216,22 @@ cdef extern from "cuml/ensemble/sporf.hpp" namespace "ML" nogil:
                       int*,
                       level_enum) except +
 
+    cdef void predict_proba(handle_t& handle,
+                            SPORFMetaData[float, int]*,
+                            float*,
+                            int,
+                            int,
+                            float*,
+                            level_enum) except +
+
+    cdef void predict_proba(handle_t& handle,
+                            SPORFMetaData[double, int]*,
+                            double*,
+                            int,
+                            int,
+                            double*,
+                            level_enum) except +
+
     cdef RF_metrics score(handle_t& handle,
                           SPORFMetaData[float, int]*,
                           int*,
@@ -1088,8 +1104,7 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
         align_bytes = None,
     ) -> CumlArray:
         """
-        Predicts class probabilities for X. This function uses the GPU
-        implementation of predict.
+        Predicts class probabilities for X using native SPORF GPU inference.
 
         Parameters
         ----------
@@ -1098,31 +1113,65 @@ class SPORFClassifier(BaseRandomForestModel, ClassifierMixin):
             When True, automatically convert the input to the data type used
             to train the model. This may increase memory usage.
         layout : string (default = 'depth_first')
-            Specifies the in-memory layout of nodes in FIL forests. Options:
-            'depth_first', 'layered', 'breadth_first'.
+            Accepted for API compatibility with RandomForestClassifier, but
+            native SPORF inference does not use FIL tree layouts.
         default_chunk_size : int, optional (default = None)
-            Determines how batches are further subdivided for parallel processing.
-            The optimal value depends on hardware, model, and batch size.
-            If None, will be automatically determined.
+            Accepted for API compatibility with RandomForestClassifier, but
+            native SPORF inference does not use FIL chunking.
         align_bytes : int, optional (default = None)
-            If specified, trees will be padded such that their in-memory size is
-            a multiple of this value. This can improve performance by guaranteeing
-            that memory reads from trees begin on a cache line boundary.
-            Typical values are 0 or 128 on GPU and 0 or 64 on CPU.
+            Accepted for API compatibility with RandomForestClassifier, but
+            native SPORF inference does not use FIL tree alignment.
 
         Returns
         -------
         y : {}
         """
-        return self._predict_model_on_gpu(
-            X=X,
-            is_classifier=True,
-            predict_proba=True,
-            convert_dtype=convert_dtype,
-            layout=layout,
-            default_chunk_size=default_chunk_size,
-            align_bytes=align_bytes,
-        )
+        cdef uintptr_t X_ptr
+        cdef uintptr_t probs_ptr
+
+        X_m, n_rows, n_cols, _dtype = \
+            input_to_cuml_array(X, order='F',
+                                convert_to_dtype=(self.dtype if convert_dtype
+                                                  else None),
+                                check_cols=self.n_cols)
+        X_ptr = X_m.ptr
+
+        probs = CumlArray.zeros((n_rows, self.num_classes), dtype=self.dtype)
+        probs_ptr = probs.ptr
+
+        cdef handle_t* handle_ = \
+            <handle_t*> <uintptr_t> self.handle.getHandle()
+
+        cdef SPORFMetaData[float, int] *rf_forest = \
+            <SPORFMetaData[float, int]*> <uintptr_t> self.rf_forest
+
+        cdef SPORFMetaData[double, int] *rf_forest64 = \
+            <SPORFMetaData[double, int]*> <uintptr_t> self.rf_forest64
+
+        if self.dtype == np.float32:
+            predict_proba(handle_[0],
+                          rf_forest,
+                          <float*> X_ptr,
+                          <int> n_rows,
+                          <int> n_cols,
+                          <float*> probs_ptr,
+                          <level_enum> self.verbose)
+        elif self.dtype == np.float64:
+            predict_proba(handle_[0],
+                          rf_forest64,
+                          <double*> X_ptr,
+                          <int> n_rows,
+                          <int> n_cols,
+                          <double*> probs_ptr,
+                          <level_enum> self.verbose)
+        else:
+            raise TypeError("supports only np.float32 and np.float64 input,"
+                            " but input of type '%s' passed."
+                            % (str(self.dtype)))
+
+        self.handle.sync()
+        del X_m
+        return probs
 
     @nvtx.annotate(
         message="score RF-Classifier @sporfclassifier.pyx",
