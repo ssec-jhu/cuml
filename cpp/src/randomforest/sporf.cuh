@@ -693,6 +693,163 @@ class SPORF {
   }
 
   /**
+   * @brief Predict class probabilities for input data
+   * @param[in] user_handle: raft::handle_t.
+   * @param[in] input: test data (n_rows samples, n_cols features) in column major format. GPU
+   * pointer.
+   * @param[in] n_rows: number of  data samples.
+   * @param[in] n_cols: number of features (excluding target feature).
+   * @param[in, out] probabilities: n_rows x n_classes predicted probabilities. GPU pointer, user
+   * allocated.
+   * @param[in] forest: CPU pointer to SPORFMetaData object.
+   * @param[in] verbosity: verbosity level for logging messages during execution
+   */
+  void predict_proba(const raft::handle_t& user_handle,
+                     const T* input,
+                     int n_rows,
+                     int n_cols,
+                     T* probabilities,
+                     const SPORFMetaData<T, L>* forest,
+                     rapids_logger::level_enum verbosity) const
+  {
+    ML::default_logger().set_level(verbosity);
+    ASSERT(rf_type == RF_type::CLASSIFICATION,
+           "SPORF::predict_proba is only supported for classification.");
+    ASSERT(probabilities != nullptr, "Error! User has not allocated memory for probabilities.");
+    ASSERT((n_rows > 0), "Invalid n_rows %d", n_rows);
+    ASSERT((n_cols > 0), "Invalid n_cols %d", n_cols);
+
+    bool input_is_dev_ptr = DT::is_dev_ptr(input);
+    bool probs_is_dev_ptr = DT::is_dev_ptr(probabilities);
+    if (!input_is_dev_ptr || (input_is_dev_ptr != probs_is_dev_ptr)) {
+      ASSERT(false,
+             "RF Error: Expected both input and probabilities to be GPU "
+             "pointers");
+    }
+
+    cudaStream_t stream = user_handle.get_stream();
+    bool do_timing = ML::default_logger().should_log(rapids_logger::level_enum::debug);
+
+    cudaEvent_t ev_total_start{}, ev_total_stop{}, ev_tree_start{}, ev_tree_stop{}, ev_reduce_start{},
+      ev_reduce_stop{};
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_total_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_tree_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_reduce_start));
+      RAFT_CUDA_TRY(cudaEventCreate(&ev_reduce_stop));
+      RAFT_CUDA_TRY(cudaEventRecord(ev_total_start, stream));
+    }
+
+    auto output_size = static_cast<std::size_t>(n_rows) * forest->trees[0]->num_outputs;
+    RAFT_CUDA_TRY(cudaMemsetAsync(probabilities, 0, sizeof(T) * output_size, stream));
+
+    int predict_streams = 1;
+    int pool_streams    = static_cast<int>(user_handle.get_stream_pool_size());
+    if (pool_streams > 0) {
+      predict_streams = std::min(4, std::min(pool_streams, this->rf_params.n_trees));
+    }
+
+    std::vector<cudaStream_t> tree_streams;
+    std::deque<rmm::device_uvector<T>> stream_prediction_buffers;
+    using PredictWs = DT::SPORFDecisionTreeWorkspace<T, L, int>;
+    std::vector<std::unique_ptr<PredictWs>> stream_workspaces;
+    if (predict_streams > 1) {
+      tree_streams.reserve(predict_streams);
+      stream_workspaces.reserve(predict_streams);
+      for (int s = 0; s < predict_streams; s++) {
+        auto tree_stream = user_handle.get_stream_from_stream_pool(s);
+        tree_streams.push_back(tree_stream);
+        stream_prediction_buffers.emplace_back(output_size, tree_stream);
+        RAFT_CUDA_TRY(cudaMemsetAsync(stream_prediction_buffers.back().data(),
+                                      0,
+                                      sizeof(T) * stream_prediction_buffers.back().size(),
+                                      tree_stream));
+        stream_workspaces.emplace_back(
+          std::make_unique<PredictWs>(static_cast<size_t>(n_rows),
+                                      static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
+                                      tree_stream));
+      }
+    } else {
+      stream_workspaces.emplace_back(
+        std::make_unique<PredictWs>(static_cast<size_t>(n_rows),
+                                    static_cast<size_t>(this->rf_params.tree_params.max_batch_size),
+                                    stream));
+    }
+
+    default_logger().set_pattern("%v");
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_tree_start, stream)); }
+    for (int i = 0; i < this->rf_params.n_trees; i++) {
+      int sid          = (predict_streams > 1) ? (i % predict_streams) : 0;
+      auto out_ptr     = (predict_streams > 1) ? stream_prediction_buffers[sid].data() : probabilities;
+      auto pred_stream = (predict_streams > 1) ? tree_streams[sid] : stream;
+      auto& ws         = *stream_workspaces[sid];
+      DT::SPORFDecisionTree::predict(user_handle,
+                                     *forest->trees[i],
+                                     this->rf_params.tree_params.max_batch_size,
+                                     input,
+                                     n_rows,
+                                     n_cols,
+                                     1.0 / this->rf_params.n_trees,
+                                     out_ptr,
+                                     forest->trees[i]->num_outputs,
+                                     verbosity,
+                                     ws,
+                                     pred_stream);
+    }
+    if (do_timing) {
+      if (predict_streams > 1) {
+        user_handle.sync_stream_pool();
+        RAFT_CUDA_TRY(cudaEventRecord(ev_tree_stop, stream));
+      } else {
+        RAFT_CUDA_TRY(cudaEventRecord(ev_tree_stop, stream));
+      }
+    }
+
+    if (do_timing) { RAFT_CUDA_TRY(cudaEventRecord(ev_reduce_start, stream)); }
+    if (predict_streams > 1) {
+      user_handle.sync_stream_pool();
+      constexpr int TPB = 256;
+      dim3 block(TPB);
+      dim3 grid((output_size + TPB - 1) / TPB);
+      for (int s = 0; s < predict_streams; s++) {
+        add_prediction_buffers_kernel<T>
+          <<<grid, block, 0, stream>>>(probabilities, stream_prediction_buffers[s].data(), output_size);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+      }
+    }
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventRecord(ev_reduce_stop, stream));
+      RAFT_CUDA_TRY(cudaEventRecord(ev_total_stop, stream));
+    }
+    user_handle.sync_stream(stream);
+
+    if (do_timing) {
+      RAFT_CUDA_TRY(cudaEventSynchronize(ev_total_stop));
+      float ms_total = 0.0f, ms_tree = 0.0f, ms_reduce = 0.0f;
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_total, ev_total_start, ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_tree, ev_tree_start, ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventElapsedTime(&ms_reduce, ev_reduce_start, ev_reduce_stop));
+      CUML_LOG_DEBUG(
+        "SPORF::predict_proba timings (ms): total=%f tree_loop=%f reduce=%f (n_trees=%d streams=%d)",
+        ms_total,
+        ms_tree,
+        ms_reduce,
+        this->rf_params.n_trees,
+        predict_streams);
+
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_total_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_total_stop));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_tree_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_tree_stop));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_reduce_start));
+      RAFT_CUDA_TRY(cudaEventDestroy(ev_reduce_stop));
+    }
+    default_logger().set_pattern(default_pattern());
+  }
+
+  /**
    * @brief Predict target feature for input data and score against ref_labels.
    * @param[in] user_handle: raft::handle_t.
    * @param[in] ref_labels: label values for cross validation (n_rows elements); GPU pointer.

@@ -400,6 +400,22 @@ void predict(const raft::handle_t& user_handle,
              int* predictions,
              rapids_logger::level_enum verbosity = rapids_logger::level_enum::info);
 
+void predict_proba(const raft::handle_t& user_handle,
+                   const SPORFClassifierF* forest,
+                   const float* input,
+                   int n_rows,
+                   int n_cols,
+                   float* probabilities,
+                   rapids_logger::level_enum verbosity = rapids_logger::level_enum::info);
+
+void predict_proba(const raft::handle_t& user_handle,
+                   const SPORFClassifierD* forest,
+                   const double* input,
+                   int n_rows,
+                   int n_cols,
+                   double* probabilities,
+                   rapids_logger::level_enum verbosity = rapids_logger::level_enum::info);
+
 RF_metrics score(const raft::handle_t& user_handle,
                  const SPORFClassifierF* forest,
                  const int* ref_labels,

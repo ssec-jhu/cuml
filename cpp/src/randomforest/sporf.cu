@@ -315,6 +315,34 @@ void predict(const raft::handle_t& user_handle,
   rf_classifier->predict(user_handle, input, n_rows, n_cols, predictions, forest, verbosity);
 }
 
+void predict_proba(const raft::handle_t& user_handle,
+                   const SPORFClassifierF* forest,
+                   const float* input,
+                   int n_rows,
+                   int n_cols,
+                   float* probabilities,
+                   rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<float, int>> rf_classifier =
+    std::make_shared<SPORF<float, int>>(forest->rf_params, RF_type::CLASSIFICATION);
+  rf_classifier->predict_proba(user_handle, input, n_rows, n_cols, probabilities, forest, verbosity);
+}
+
+void predict_proba(const raft::handle_t& user_handle,
+                   const SPORFClassifierD* forest,
+                   const double* input,
+                   int n_rows,
+                   int n_cols,
+                   double* probabilities,
+                   rapids_logger::level_enum verbosity)
+{
+  ASSERT(!forest->trees.empty(), "Cannot predict! No trees in the forest.");
+  std::shared_ptr<SPORF<double, int>> rf_classifier =
+    std::make_shared<SPORF<double, int>>(forest->rf_params, RF_type::CLASSIFICATION);
+  rf_classifier->predict_proba(user_handle, input, n_rows, n_cols, probabilities, forest, verbosity);
+}
+
 /**
  * @defgroup RandomForestClassificationScore Random Forest Classification - Score function
  * @brief Compare predicted features validate against ref_labels.
