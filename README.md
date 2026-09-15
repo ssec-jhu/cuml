@@ -1,5 +1,9 @@
 # <div align="left"><img src="img/rapids_logo.png" width="90px"/>&nbsp;cuML - GPU Machine Learning Algorithms</div>
 
+> **Archival notice:** This repository is being archived and is superseded by
+> [neurodata/cuml](https://github.com/neurodata/cuml). Please use that repository
+> for continued development, issues, and contributions.
+
 cuML is a suite of libraries that implement machine learning algorithms and mathematical primitives functions that share compatible APIs with other [RAPIDS](https://rapids.ai/) projects.
 
 cuML enables data scientists, researchers, and software engineers to run
